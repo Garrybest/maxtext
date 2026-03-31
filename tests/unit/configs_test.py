@@ -260,7 +260,19 @@ def test_kimi_configs(config_file):
   run_config_validation(config_file)
 
 
-# --- Test Group 9: Inference-specific Configs ---
+# --- Test Group 9: Ling2 Model Family ---
+
+LING2_CONFIGS = [
+    os.path.join(CONFIGS_DIR, "models", "ling2.yml"),
+]
+
+
+@pytest.mark.parametrize("config_file", LING2_CONFIGS)
+def test_ling2_configs(config_file):
+  run_config_validation(config_file)
+
+
+# --- Test Group 10: Inference-specific Configs ---
 
 INFERENCE_CONFIGS = [
     os.path.join(CONFIGS_DIR, "inference", "inference.yml"),

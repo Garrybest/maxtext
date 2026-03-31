@@ -514,12 +514,19 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.QWEN3_NEXT: get_scannable(qwen3.Qwen3NextDecoderLayer, qwen3.Qwen3NextScannableBlock),
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
+        DecoderBlockType.LING2: NotImplemented,  # TODO(PR2): replace with actual Ling2 decoder layers
     }
 
     if cfg.decoder_block not in layer_map:
       raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
 
-    return layer_map[cfg.decoder_block]
+    result = layer_map[cfg.decoder_block]
+    if result is NotImplemented:
+      raise NotImplementedError(
+          f"Decoder block {cfg.decoder_block.value!r} is registered but not yet implemented. "
+          "See TODO(PR2) for the follow-up implementation."
+      )
+    return result
 
   def minimal_policy(self, with_context=False, with_quantization=False):
     """Helper for creating minimal checkpoint policies."""
@@ -661,6 +668,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        DecoderBlockType.LING2,
     ):
       return functools.partial(RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs)
     elif self.config.decoder_block == DecoderBlockType.GPT3:

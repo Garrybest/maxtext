@@ -102,6 +102,7 @@ class DecoderBlockType(enum.Enum):
   SIMPLE_MLP = "simple_mlp"
   LLAMA4 = "llama4"
   OLMO3 = "olmo3"
+  LING2 = "ling2"
 
 
 class AttentionType(enum.Enum):

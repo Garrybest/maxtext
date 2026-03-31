@@ -263,6 +263,7 @@ ModelName = Literal[
     "olmo3-7b",
     "olmo3-7b-pt",
     "olmo3-32b",
+    "ling2",
 ]
 
 
@@ -537,6 +538,14 @@ class MlaAttention(BaseModel):
   qk_nope_head_dim: NonNegativeInt = Field(128, description="Dimension for non-RoPE part of QK heads in MLA.")
   qk_rope_head_dim: NonNegativeInt = Field(64, description="Dimension for RoPE part of QK heads in MLA.")
   v_head_dim: NonNegativeInt = Field(128, description="Dimension of V heads in MLA.")
+  mla_interleaved_rope: bool = Field(
+      True,
+      description=(
+          "Whether to de-interleave RoPE dimensions before applying rotary embedding "
+          "in MLA. When True, reorders [d0, d1, d2, d3, ...] -> [d0, d2, ..., d1, d3, ...] "
+          "to match the non-interleaved RoPE convention."
+      ),
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -656,6 +665,14 @@ class MoEGeneral(BaseModel):
       True,
       description="Whether to use full fp32 precision to sum expert weights for numerical stability.",
   )
+  moe_z_loss_weight: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "Weight for MoE router z-loss. Adds a penalty on the log-sum-exp of "
+          "router logits to encourage uniform routing. "
+          "0.0 disables z-loss entirely (zero compute overhead when disabled)."
+      ),
+  )
 
 
 class MoEKernels(BaseModel):
@@ -738,6 +755,38 @@ class DeepSeekMoE(BaseModel):
       1,
       description="Factor by which to split the batch into micro-batches. Only used if use_batch_split_schedule is True.",
   )
+  moe_shared_expert_dim: int = Field(
+      0,
+      description=(
+          "Intermediate dimension for shared experts. When 0, falls back to "
+          "base_moe_mlp_dim. Allows shared experts to have a different FFN width "
+          "than routed experts."
+      ),
+  )
+  routed_bias_dtype: str = Field(
+      "",
+      description=(
+          "Data type for the routed gate bias parameter. Empty string means "
+          "follow weight_dtype. Set to 'float32' to keep bias in higher precision "
+          "for loss-free load balancing stability."
+      ),
+  )
+  enable_routed_bias_grad: bool = Field(
+      True,
+      description=(
+          "Whether the routed gate bias receives gradient-based optimizer updates. "
+          "When False, the bias is frozen from optimizer updates and only modified "
+          "via loss-free bias update (routed_bias_update_rate). Setting to False "
+          "matches Megatron's default loss-free balancing behavior."
+      ),
+  )
+  routed_bias_zero_mean_update: bool = Field(
+      False,
+      description=(
+          "Whether to recenter routed expert bias to zero-mean after each "
+          "loss-free bias update step. Prevents bias drift over long training runs."
+      ),
+  )
 
 
 class Qwen3Next(BaseModel):
@@ -757,6 +806,20 @@ class Qwen3Next(BaseModel):
       description="Whether to apply L2 normalization to query and key tensors inside the Gated Delta Rule kernel.",
   )
   partial_rotary_factor: float = Field(1.0, description="The ratio of dimension to apply ROPE on")
+  group_norm_size: int = Field(
+      1,
+      description=(
+          "Group size for GroupRMSNorm applied to GLA output. "
+          "A value of 1 is equivalent to standard RMSNorm (per-element normalization)."
+      ),
+  )
+  use_linear_silu: bool = Field(
+      False,
+      description=(
+          "Whether to apply SiLU activation on the fused QKV projection output "
+          "in GLA layers before splitting into Q, K, V tensors."
+      ),
+  )
 
 
 class HardwareAndMesh(BaseModel):
@@ -964,6 +1027,20 @@ class Tokenizer(BaseModel):
       1,
       description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
   )
+  pad_id: int = Field(
+      0,
+      description=(
+          "Padding token ID. Used when grain_file_type='mmap' to avoid loading "
+          "the tokenizer solely for the pad token ID."
+      ),
+  )
+  bos_id: int = Field(
+      1,
+      description=(
+          "Beginning-of-sentence token ID. Used when grain_file_type='mmap' with "
+          "concat_then_split packing to insert BOS tokens between documents."
+      ),
+  )
 
 
 class DatasetGeneral(BaseModel):
@@ -1060,6 +1137,41 @@ class GrainDataset(BaseModel):
       description="Max workers for ThreadPoolExecutor when mixing multiple Grain data sources.",
   )
   grain_shuffle_buffer_size: int = Field(100, description="Shuffle buffer size when using Parquet or TFRecord.")
+  blend_cache_dir: PathStr = Field(
+      "",
+      description=(
+          "Cache directory for auto-generated Megatron blend indices. "
+          "When non-empty, generated index files are cached here for reuse across runs."
+      ),
+  )
+  blend_index_dir: PathStr = Field(
+      "",
+      description=(
+          "Directory containing pre-generated Megatron dataset_index.npy files. "
+          "When set, skips index generation and loads from this directory directly."
+      ),
+  )
+  reset_attention_mask: bool = Field(
+      True,
+      description=(
+          "Controls segment ID generation when converting Megatron mmap packed data "
+          "to MaxText format. When True, different documents within a packed sample "
+          "receive separate segment IDs, preventing cross-document attention via "
+          "MaxText's existing segment ID mechanism. When False, all tokens in a packed "
+          "sample share the same segment ID, allowing cross-document attention."
+      ),
+  )
+  eod_mask_loss: bool = Field(
+      False,
+      description=(
+          "When True, end-of-document (EOD) tokens are excluded from loss calculation. "
+          "Matches Megatron-LM's default behavior for mmap datasets."
+      ),
+  )
+  mmap_split_sentences: bool = Field(
+      False,
+      description="Enable sentence-level splitting when loading mmap format data.",
+  )
 
 
 class FineTuning(BaseModel):
@@ -1190,6 +1302,16 @@ class Optimizer(BaseModel):
       description=(
           "List of parameter names/patterns to train. If non-empty, all other parameters will be frozen, "
           "example: ['.*indexer.*']. If empty (default), all parameters are trained."
+      ),
+  )
+  calculate_per_token_loss: bool = Field(
+      True,
+      description=(
+          "Controls gradient accumulation loss normalization. When True (default), "
+          "accumulated gradients are divided by total token count across all "
+          "micro-batches (global per-token average). When False, each micro-batch "
+          "independently computes per-token average, then gradients are averaged "
+          "with equal weight (1/N)."
       ),
   )
 
@@ -2447,8 +2569,12 @@ class MaxTextConfig(
           )
       if self.decoder_block == DecoderBlockType.GPT_OSS and not self.sparse_matmul and self.capacity_factor != -1:
         raise ValueError("GPT-OSS MoE only supports dropless (capacity_factor=-1) with dense matmul.")
-      if self.routed_bias and self.routed_bias_update_rate > 0.0 and self.decoder_block != DecoderBlockType.DEEPSEEK:
-        raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      if (
+          self.routed_bias
+          and self.routed_bias_update_rate > 0.0
+          and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2)
+      ):
+        raise ValueError("Loss-free load balancing is only supported for the DeepSeek and Ling2 decoder blocks.")
     if self.use_multimodal:
       valid_mm_models = (
           "gemma3-4b",
@@ -2516,15 +2642,18 @@ class MaxTextConfig(
             f"The number of decoder layers ({self.base_num_decoder_layers}) must be divisible by interleave moe layer step "
             f"({self.interleave_moe_layer_step})"
         )
-    if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
-      if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
-        raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")
+    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.LING2):
+      if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
+        if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
+          raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")
       rotary_dim = int(self.head_dim * self.partial_rotary_factor)
       if rotary_dim % 2 != 0:
         raise ValueError(f"Calculated rotary dimension ({rotary_dim}) must be a multiple of 2.")
     else:
       if self.partial_rotary_factor is not None and self.partial_rotary_factor != 1.0:
-        raise ValueError("`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next'.")
+        raise ValueError(
+            "`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next' or 'ling2'."
+        )
 
     tokenizer_path = getattr(self, "tokenizer_path", None)
     if (
