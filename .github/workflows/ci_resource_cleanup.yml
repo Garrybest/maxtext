@@ -1,0 +1,50 @@
+name: CI Resource Cleanup
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Every hour
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    name: "Delete stale CI K8s resources"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Delete CI resources older than 2 hours
+        run: |
+          THRESHOLD=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          FOUND=0
+
+          for APP_LABEL in ci-smoke-test ci-unit-tests; do
+            echo "Checking $APP_LABEL resources created before $THRESHOLD"
+            for KIND in job service secret; do
+              ITEMS=$(kubectl get "$KIND" -l "app=$APP_LABEL" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' \
+                2>/dev/null || true)
+
+              while IFS=$'\t' read -r NAME CREATED; do
+                [ -z "$NAME" ] && continue
+                if [[ "$CREATED" < "$THRESHOLD" ]]; then
+                  echo "  Deleting $KIND/$NAME (created: $CREATED)"
+                  kubectl delete "$KIND" "$NAME" --ignore-not-found
+                  FOUND=$((FOUND + 1))
+                fi
+              done <<< "$ITEMS"
+            done
+          done
+
+          echo "Cleanup done. Deleted $FOUND stale resources."

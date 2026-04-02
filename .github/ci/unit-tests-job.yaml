@@ -1,0 +1,150 @@
+# CI Unit Tests - K8s Manifests
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL
+# Runs pytest unit tests on TPU.
+---
+# Headless Service for TPU pod DNS resolution (required for JAX coordinator)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}-headless-svc
+  namespace: default
+  labels:
+    app: ci-unit-tests
+    ci-branch: "${BRANCH_LABEL}"
+spec:
+  clusterIP: None
+  selector:
+    job-name: ${JOB_NAME}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  labels:
+    app: ci-unit-tests
+    ci-branch: "${BRANCH_LABEL}"
+    job-name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+      labels:
+        app: ci-unit-tests
+        ci-branch: "${BRANCH_LABEL}"
+        job-name: ${JOB_NAME}
+    spec:
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # 1. Clone repo at specific ref (supports both branch names and SHAs)
+          git init /root/maxtext
+          cd /root/maxtext
+          git remote add origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git"
+          git fetch --depth=1 origin "${BRANCH}"
+          git checkout FETCH_HEAD
+
+          # 2. Setup Python environment
+          pip install uv
+          uv venv --python 3.12 --seed maxtext_venv
+          source maxtext_venv/bin/activate
+          uv pip install -e '.[tpu]' --resolution=lowest
+          uv pip install pytest pytest-timeout
+
+          export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/src
+
+          # 3. Run unit tests
+          echo ""
+          echo "========================================================"
+          echo "Running unit tests"
+          echo "========================================================"
+
+          UNIT_TEST_EXIT=0
+          python3 -m pytest tests/unit/ -v -x --timeout=600 \
+            --ignore=tests/unit/test_env_smoke.py \
+            --ignore=tests/unit/maxengine_test.py \
+            --ignore=tests/unit/attention_test.py \
+            --ignore=tests/unit/context_parallelism_test.py \
+            --ignore=tests/unit/grain_data_processing_test.py \
+            --ignore=tests/unit/hf_data_processing_test.py \
+            --ignore=tests/unit/mhc_test.py \
+            --ignore=tests/unit/moe_test.py \
+            --ignore=tests/unit/multihost_dataloading_test.py \
+            --ignore=tests/unit/pipeline_parallelism_test.py \
+            --ignore=tests/unit/tfds_data_processing_test.py \
+            --ignore=tests/unit/tokenizer_test.py \
+            -k "not scheduled_only" \
+            2>&1 || UNIT_TEST_EXIT=$?
+
+          # Always run the env smoke test (should always pass)
+          ENV_SMOKE_EXIT=0
+          python3 -m pytest tests/unit/test_env_smoke.py -v || ENV_SMOKE_EXIT=$?
+
+          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ]
+        env:
+        # --- GitHub token for cloning private repo ---
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${JOB_NAME}-token
+              key: token
+        # --- Runtime env ---
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        - name: PATH
+          value: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: TPU_PROCESS_ADDRESSES
+          value: ${JOB_NAME}-0.${JOB_NAME}-headless-svc:8476
+        - name: TPU_PROCESS_PORT
+          value: "8476"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            ephemeral-storage: 20Gi
+            google.com/tpu: "4"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /models
+          name: gcs-fuse-csi-ephemeral
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      restartPolicy: Never
+      serviceAccountName: gcs-account
+      subdomain: ${JOB_NAME}-headless-svc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: tmpfs
+      - emptyDir:
+          medium: Memory
+        name: gke-gcsfuse-cache
+      - name: gcs-fuse-csi-ephemeral
+        persistentVolumeClaim:
+          claimName: ant-pretrain-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory
