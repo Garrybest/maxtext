@@ -1,0 +1,229 @@
+#!/bin/bash
+# Ling2 Pretraining Script
+# Architecture: Ling2 (Hybrid MLA/GLA + MoE)
+# Dataset: Megatron MMap indexed datasets (.bin/.idx)
+
+set -e
+
+# ============================================================================
+# 1. Tokenizer Config
+# ============================================================================
+# Vocabulary size must match the tokenizer used to create the mmap data
+VOCAB_SIZE=157184
+# Token IDs matching the tokenizer (used directly, no tokenizer loading needed for mmap)
+PAD_ID=156892   # <|endoftext|>
+BOS_ID=156891   # <|startoftext|>
+
+# ============================================================================
+# 2. Basic Environment Config (GCS Bucket & Run Name)
+# ============================================================================
+BASE_OUTPUT_DIR=${GCS_BUCKET:-"gs://ant-pretrain/pretrain/dev"}
+RUN_NAME=${RUN_NAME:-"ling2-pretrain-$(date +%Y%m%d_%H%M)"}
+OUTPUT_DIR="${BASE_OUTPUT_DIR}/${RUN_NAME}"
+
+# ============================================================================
+# 3. JAX Multi-node Config (Auto-detect)
+# ============================================================================
+if [[ -n "$TPU_PROCESS_ADDRESSES" ]]; then
+    JAX_COORDINATOR_ADDRESS=$(echo "$TPU_PROCESS_ADDRESSES" | cut -d',' -f1)
+    export JAX_COORDINATOR_ADDRESS
+    echo "Multi-node detection: Coordinator -> $JAX_COORDINATOR_ADDRESS"
+    echo "   Worker ID: $TPU_WORKER_ID"
+    echo "   TPU Topology: $TPU_TOPOLOGY"
+else
+    echo "TPU_PROCESS_ADDRESSES not detected, assuming single machine."
+fi
+
+# ============================================================================
+# 4. Dataset Config (Megatron MMap Indexed)
+# ============================================================================
+# Path prefixes for .idx/.bin files (without extension), or directories containing them
+# Path format for mmap_npy:
+#   single dataset: "npy_dir|bin_prefix_or_dir"
+#   blended dataset: "npy_dir|bin_prefix_or_dir,weight;npy_dir|bin_prefix_or_dir,weight"
+# The .npy index files encode document ordering, sampling, and shuffle.
+# bin_dirs provide the raw token data (.bin/.idx files).
+DATASET_TYPE="grain"
+GRAIN_FILE_TYPE="mmap_npy"
+
+NEMO_HQ_T2E_WEIGHT="0.597200"
+NEMO_MHQ_T2E_WEIGHT="0.402800"
+NEMO_HQ_T2E_BIN_PREFIX="/models/datasets/nemotron-cc-v2.1_megatron_indexed/High-Quality-Translated-To-English_text_document"
+NEMO_MHQ_T2E_BIN_PREFIX="/models/datasets/nemotron-cc-v2.1_megatron_indexed/Medium-High-Quality-Translated-To-English_text_document"
+# Replace these with the actual per-component npy index directories.
+NEMO_HQ_T2E_NPY_DIR="/models/datasets/hqt-npy"
+NEMO_MHQ_T2E_NPY_DIR="/models/datasets/mqt-npy"
+
+GRAIN_TRAIN_FILES="${NEMO_HQ_T2E_NPY_DIR}|${NEMO_HQ_T2E_BIN_PREFIX}"
+GRAIN_EVAL_FILES=${GRAIN_EVAL_FILES:-$GRAIN_TRAIN_FILES}
+# Pre-generated Megatron blended indices directory.
+# This directory should contain:
+#   - dataset_index.npy
+#   - dataset_sample_index.npy
+BLEND_INDEX_DIR="/models/datasets/ling2.5-blend/"
+# Conservative Grain dataloader parallelism for multi-host stability.
+GRAIN_WORKER_COUNT=${GRAIN_WORKER_COUNT:-8}
+GRAIN_PER_WORKER_BUFFER_SIZE=${GRAIN_PER_WORKER_BUFFER_SIZE:-32}
+GRAIN_NUM_THREADS=${GRAIN_NUM_THREADS:-16}
+GRAIN_PREFETCH_BUFFER_SIZE=${GRAIN_PREFETCH_BUFFER_SIZE:-500}
+MMAP_SPLIT_SENTENCES="true"  # Data was generated with --split-sentences
+# MTP Plan C: Allow cross-document attention with packing for efficiency
+PACKING="true"  # Enable sequence packing for better GPU/TPU utilization
+RESET_ATTENTION_MASK="false"  # Allow cross-document attention (Megatron default mode)
+EOD_MASK_LOSS="true"  # Exclude EOD tokens from loss (matching Megatron --eod-mask-loss)
+
+# ============================================================================
+# 5. Training Hyperparameters
+# ============================================================================
+MODEL_NAME="ling2"
+CONFIG_FILE="src/maxtext/configs/base.yml"
+
+# Training Steps and Batch Size
+STEPS=${STEPS:-100000}
+if [ "$STEPS" -le 0 ] 2>/dev/null; then
+    echo "Error: STEPS must be > 0 (got: $STEPS)" >&2
+    exit 1
+fi
+MAX_SEQ_LEN=4096
+
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-2}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+
+EVAL_INTERVAL=${EVAL_INTERVAL:-1490}
+EVAL_STEPS=1
+OPT_TYPE="adamw"
+ADAM_B1=0.9
+ADAM_B2=0.95
+ADAM_WEIGHT_DECAY=0.1
+MU_DTYPE="float32"  # Megatron uses fp32 master weights; must match to avoid multi-step divergence
+GRADIENT_CLIPPING_THRESHOLD=1.0
+LEARNING_RATE=0.000336
+MIN_LEARNING_RATE=0.000336  # Constant LR: min_lr = lr
+WARMUP_ITERS=${WARMUP_ITERS:-250}
+WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${STEPS})")
+# Constant learning rate schedule (matching Megatron --lr-decay-style constant)
+COSINE_LEARNING_RATE_FINAL_FRACTION=1.0  # Keep at 1.0 for constant LR
+LEARNING_RATE_SCHEDULE_STEPS=$STEPS
+DATA_SHUFFLE_SEED=42
+INIT_WEIGHTS_SEED=42
+REMAT_POLICY=${REMAT_POLICY:-"save_out_proj"}
+
+CHECKPOINT_PERIOD=${CHECKPOINT_PERIOD:-100}
+
+# ============================================================================
+# 6. Start Training Command
+# ============================================================================
+echo "========================================================"
+echo "Starting Ling2 Training"
+echo "   Model Arch : Ling2 (MLA + GLA + MoE)"
+echo "   Output Dir : $OUTPUT_DIR"
+echo "   Dataset    : $GRAIN_TRAIN_FILES"
+echo "   Eval Data  : $GRAIN_EVAL_FILES"
+echo "   BlendIndex : $BLEND_INDEX_DIR"
+echo "   Per-Device Batch: $PER_DEVICE_BATCH_SIZE"
+echo "   Grad Accum : $GRADIENT_ACCUMULATION_STEPS"
+echo "   LR Schedule: Constant (warmup=${WARMUP_ITERS}, lr=${LEARNING_RATE})"
+echo "========================================================"
+
+LIBTPU_INIT_ARGS_DEFAULT="\
+--xla_tpu_enable_async_collective_fusion=true \
+--xla_tpu_enable_async_collective_fusion_multiple_steps=true \
+--xla_tpu_overlap_compute_collective_tc=true \
+--xla_enable_async_all_gather=true \
+--xla_enable_async_collective_permute=true \
+--xla_tpu_enable_all_experimental_scheduler_features=true \
+--xla_tpu_scoped_vmem_limit_kib=65536 \
+--xla_tpu_dvfs_p_state=7 \
+--xla_tpu_enable_async_collective_fusion_fuse_all_gather=false \
+--xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=false \
+--xla_tpu_enable_async_collective_fusion_fuse_all_reduce=false \
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=true \
+--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true \
+--xla_tpu_enable_sparse_core_collective_offload_all_reduce=true"
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS_DEFAULT} ${LIBTPU_INIT_ARGS:-}"
+echo "   LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
+    model_name=$MODEL_NAME \
+    override_model_config=true \
+    run_name=$RUN_NAME \
+    base_output_directory=$BASE_OUTPUT_DIR \
+    \
+    `# --- Dataset Loading (Megatron MMap) ---` \
+    dataset_type=$DATASET_TYPE \
+    grain_file_type=$GRAIN_FILE_TYPE \
+    grain_train_files=$GRAIN_TRAIN_FILES \
+    grain_eval_files=$GRAIN_EVAL_FILES \
+    grain_worker_count=$GRAIN_WORKER_COUNT \
+    grain_per_worker_buffer_size=$GRAIN_PER_WORKER_BUFFER_SIZE \
+    grain_num_threads=$GRAIN_NUM_THREADS \
+    grain_prefetch_buffer_size=$GRAIN_PREFETCH_BUFFER_SIZE \
+    grain_worker_count_eval=$GRAIN_WORKER_COUNT \
+    grain_per_worker_buffer_size_eval=$GRAIN_PER_WORKER_BUFFER_SIZE \
+    grain_num_threads_eval=$GRAIN_NUM_THREADS \
+    grain_prefetch_buffer_size_eval=$GRAIN_PREFETCH_BUFFER_SIZE \
+    mmap_split_sentences=$MMAP_SPLIT_SENTENCES \
+    blend_index_dir=$BLEND_INDEX_DIR \
+    packing=$PACKING \
+    reset_attention_mask=$RESET_ATTENTION_MASK \
+    eod_mask_loss=$EOD_MASK_LOSS \
+    \
+    `# --- Tokenizer IDs (no tokenizer loading needed for mmap) ---` \
+    vocab_size=$VOCAB_SIZE \
+    pad_id=$PAD_ID \
+    bos_id=$BOS_ID \
+    \
+    `# --- Training Parameters ---` \
+    steps=$STEPS \
+    eval_interval=$EVAL_INTERVAL \
+    eval_steps=$EVAL_STEPS \
+    max_target_length=$MAX_SEQ_LEN \
+    per_device_batch_size=$PER_DEVICE_BATCH_SIZE \
+    gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS \
+    data_shuffle_seed=$DATA_SHUFFLE_SEED \
+    init_weights_seed=$INIT_WEIGHTS_SEED \
+    \
+    `# --- Optimizer (adam) ---` \
+    opt_type=$OPT_TYPE        \
+    adam_b1=$ADAM_B1               \
+    adam_b2=$ADAM_B2               \
+    adam_weight_decay=$ADAM_WEIGHT_DECAY      \
+    mu_dtype=$MU_DTYPE                        \
+    `# --- learning rate ---` \
+    gradient_clipping_threshold=$GRADIENT_CLIPPING_THRESHOLD \
+    learning_rate=$LEARNING_RATE \
+    warmup_steps_fraction=$WARMUP_STEPS_FRACTION \
+    cosine_learning_rate_final_fraction=$COSINE_LEARNING_RATE_FINAL_FRACTION \
+    learning_rate_schedule_steps=$LEARNING_RATE_SCHEDULE_STEPS \
+    \
+    `# --- Parallelism Strategy (configurable via ENV) ---` \
+    ici_data_parallelism=${ICI_DATA_PARALLELISM:-1} \
+    ici_fsdp_parallelism=${ICI_FSDP_PARALLELISM:-1} \
+    ici_tensor_parallelism=${ICI_TENSOR_PARALLELISM:-1} \
+    ici_context_parallelism=${ICI_CONTEXT_PARALLELISM:-1} \
+    ici_expert_parallelism=${ICI_EXPERT_PARALLELISM:-8} \
+    shard_exp_on_fsdp=${SHARD_EXP_ON_FSDP:-false} \
+    \
+    `# --- Performance Optimization ---` \
+    remat_policy=$REMAT_POLICY \
+    `# --- System Config ---` \
+    enable_checkpointing=false \
+    save_checkpoint_on_completion=false \
+    enable_emergency_checkpoint=false \
+    enable_multi_tier_checkpointing=false \
+    checkpoint_period=$CHECKPOINT_PERIOD \
+    async_checkpointing=false \
+    gcs_metrics=false \
+    save_config_to_gcs=false \
+    load_parameters_path=/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/ \
+    log_period=10 \
+    \
+    `# --- Profiler (optional, controlled by ENV) ---` \
+    ${PROFILER:+profiler=$PROFILER} \
+    ${PROFILER:+skip_first_n_steps_for_profiler=${SKIP_FIRST_N_STEPS_FOR_PROFILER:-1}} \
+    ${PROFILER:+profiler_steps=${PROFILER_STEPS:-5}} \
+    \
+    "$@"
+
+
+echo "Training finished (or submitted). Check GCS for logs."

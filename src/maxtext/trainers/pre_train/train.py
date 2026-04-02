@@ -204,21 +204,19 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       total_z_loss = jnp.sum(z_loss)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  # If gradient accumulation is enabled, we don't need to divide total_loss
-  # by total_weights and then multiply the computed gradient by total_weights,
-  # since it's equivalent to computing the gradient from total_loss.
-  # This simplification reduces the number of operations and makes it easier
-  # for XLA to move all-reduce out of the gradient accumulation loop when use
-  # Zero1+GA to reduce communication overhead.
-  # EPS was used to avoid division by zero, but it's not needed when gradient
-  # accumulation is enabled since there's no division.
-  if config.gradient_accumulation_steps > 1 and not config.use_tunix_gradient_accumulation:
+  # GA loss convention:
+  # - use_ga_raw_sum=True: loss_fn returns raw CE sum, GA divides by total_weights
+  #   or gradient_accumulation_steps later. Aux losses need * total_weights compensation.
+  # - use_ga_raw_sum=False: loss_fn returns per-token average directly.
+  # Three conditions for raw sum mode: GA>1, per-token mode, and not Tunix GA.
+  use_ga_raw_sum = (
+      config.gradient_accumulation_steps > 1
+      and config.calculate_per_token_loss
+      and not config.use_tunix_gradient_accumulation
+  )
+  if use_ga_raw_sum:
     loss = total_loss
   else:
-    # When using Tunix gradient accumulation, we revert to standard normalization.
-    # Unlike the manual accumulation path above, Tunix (via optax.MultiSteps) expects
-    # a normalized loss for each step. It handles the accumulation state
-    # updates and scaling internally.
     loss = total_loss / (total_weights + EPS)
 
   # We keep z-loss normalized by total_weights.
@@ -228,7 +226,13 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   mtp_loss = 0.0
   if config.mtp_num_layers > 0 and is_train:
     mtp_loss = calculate_mtp_loss(intermediate_outputs, config)
-    loss += mtp_loss
+    # Note: This differs from MaxText upstream which uses `loss += mtp_loss` unconditionally.
+    # In GA raw-sum mode, aux losses must be scaled by total_weights so that when GA later
+    # divides gradients by total_weights, aux loss gradients maintain their correct magnitude.
+    if use_ga_raw_sum:
+      loss += mtp_loss * total_weights
+    else:
+      loss += mtp_loss
 
   # get indexer loss
   indexer_loss = 0.0
@@ -244,7 +248,10 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
 
     if indexer_losses:
       indexer_loss = jnp.mean(jnp.concatenate(indexer_losses))
-      loss += indexer_loss
+      if use_ga_raw_sum:
+        loss += indexer_loss * total_weights
+      else:
+        loss += indexer_loss
     else:
       max_logging.debug("No indexer loss found.")
 
@@ -269,7 +276,10 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       max_logging.debug("\nNo MoE load balance loss found. Defaulting to 0.0.")
 
     moe_lb_loss = jnp.mean(jnp.array(total_moe_lb_loss))
-    loss += moe_lb_loss
+    if use_ga_raw_sum:
+      loss += moe_lb_loss * total_weights
+    else:
+      loss += moe_lb_loss
 
   # get MoE routed bias term updates
   moe_bias_updates = None
@@ -356,6 +366,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       raw_grads,
   )
   intermediate_outputs = aux["intermediate_outputs"]
+  total_loss = aux["total_loss"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
   indexer_loss = aux["indexer_loss"]
@@ -401,8 +412,15 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
     new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
 
+  # Compute lm_loss: pure LM cross-entropy per-token loss, matching Megatron's "lm loss".
+  if config.gradient_accumulation_steps > 1:
+    lm_loss = aux["lm_loss"]
+  else:
+    lm_loss = total_loss / (total_weights + EPS)
+
   scalar_metrics = {
       "learning/loss": loss,
+      "learning/lm_loss": lm_loss,
       "learning/z_loss": z_loss,
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
@@ -422,6 +440,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+    scalar_metrics["learning/num_zeros"] = jax.tree_util.tree_reduce(
+        lambda acc, x: acc + jnp.sum(x == 0), raw_grads, initializer=jnp.array(0, dtype=jnp.int64)
+    )
+  scalar_metrics["learning/is_nan"] = jnp.any(jnp.isnan(lm_loss)).astype(jnp.int32)
+  scalar_metrics["learning/is_inf"] = jnp.any(jnp.isinf(lm_loss)).astype(jnp.int32)
   if config.use_dpo:
     scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
   metrics = {
@@ -574,6 +597,8 @@ def train_loop(config, recorder, state=None):
         for eval_batch in eval_data_iterator:
           if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
             break
+          # Ensure eval batch sharding matches train data sharding to avoid cross-device transfer.
+          eval_batch = jax.device_put(eval_batch, data_loader.input_data_shardings)
           with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)

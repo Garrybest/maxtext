@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding
 
 from maxtext.common.common_types import ShardMode
+from maxtext.utils.globals import EPS
 from maxtext.utils.sharding import maybe_shard_with_name
 
 
@@ -58,8 +59,15 @@ def gradient_accumulation_loss_and_grad(
 
   Returns:
       A tuple containing:
-      - total_loss (Array): The mean loss, averaged over all microbatches.
-      - final_aux (PyTree): Auxiliary outputs, summed across microbatches.
+      - total_loss (Array): The mean loss (mixed: LM + auxiliary losses),
+          averaged over all microbatches — same semantics as the upstream
+          single-batch path. When ``calculate_per_token_loss`` is True
+          (default), the LM component is the global per-token average;
+          when False, it is the average of per-microbatch per-token losses
+          (matching Megatron's equal-weight mode).
+      - final_aux (PyTree): Auxiliary outputs, averaged across microbatches.
+          Includes an extra ``lm_loss`` key: the pure LM cross-entropy loss
+          (no auxiliary losses), comparable to Megatron's ``lm loss``.
       - raw_grads (PyTree): The accumulated and averaged gradients.
   """
 
@@ -98,6 +106,9 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
     acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
     acc_grad_and_loss["total_weights"] += aux["total_weights"]
+    # Megatron mode: accumulate per-microbatch per-token loss for equal-weight averaging
+    if not config.calculate_per_token_loss:
+      acc_grad_and_loss["lm_loss_per_token"] += aux["total_loss"] / (aux["total_weights"] + EPS)
     return acc_grad_and_loss, aux
 
   def reshape_to_microbatch_accumulations(batch_arr):
@@ -117,22 +128,47 @@ def gradient_accumulation_loss_and_grad(
       "moe_lb_loss": 0.0,
       "indexer_loss": 0.0,
       "mtp_loss": 0.0,
+      "lm_loss_per_token": 0.0,
       "ga_params": ga_params,
   }
 
   grad_and_loss, aux = jax.lax.scan(
       accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
   )
+  # Gradient normalization strategy depends on calculate_per_token_loss:
+  # - True (default): divide by total_weights (global per-token average across all micro-batches)
+  # - False: divide by gradient_accumulation_steps (equal-weight average of per-microbatch
+  #   per-token-averaged gradients, matching Megatron's default mode)
+  total_weights = grad_and_loss["total_weights"]
+  grad_divisor = (
+      total_weights + EPS
+      if config.calculate_per_token_loss
+      else config.gradient_accumulation_steps
+  )
+  # Compute pure LM loss (cross-entropy only, no auxiliary losses).
+  if config.calculate_per_token_loss:
+    lm_loss = grad_and_loss["loss"] / (total_weights + EPS)
+  else:
+    lm_loss = grad_and_loss["lm_loss_per_token"] / config.gradient_accumulation_steps
+  # Mixed loss preserves upstream semantics: LM + all auxiliary losses.
   loss = (
-      grad_and_loss["loss"] / grad_and_loss["total_weights"]
+      lm_loss
       + grad_and_loss["moe_lb_loss"] / config.gradient_accumulation_steps
       + grad_and_loss["indexer_loss"] / config.gradient_accumulation_steps
       + grad_and_loss["mtp_loss"] / config.gradient_accumulation_steps
   )
   raw_grads = grad_and_loss["grad"]
   raw_grads = jax.tree.map(_maybe_shard_with_name, raw_grads, params_shardings)
-  raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_and_loss["total_weights"], raw_grads)
+  raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_divisor, raw_grads)
   aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
+
+  # Fix metrics reporting: aux metrics in aux are sums across K microbatches,
+  # but should be averages for consistent reporting with GA=1 case.
+  aux["mtp_loss"] = aux["mtp_loss"] / config.gradient_accumulation_steps
+  aux["moe_lb_loss"] = aux["moe_lb_loss"] / config.gradient_accumulation_steps
+  aux["indexer_loss"] = aux["indexer_loss"] / config.gradient_accumulation_steps
+  # Inject pure LM loss for downstream metrics (comparable to Megatron's "lm loss").
+  aux["lm_loss"] = lm_loss
 
   return loss, aux, raw_grads
 
