@@ -115,11 +115,11 @@ def get_test_base_output_directory(cloud_path=None):
 
   Returns:
     Local test logs directory when decoupled, otherwise returns
-    the specified cloud path or default GCS runner-maxtext-logs bucket.
+    the specified cloud path or default GCS primatrix-maxtext-logs bucket.
   """
   if is_decoupled():
     return os.path.join("maxtext_local_output", "gcloud_decoupled_test_logs")
-  return cloud_path or "gs://runner-maxtext-logs"
+  return cloud_path or "gs://primatrix-maxtext-logs"
 
 
 __all__ = [

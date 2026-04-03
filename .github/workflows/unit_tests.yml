@@ -133,11 +133,11 @@ jobs:
           kubectl logs -f "job/$JOB_NAME" -c jax-tpu || true
 
           echo "Waiting for job completion status..."
-          if kubectl wait --for=condition=complete --timeout=60s "job/$JOB_NAME" 2>/dev/null; then
+          if kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" 2>/dev/null; then
             echo "Unit tests completed successfully!"
             exit 0
           fi
-          if kubectl wait --for=condition=failed --timeout=10s "job/$JOB_NAME" 2>/dev/null; then
+          if kubectl wait --for=condition=failed --timeout=30s "job/$JOB_NAME" 2>/dev/null; then
             echo "Unit tests failed!"
             exit 1
           fi
