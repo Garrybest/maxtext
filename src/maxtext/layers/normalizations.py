@@ -102,6 +102,59 @@ class GlobalRMSNorm(RMSNorm):
     return y_flat.reshape(input_shape)
 
 
+class GroupRMSNorm(nnx.Module):
+  """Group RMS normalization.
+
+  Divides the feature dimension into ``group_norm_size`` groups and applies
+  independent RMS normalization to each group.
+  """
+
+  def __init__(
+      self,
+      num_features: int,
+      group_norm_size: int,
+      epsilon: float = 1e-6,
+      dtype: Any = jnp.float32,
+      weight_dtype: Any = jnp.float32,
+      shard_mode: ShardMode = ShardMode.AUTO,
+      kernel_axes: tuple[None | str, ...] = (),
+      scale_init: Initializer = nn.initializers.ones,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    self.num_features = num_features
+    self.group_norm_size = group_norm_size
+    if group_norm_size <= 0:
+      raise ValueError(f"group_norm_size must be positive, got {group_norm_size}")
+    if num_features % group_norm_size != 0:
+      raise ValueError(f"num_features ({num_features}) must be divisible by " f"group_norm_size ({group_norm_size})")
+    self.epsilon = epsilon
+    self.dtype = dtype
+    self.weight_dtype = weight_dtype
+    self.shard_mode = shard_mode
+    self.kernel_axes = kernel_axes
+    self.scale = nnx.Param(
+        scale_init(rngs.params(), (num_features,), weight_dtype),
+        sharding=kernel_axes,
+    )
+
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    """Applies group RMS normalization on the input."""
+    input_dtype = x.dtype
+    input_shape = x.shape
+    d = input_shape[-1]
+    group_shape = (*input_shape[:-1], self.group_norm_size, d // self.group_norm_size)
+
+    x = jnp.asarray(x, jnp.float32)
+    x_grouped = x.reshape(group_shape)
+    variance = jnp.mean(lax.square(x_grouped), axis=-1, keepdims=True)
+    x_normed = x_grouped * lax.rsqrt(variance + self.epsilon)
+    x_normed = x_normed.reshape(input_shape)
+
+    scale = jnp.asarray(self.scale.value, self.dtype)
+    return jnp.asarray(x_normed * scale, input_dtype)
+
+
 def Qwen3NextRMSNorm(num_features: int, eps: float, dtype: DType, weight_dtype: DType, *, rngs: nnx.Rngs):
   """
   Used for input and post attention layernorms

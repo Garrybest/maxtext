@@ -23,7 +23,9 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "tops @ git+https://github.com/primatrix/pallas-kernel.git@release/v0.3",
+]
 
 [tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
 tpu = ["src/dependencies/requirements/generated_requirements/tpu-requirements.txt"]

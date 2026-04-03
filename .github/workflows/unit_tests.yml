@@ -11,6 +11,14 @@ on:
         description: "Branch to test"
         required: true
         default: "main"
+      dump_dir:
+        description: "Megatron dump directory on GCS-Fuse (leave empty to auto-detect)"
+        required: false
+        default: ""
+      ckpt_path:
+        description: "Orbax checkpoint path"
+        required: false
+        default: "/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/"
 
 concurrency:
   group: unit-tests-${{ github.head_ref || github.event.inputs.branch || github.ref_name }}
@@ -28,6 +36,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+
+      - name: Resolve dump directory
+        id: dump
+        run: |
+          INPUT_DIR="${{ github.event.inputs.dump_dir }}"
+          if [ -n "$INPUT_DIR" ]; then
+            echo "Using user-specified dump dir: $INPUT_DIR"
+            echo "dir=$INPUT_DIR" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dump dir not specified; K8s pod will auto-detect from GCS-Fuse mount."
+            echo "dir=auto" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -69,6 +89,7 @@ jobs:
           JOB_NAME="${{ steps.job.outputs.name }}"
           kubectl create secret generic "${JOB_NAME}-token" \
             --from-literal=token="${{ github.token }}" \
+            --from-literal=cross-repo-token="${{ secrets.CROSS_REPO_TOKEN }}" \
             --dry-run=client -o yaml | kubectl apply -f -
           kubectl label secret "${JOB_NAME}-token" \
             app=ci-unit-tests \
@@ -79,9 +100,11 @@ jobs:
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
           BRANCH: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+          DUMP_DIR: ${{ steps.dump.outputs.dir }}
+          CKPT_PATH: ${{ github.event.inputs.ckpt_path || '/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/' }}
           BRANCH_LABEL: ${{ steps.branch.outputs.label }}
         run: |
-          envsubst '$JOB_NAME $BRANCH $BRANCH_LABEL' \
+          envsubst '$JOB_NAME $BRANCH $DUMP_DIR $CKPT_PATH $BRANCH_LABEL' \
             < .github/ci/unit-tests-job.yaml \
             | kubectl apply -f -
 

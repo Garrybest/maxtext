@@ -1,6 +1,6 @@
 # CI Unit Tests - K8s Manifests
-# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL
-# Runs pytest unit tests on TPU.
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $DUMP_DIR $CKPT_PATH $BRANCH_LABEL
+# Runs pytest unit tests + GLA compare test on TPU.
 ---
 # Headless Service for TPU pod DNS resolution (required for JAX coordinator)
 apiVersion: v1
@@ -65,13 +65,163 @@ spec:
           source maxtext_venv/bin/activate
           uv pip install -e '.[tpu]' --resolution=lowest
           uv pip install pytest pytest-timeout
+          git config --global url."https://x-access-token:${CROSS_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git clone --depth=1 "https://github.com/primatrix/Argus.git" Argus
+          pip install -e Argus
 
           export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/src
 
-          # 3. Run unit tests
+          # 2.5. Install gcloud CLI for fast GCS downloads (bypasses GCS-Fuse)
+          curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt 2>&1 | tail -1
+          export PATH="/opt/google-cloud-sdk/bin:${PATH}"
+
+          # 3. Resolve dump directory (auto-detect from GCS-Fuse if not specified)
+          is_dump_complete() {
+            local d="$1"
+            local step_dir=$(ls -d "${d}"/step_* 2>/dev/null | head -1)
+            if [ -z "${step_dir}" ]; then
+              echo "  INCOMPLETE: no step_* dirs in ${d}" >&2
+              return 1
+            fi
+            local rank_dir=$(ls -d "${step_dir}"/rank_* 2>/dev/null | head -1)
+            if [ -z "${rank_dir}" ]; then
+              echo "  INCOMPLETE: no rank_* dirs in ${step_dir}" >&2
+              return 1
+            fi
+            if [ ! -f "${rank_dir}/forward/index.json" ]; then
+              echo "  INCOMPLETE: no forward/index.json in ${rank_dir}" >&2
+              return 1
+            fi
+            echo "  COMPLETE: ${d}" >&2
+            return 0
+          }
+
+          find_valid_dump() {
+            local candidates="$1"
+            for d in $(echo "${candidates}" | sort -r); do
+              [ -z "${d}" ] && continue
+              if is_dump_complete "${d}"; then
+                echo "${d}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          RESOLVED_DUMP_DIR="${DUMP_DIR}"
+          if [ "${RESOLVED_DUMP_DIR}" = "auto" ] || [ -z "${RESOLVED_DUMP_DIR}" ]; then
+            echo "Auto-detecting megatron_ci dump from /models/argus_dump/..."
+            CANDIDATES=$(ls -d /models/argus_dump/megatron_ci_* 2>/dev/null \
+              | grep -E '/megatron_ci_[0-9]{8}_[0-9]{6}_[0-9a-f]+$')
+            RESOLVED_DUMP_DIR=$(find_valid_dump "${CANDIDATES}") || true
+            if [ -z "${RESOLVED_DUMP_DIR}" ]; then
+              echo "ERROR: No complete megatron_ci dump found in /models/argus_dump/"
+              echo "  All candidates checked:"
+              echo "${CANDIDATES}" | sed 's/^/    /'
+              exit 1
+            fi
+          fi
+
+          # 4. Pre-copy test data from GCS to ramdisk for faster I/O
+          RAMDISK="/tmp/ramdisk"
+          RAMDISK_DUMP="${RAMDISK}/dump"
+          RAMDISK_CKPT="${RAMDISK}/ckpt"
+          ACTIVE_CKPT="${CKPT_PATH}"
+
+          FUSE_MOUNT="/models"
+          GCS_BUCKET=$(awk -v mp="${FUSE_MOUNT}" '$2 == mp {print $1}' /proc/mounts)
+          if [ -z "${GCS_BUCKET}" ]; then
+            echo "WARNING: Cannot detect GCS bucket from ${FUSE_MOUNT} mount, falling back to cp"
+            USE_GCLOUD=false
+          else
+            echo "Detected GCS bucket: ${GCS_BUCKET} (mounted at ${FUSE_MOUNT})"
+            USE_GCLOUD=true
+          fi
+
+          fuse_to_gcs() {
+            echo "gs://${GCS_BUCKET}/${1#${FUSE_MOUNT}/}"
+          }
+
+          echo ""
+          echo "========================================================"
+          echo "Pre-copying test data to ramdisk (via $(${USE_GCLOUD} && echo gcloud || echo cp))"
+          echo "  dump-dir: ${RESOLVED_DUMP_DIR}"
+          echo "  ckpt-path: ${ACTIVE_CKPT}"
+          echo "========================================================"
+
+          COPY_START=$(date +%s)
+
+          STEP1_DIR="${RESOLVED_DUMP_DIR}/step_1"
+          if [ ! -d "${STEP1_DIR}" ]; then
+            echo "ERROR: ${STEP1_DIR} not found"
+            exit 1
+          fi
+          for rank_dir in "${STEP1_DIR}"/rank_*; do
+            rank_name=$(basename "${rank_dir}")
+            dest="${RAMDISK_DUMP}/step_1/${rank_name}"
+            mkdir -p "${dest}"
+            (
+              cp "${rank_dir}/metadata.yaml" "${dest}/" 2>/dev/null || true
+              for cat_dir in "${rank_dir}"/*/; do
+                cat_name=$(basename "${cat_dir}")
+                case "${cat_name}" in
+                  forward|backward|grads)
+                    mkdir -p "${dest}/${cat_name}"
+                    if ${USE_GCLOUD}; then
+                      gcs_src="$(fuse_to_gcs "${cat_dir}")"
+                      if ! gcloud storage cp -r "${gcs_src}*" "${dest}/${cat_name}/" 2>&1; then
+                        echo "WARNING: gcloud cp failed for ${gcs_src}, falling back to cp" >&2
+                        cp -a "${cat_dir}"/. "${dest}/${cat_name}/"
+                      fi
+                    else
+                      cp -a "${cat_dir}"/. "${dest}/${cat_name}/"
+                    fi
+                    ;;
+                  *)
+                    ln -s "${cat_dir}" "${dest}/${cat_name}"
+                    ;;
+                esac
+              done
+            ) &
+          done
+
+          for step_dir in "${RESOLVED_DUMP_DIR}"/step_*; do
+            step_name=$(basename "${step_dir}")
+            [ "${step_name}" = "step_1" ] && continue
+            ln -s "${step_dir}" "${RAMDISK_DUMP}/${step_name}"
+          done
+
+          (
+            if ${USE_GCLOUD}; then
+              gcs_ckpt="$(fuse_to_gcs "${ACTIVE_CKPT}")"
+              mkdir -p "${RAMDISK_CKPT}"
+              if ! gcloud storage cp -r "${gcs_ckpt}*" "${RAMDISK_CKPT}/" 2>&1; then
+                echo "WARNING: gcloud cp failed for ${gcs_ckpt}, falling back to cp" >&2
+                cp -a "${ACTIVE_CKPT}"/. "${RAMDISK_CKPT}/"
+              fi
+            else
+              cp -a "${ACTIVE_CKPT}"/. "${RAMDISK_CKPT}/"
+            fi
+          ) &
+
+          wait
+          COPY_EXIT=$?
+          COPY_END=$(date +%s)
+          echo "  Ramdisk copy done in $((COPY_END - COPY_START))s (exit=${COPY_EXIT})"
+          echo "  Copied sizes: dump=$(du -sh "${RAMDISK_DUMP}" | awk '{print $1}'), ckpt=$(du -sh "${RAMDISK_CKPT}" | awk '{print $1}')"
+          echo "  Ramdisk usage: $(df -h "${RAMDISK}" | tail -1 | awk '{print $3 "/" $2 " (" $5 " used)"}')"
+
+          RESOLVED_DUMP_DIR="${RAMDISK_DUMP}"
+          ACTIVE_CKPT="${RAMDISK_CKPT}"
+
+          # 5. Run unit tests
+          export DUMP_DIR="${RESOLVED_DUMP_DIR}"
+          export CKPT_PATH="${ACTIVE_CKPT}"
           echo ""
           echo "========================================================"
           echo "Running unit tests"
+          echo "  dump-dir: ${RESOLVED_DUMP_DIR}"
+          echo "  ckpt-path: ${ACTIVE_CKPT}"
           echo "========================================================"
 
           UNIT_TEST_EXIT=0
@@ -88,6 +238,7 @@ spec:
             --ignore=tests/unit/pipeline_parallelism_test.py \
             --ignore=tests/unit/tfds_data_processing_test.py \
             --ignore=tests/unit/tokenizer_test.py \
+            --ignore=tests/unit/gla_compare_test.py \
             -k "not scheduled_only" \
             2>&1 || UNIT_TEST_EXIT=$?
 
@@ -95,14 +246,32 @@ spec:
           ENV_SMOKE_EXIT=0
           python3 -m pytest tests/unit/test_env_smoke.py -v || ENV_SMOKE_EXIT=$?
 
-          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ]
+          # GLA compare test (Megatron dump precision comparison)
+          GLA_EXIT=0
+          echo ""
+          echo "========================================================"
+          echo "Running GLA compare test"
+          echo "========================================================"
+          python3 tests/unit/gla_compare_test.py -v || GLA_EXIT=$?
+
+          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ]
         env:
+        # --- Unit test config (from workflow dispatch inputs) ---
+        - name: DUMP_DIR
+          value: "${DUMP_DIR}"
+        - name: CKPT_PATH
+          value: "${CKPT_PATH}"
         # --- GitHub token for cloning private repo ---
         - name: GITHUB_TOKEN
           valueFrom:
             secretKeyRef:
               name: ${JOB_NAME}-token
               key: token
+        - name: CROSS_REPO_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ${JOB_NAME}-token
+              key: cross-repo-token
         # --- Runtime env ---
         - name: PIP_CACHE_DIR
           value: /tmp/ramdisk/.cache/pip
@@ -137,7 +306,7 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
+          sizeLimit: 600Gi
         name: tmpfs
       - emptyDir:
           medium: Memory
