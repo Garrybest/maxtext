@@ -664,7 +664,7 @@ hf_access_token: ''
 grain_train_files: ''
 grain_eval_files: ''
 grain_train_mixture_config_path: '' # Path to a JSON file specifying the mixture weights for Grain training data.
-grain_file_type: 'arrayrecord' # arrayrecord or parquet
+grain_file_type: 'arrayrecord' # arrayrecord, tfrecord, parquet, mmap, or mmap_npy
 grain_packing_type: 'first_fit' # 'first_fit', 'best_fit' or 'concat_then_split'. See details of the corresponding module in https://google-grain.readthedocs.io/en/latest/grain.experimental.html
 grain_worker_count: 1 # Set to -1 to enable auto-tuning: automatically determines optimal worker count. See https://google-grain.readthedocs.io/en/latest/_autosummary/grain.experimental.pick_performance_config.html
 grain_per_worker_buffer_size: 1
@@ -681,6 +681,14 @@ grain_num_threads_eval: 16
 grain_prefetch_buffer_size_eval: 500
 grain_data_source_max_workers: 16  # Max workers for ThreadPoolExecutor when mixing multiple Grain data sources.
 grain_shuffle_buffer_size: 100 # shuffle buffer when using sequential access formats such as Parquet, TFRecord.
+# for MMap/Megatron data format (grain_file_type=mmap or mmap_npy)
+mmap_eod_id: 0  # End-of-document token ID for mmap/mmap_npy data format
+blend_cache_dir: ''  # Cache directory for auto-generated blend indices
+blend_index_dir: ''  # Directory for pre-generated blend index .npy files
+reset_attention_mask: True  # Reset attention at document boundaries
+eod_mask_loss: False  # Exclude EOD tokens from loss
+mmap_split_sentences: False  # Document-level indexing for sentence-split data
+mmap_npy_split: ''      # Megatron split ratio, e.g. '99,1' or '98,1,1'. Train=split0, eval=split1
 # for using pathways
 colocated_python_data_input: False  # experimental feature, under testing
 

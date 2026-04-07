@@ -1119,7 +1119,8 @@ class GrainDataset(BaseModel):
       description="Path to a JSON file specifying the mixture weights for Grain training data.",
   )
   grain_file_type: str = Field(
-      "arrayrecord", description="File type for Grain data. Supported: arrayrecord, tfrecord, parquet."
+      "arrayrecord",
+      description="File type for Grain data. Supported: arrayrecord, tfrecord, parquet, mmap, mmap_npy.",
   )
   grain_worker_count: int = Field(1, description="Number of workers for Grain data loading.")
   grain_per_worker_buffer_size: int = Field(1, description="Per-worker buffer size for Grain train data loading.")
@@ -1171,6 +1172,39 @@ class GrainDataset(BaseModel):
   mmap_split_sentences: bool = Field(
       False,
       description="Enable sentence-level splitting when loading mmap format data.",
+  )
+
+
+class MMapDataset(BaseModel):
+  """Configuration for MMap/Megatron-compatible data format (grain_file_type='mmap' or 'mmap_npy')."""
+
+  mmap_eod_id: int = Field(
+      0,
+      description="End-of-document token ID for mmap/mmap_npy data format.",
+  )
+  blend_cache_dir: PathStr = Field(
+      "",
+      description="Cache directory for auto-generated Megatron blend indices.",
+  )
+  blend_index_dir: PathStr = Field(
+      "",
+      description="Directory for pre-generated dataset_index.npy / dataset_sample_index.npy blend indices.",
+  )
+  reset_attention_mask: bool = Field(
+      True,
+      description="When True, attention resets at document boundaries and positions restart per document.",
+  )
+  eod_mask_loss: bool = Field(
+      False,
+      description="When True, EOD tokens are excluded from loss computation.",
+  )
+  mmap_split_sentences: bool = Field(
+      False,
+      description="When True, uses document-level indexing for sentence-split mmap data.",
+  )
+  mmap_npy_split: str = Field(
+      "",
+      description="Megatron split ratio, e.g. '99,1' or '98,1,1'. Train=split0, eval=split1.",
   )
 
 
@@ -2049,6 +2083,7 @@ class MaxTextConfig(
     TfdsDataset,
     HfDataset,
     GrainDataset,
+    MMapDataset,
     Tokenizer,
     # Inference
     InferenceGeneral,
