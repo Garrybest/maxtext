@@ -375,6 +375,220 @@ class TestRollAndMask(unittest.TestCase):
     rolled_by_0 = multi_token_prediction.roll_and_mask(input_tensor, shift=0)
     self.assertTrue(jnp.array_equal(rolled_by_0, input_tensor), "A shift of 0 should be a no-op.")
 
+  def test_roll_and_mask_by_segment(self):
+    """Validates that roll_and_mask_by_segment respects document boundaries."""
+    # Two documents in a single sequence: [doc1, doc1, doc1, doc2, doc2, pad, pad, pad]
+    x = jnp.array([[10, 20, 30, 40, 50, 0, 0, 0]], dtype=jnp.int32)
+    segment_ids = jnp.array([[1, 1, 1, 2, 2, 0, 0, 0]], dtype=jnp.int32)
+
+    rolled = multi_token_prediction.roll_and_mask_by_segment(x, segment_ids, shift=-1)
+    # Position 0 -> 20 (same segment 1->1)
+    # Position 1 -> 30 (same segment 1->1)
+    # Position 2 -> 0  (boundary: segment 1->2)
+    # Position 3 -> 50 (same segment 2->2)
+    # Position 4 -> 0  (boundary: segment 2->0)
+    # Position 5,6,7 -> 0 (padding/boundary)
+    expected = jnp.array([[20, 30, 0, 50, 0, 0, 0, 0]], dtype=jnp.int32)
+    self.assertTrue(
+        jnp.array_equal(rolled, expected),
+        f"Segment-aware rolling incorrect. Got {rolled}, expected {expected}",
+    )
+
+  def test_roll_and_mask_by_segment_none_fallback(self):
+    """Validates that None segment_ids falls back to simple roll_and_mask."""
+    x = jnp.array([[10, 20, 30, 40]], dtype=jnp.int32)
+    rolled = multi_token_prediction.roll_and_mask_by_segment(x, None, shift=-1)
+    expected = jnp.array([[20, 30, 40, 0]], dtype=jnp.int32)
+    self.assertTrue(jnp.array_equal(rolled, expected))
+
+
+class TestCalculateMtpLoss(unittest.TestCase):
+  """Unit tests for the calculate_mtp_loss function with both normalization modes."""
+
+  def test_global_normalization(self):
+    """Global normalization: sum(losses) / sum(weights)."""
+    mtp_losses_array = jnp.array([10.0, 6.0])
+    mtp_weights_array = jnp.array([100.0, 50.0])
+    intermediate_outputs = {"mtp_losses": {"mtp_block": {"losses": (mtp_losses_array,), "weights": (mtp_weights_array,)}}}
+
+    class FakeConfig:
+      """Fake config for testing."""
+
+      mtp_per_layer_loss_norm = False
+      mtp_loss_scaling_factor = 0.1
+
+    scaled_loss, raw_loss = multi_token_prediction.calculate_mtp_loss(intermediate_outputs, FakeConfig())
+    expected_raw = 16.0 / 150.0
+    self.assertAlmostEqual(float(raw_loss), expected_raw, places=5)
+    self.assertAlmostEqual(float(scaled_loss), expected_raw * 0.1, places=5)
+
+  def test_per_layer_normalization(self):
+    """Per-layer normalization: mean(loss_k / weight_k)."""
+    mtp_losses_array = jnp.array([10.0, 6.0])
+    mtp_weights_array = jnp.array([100.0, 50.0])
+    intermediate_outputs = {"mtp_losses": {"mtp_block": {"losses": (mtp_losses_array,), "weights": (mtp_weights_array,)}}}
+
+    class FakeConfig:
+      """Fake config for testing."""
+
+      mtp_per_layer_loss_norm = True
+      mtp_loss_scaling_factor = 0.1
+
+    scaled_loss, raw_loss = multi_token_prediction.calculate_mtp_loss(intermediate_outputs, FakeConfig())
+    expected_raw = (10.0 / 100.0 + 6.0 / 50.0) / 2.0
+    self.assertAlmostEqual(float(raw_loss), expected_raw, places=5)
+    self.assertAlmostEqual(float(scaled_loss), expected_raw * 0.1, places=5)
+
+  def test_empty_losses_returns_zero(self):
+    """When no MTP losses are present, returns (0.0, 0.0)."""
+
+    class FakeConfig:
+      """Fake config for testing."""
+
+      mtp_per_layer_loss_norm = False
+      mtp_loss_scaling_factor = 0.1
+
+    scaled, raw = multi_token_prediction.calculate_mtp_loss({}, FakeConfig())
+    self.assertEqual(scaled, 0.0)
+    self.assertEqual(raw, 0.0)
+
+  def test_array_format_input(self):
+    """When inputs are arrays (NNX Variable format) instead of tuples."""
+    intermediate_outputs = {
+        "mtp_losses": {"mtp_block": {"losses": jnp.array([10.0, 6.0]), "weights": jnp.array([100.0, 50.0])}}
+    }
+
+    class FakeConfig:
+      """Fake config for testing."""
+
+      mtp_per_layer_loss_norm = False
+      mtp_loss_scaling_factor = 0.1
+
+    _, raw_loss = multi_token_prediction.calculate_mtp_loss(intermediate_outputs, FakeConfig())
+    self.assertAlmostEqual(float(raw_loss), 16.0 / 150.0, places=5)
+
+
+class TestOutputProjectionMode(unittest.TestCase):
+  """Tests that MTP block selects the correct output projection path."""
+
+  def _run_forward(self, mtp_final_layernorm):
+    """Run MTP block forward and return log of which projection method was called."""
+    extra_args = get_decoupled_parallelism_overrides()
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="mtp_output_proj_test",
+        skip_jax_distributed_system=True,
+        mtp_num_layers=1,
+        base_emb_dim=16,
+        mtp_final_layernorm=mtp_final_layernorm,
+        **extra_args,
+    )
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+    rngs = nnx.Rngs(params=42, dropout=42)
+    batch_size = jax.device_count()
+    seq_len = 8
+
+    call_log = []
+
+    class TrackingMockDecoder:
+      """Mock decoder that tracks which output projection method is called."""
+
+      def __init__(self, config):
+        self.config = config
+        self.model_mode = MODEL_MODE_TRAIN
+
+      def _apply_embedding(self, _emb, input_ids, _pos, _det, model_mode):
+        b, s = input_ids.shape
+        return jnp.zeros((b, s, self.config.base_emb_dim), dtype=self.config.dtype)
+
+      def apply_output_head(self, _emb, hidden_state, _det, model_mode):
+        call_log.append("apply_output_head")
+        b, s, _ = hidden_state.shape
+        return jnp.zeros((b, s, self.config.vocab_size), dtype=self.config.dtype)
+
+      def apply_output_projection(self, _emb, hidden_state, _det, model_mode):
+        call_log.append("apply_output_projection")
+        b, s, _ = hidden_state.shape
+        return jnp.zeros((b, s, self.config.vocab_size), dtype=self.config.dtype)
+
+    block = multi_token_prediction.MultiTokenPredictionBlock(
+        config=cfg,
+        mesh=mesh,
+        transformer_layer_module=NNXDecoderLayer,
+        decoder=TrackingMockDecoder(cfg),
+        rngs=rngs,
+    )
+
+    shared_emb = embeddings.Embed(
+        num_embeddings=cfg.vocab_size, num_features=cfg.base_emb_dim, config=cfg, mesh=mesh, rngs=rngs
+    )
+    block(
+        shared_emb,
+        jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, cfg.base_emb_dim)),
+        jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+        jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+        jnp.ones((batch_size, seq_len)),
+        position_ids=jnp.broadcast_to(jnp.arange(seq_len), (batch_size, seq_len)),
+        decoder_segment_ids=jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+        model_mode=MODEL_MODE_TRAIN,
+        deterministic=True,
+    )
+    return call_log
+
+  def test_final_layernorm_false_uses_output_head(self):
+    """When mtp_final_layernorm=False, apply_output_head is called."""
+    call_log = self._run_forward(mtp_final_layernorm=False)
+    self.assertIn("apply_output_head", call_log)
+    self.assertNotIn("apply_output_projection", call_log)
+
+  def test_final_layernorm_true_uses_output_projection(self):
+    """When mtp_final_layernorm=True, apply_output_projection is called."""
+    call_log = self._run_forward(mtp_final_layernorm=True)
+    self.assertIn("apply_output_projection", call_log)
+    self.assertNotIn("apply_output_head", call_log)
+
+
+class TestGradientAccumulationMtpMetrics(unittest.TestCase):
+  """Tests MTP metric accumulation and normalization in gradient accumulation."""
+
+  def test_raw_mtp_loss_normalization(self):
+    """Verifies raw_mtp_loss is averaged across GA steps, not summed."""
+    ga_steps = 4
+    per_step_raw_mtp_loss = 0.5
+    per_step_mtp_loss = 0.05
+
+    acc = {"mtp_loss": 0.0, "raw_mtp_loss": 0.0}
+    for _ in range(ga_steps):
+      acc["mtp_loss"] += per_step_mtp_loss
+      acc["raw_mtp_loss"] += per_step_raw_mtp_loss
+
+    normalized_mtp_loss = acc["mtp_loss"] / ga_steps
+    normalized_raw_mtp_loss = acc["raw_mtp_loss"] / ga_steps
+
+    self.assertAlmostEqual(normalized_mtp_loss, per_step_mtp_loss, places=5)
+    self.assertAlmostEqual(normalized_raw_mtp_loss, per_step_raw_mtp_loss, places=5)
+
+  def test_mtp_expert_counts_averaging(self):
+    """Verifies mtp_expert_counts are averaged (not summed) across GA steps."""
+    ga_steps = 4
+    per_step_counts = jnp.ones(8) * 10.0
+    total_counts = per_step_counts * ga_steps
+    averaged = total_counts / ga_steps
+    self.assertTrue(jnp.allclose(averaged, per_step_counts))
+
+  def test_none_expert_counts_skipped(self):
+    """Verifies None expert counts are safely skipped during normalization."""
+    ga_steps = 4
+    aux = {"moe_expert_counts": jnp.ones(8) * 40.0, "mtp_expert_counts": None}
+
+    for key in ["moe_expert_counts", "mtp_expert_counts"]:
+      if aux.get(key) is not None:
+        aux[key] = jax.tree.map(lambda x: x / ga_steps, aux[key])
+
+    self.assertTrue(jnp.allclose(aux["moe_expert_counts"], jnp.ones(8) * 10.0))
+    self.assertIsNone(aux["mtp_expert_counts"])
+
 
 if __name__ == "__main__":
   unittest.main()

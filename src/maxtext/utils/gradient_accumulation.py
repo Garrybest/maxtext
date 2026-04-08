@@ -104,6 +104,7 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
     acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
     acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
+    acc_grad_and_loss["raw_mtp_loss"] += aux["raw_mtp_loss"]
     acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
     acc_grad_and_loss["total_weights"] += aux["total_weights"]
     # Megatron mode: accumulate per-microbatch per-token loss for equal-weight averaging
@@ -129,6 +130,7 @@ def gradient_accumulation_loss_and_grad(
       "indexer_loss": 0.0,
       "mtp_loss": 0.0,
       "lm_loss_per_token": 0.0,
+      "raw_mtp_loss": 0.0,
       "ga_params": ga_params,
   }
 
@@ -140,11 +142,7 @@ def gradient_accumulation_loss_and_grad(
   # - False: divide by gradient_accumulation_steps (equal-weight average of per-microbatch
   #   per-token-averaged gradients, matching Megatron's default mode)
   total_weights = grad_and_loss["total_weights"]
-  grad_divisor = (
-      total_weights + EPS
-      if config.calculate_per_token_loss
-      else config.gradient_accumulation_steps
-  )
+  grad_divisor = total_weights + EPS if config.calculate_per_token_loss else config.gradient_accumulation_steps
   # Compute pure LM loss (cross-entropy only, no auxiliary losses).
   if config.calculate_per_token_loss:
     lm_loss = grad_and_loss["loss"] / (total_weights + EPS)
@@ -165,10 +163,16 @@ def gradient_accumulation_loss_and_grad(
   # Fix metrics reporting: aux metrics in aux are sums across K microbatches,
   # but should be averages for consistent reporting with GA=1 case.
   aux["mtp_loss"] = aux["mtp_loss"] / config.gradient_accumulation_steps
+  aux["raw_mtp_loss"] = aux["raw_mtp_loss"] / config.gradient_accumulation_steps
   aux["moe_lb_loss"] = aux["moe_lb_loss"] / config.gradient_accumulation_steps
   aux["indexer_loss"] = aux["indexer_loss"] / config.gradient_accumulation_steps
   # Inject pure LM loss for downstream metrics (comparable to Megatron's "lm loss").
   aux["lm_loss"] = lm_loss
+  # Expert counts are summed across microbatches by scan but must be averaged,
+  # otherwise the effective update rate is amplified by gradient_accumulation_steps.
+  for key in ["moe_expert_counts", "mtp_expert_counts"]:
+    if aux.get(key) is not None:
+      aux[key] = jax.tree.map(lambda x: x / config.gradient_accumulation_steps, aux[key])
 
   return loss, aux, raw_grads
 

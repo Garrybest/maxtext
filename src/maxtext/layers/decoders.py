@@ -678,16 +678,20 @@ class Decoder(nn.Module):
     return y
 
   @nn.compact
-  def apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
-    """Applies final normalization and projects hidden states to logits."""
+  def apply_decoder_norm(self, y: jnp.ndarray) -> jnp.ndarray:
+    """Applies the final decoder normalization to hidden states.
 
+    This produces the same normalized output as the decoder_norm inside
+    apply_output_head, but without the subsequent projection. Used to
+    normalize hidden states before passing them to MTP when
+    mtp_final_layernorm=True, matching Megatron's TransformerBlock behavior.
+    """
     cfg = self.config
     if cfg.shard_mode == ShardMode.EXPLICIT:
       norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length_no_exp", "activation_embed"))
     else:
       norm_out_sharding = None
-
-    y = self.get_norm_layer(num_features=y.shape[-1])(
+    return self.get_norm_layer(num_features=y.shape[-1])(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="decoder_norm",
@@ -695,6 +699,37 @@ class Decoder(nn.Module):
         kernel_axes=("norm",),
         parameter_memory_host_offload=cfg.parameter_memory_host_offload,
     )(y, out_sharding=norm_out_sharding)
+
+  @nn.compact
+  def apply_output_head(self, shared_embedding: nn.Module | nnx.Module, y, deterministic, model_mode):
+    """Applies final normalization and projects hidden states to logits."""
+    y = self.apply_decoder_norm(y)
+    return self.apply_output_projection(shared_embedding, y, deterministic, model_mode)
+
+  @nn.compact
+  def apply_output_projection(
+      self,
+      shared_embedding: nn.Module | nnx.Module,
+      y: jnp.ndarray,
+      deterministic: bool,
+      model_mode: str,
+  ) -> jnp.ndarray:
+    """Projects hidden states to logits WITHOUT applying decoder_norm.
+
+    Used by MTP layers which have their own final_layernorm and should not
+    apply the shared decoder_norm again (which would cause double normalization).
+
+    Args:
+      shared_embedding: Shared embedding module for logit projection.
+      y: Hidden states of shape [batch, length, emb_dim], already normalized
+        by MTP's own final_layernorm.
+      deterministic: Whether to disable dropout.
+      model_mode: Operational mode (train, prefill, autoregressive).
+
+    Returns:
+      Logits of shape [batch, length, vocab_size].
+    """
+    cfg = self.config
     y = nn.Dropout(rate=cfg.dropout_rate, broadcast_dims=(-2,))(y, deterministic=deterministic)
 
     if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
@@ -704,9 +739,7 @@ class Decoder(nn.Module):
           self.mesh, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
       )
 
-    # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
-      # Use the transpose of embedding matrix for logit transform.
       if isinstance(shared_embedding, nnx.Module):
         embedding_table = shared_embedding.embedding.value
       else:
@@ -717,7 +750,6 @@ class Decoder(nn.Module):
       logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
 
       if self.config.normalize_embedding_logits:
-        # Correctly normalize pre-softmax logits for this shared case.
         logits = logits / jnp.sqrt(y.shape[-1])
       if cfg.final_logits_soft_cap:
         logits = logits / cfg.final_logits_soft_cap
@@ -727,7 +759,7 @@ class Decoder(nn.Module):
           inputs_shape=y.shape,
           out_features_shape=cfg.vocab_size,
           weight_dtype=cfg.weight_dtype,
-          dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
+          dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,
           kernel_axes=("embed", "vocab"),
           shard_mode=cfg.shard_mode,
           name="logits_dense",
@@ -736,7 +768,7 @@ class Decoder(nn.Module):
       )(
           y,
           out_sharding=out_sharding,
-      )  # We do not quantize the logits matmul.
+      )
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)

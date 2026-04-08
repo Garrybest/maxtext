@@ -464,6 +464,17 @@ class MTP(BaseModel):
       0,
       description="Specifies which MTP layer is used to calculate metrics.",
   )
+  mtp_final_layernorm: bool = Field(
+      False,
+      description="If True, apply an extra RMSNorm after each MTP transformer layer output.",
+  )
+  mtp_per_layer_loss_norm: bool = Field(
+      False,
+      description=(
+          "If True, normalize MTP loss per-layer independently before averaging "
+          "(Megatron-LM style). If False, use global sum(losses)/sum(weights)."
+      ),
+  )
 
 
 class Logits(BaseModel):

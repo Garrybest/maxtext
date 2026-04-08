@@ -14,7 +14,7 @@
 
 """JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437 """
 
-from typing import Type
+from typing import Optional, Type, Union
 
 from flax import linen as nn
 from flax import nnx
@@ -22,12 +22,14 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 from maxtext.common.common_types import Config, MODEL_MODE_TRAIN
-from maxtext.layers.nnx_decoders import NNXDecoderLayer
 from maxtext.utils.globals import EPS
 from maxtext.layers.decoders import DecoderLayer
+from maxtext.layers.nnx_decoders import NNXDecoderLayer
 from maxtext.layers.initializers import variable_to_logically_partitioned
 from maxtext.layers.linears import DenseGeneral
 from maxtext.layers.normalizations import RMSNorm
+from maxtext.layers import nnx_wrappers
+from maxtext.layers import quantizations
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import sharding
@@ -59,6 +61,57 @@ def roll_and_mask(x: jnp.ndarray, shift: int = -1) -> jnp.ndarray:
   return jnp.roll(x, shift, axis=1).at[:, shift:, ...].set(0)
 
 
+def roll_and_mask_by_segment(x: jnp.ndarray, segment_ids: jnp.ndarray, shift: int = -1) -> jnp.ndarray:
+  """Rolls sequence left within document boundaries defined by segment_ids.
+
+  For each position, if the next position belongs to a different segment (or is
+  the last position), the rolled value is zeroed out instead of wrapping around
+  from the next document.
+
+  When segment_ids is None or all positions have the same non-zero segment ID
+  (reset_attention_mask=False mode), this behaves like roll_and_mask, only
+  zeroing the last position.
+
+  Args:
+    x: Input array of shape [batch, seq_len, ...].
+    segment_ids: Integer segment IDs of shape [batch, seq_len], or None.
+      Same segment ID = same document. 0 = padding/EOD.
+      If None, falls back to simple roll_and_mask behavior.
+    shift: Number of positions to shift left (must be -1).
+
+  Returns:
+    Rolled array with cross-boundary and tail positions zeroed.
+  """
+  assert shift == -1, f"roll_and_mask_by_segment only supports shift=-1, got {shift}"
+
+  # If segment_ids is None, fall back to simple roll_and_mask
+  if segment_ids is None:
+    return roll_and_mask(x, shift)
+
+  # Standard left-roll by 1
+  rolled = jnp.roll(x, shift, axis=1)
+  # Zero out the absolute last position (same as original)
+  rolled = rolled.at[:, shift:, ...].set(0)
+
+  # Build boundary mask: True where position i and i+1 are in different segments,
+  # or where position i is padding (segment_id == 0).
+  seg_current = segment_ids  # [batch, seq_len]
+  seg_next = jnp.roll(segment_ids, shift, axis=1)  # shifted segment_ids
+  seg_next = seg_next.at[:, shift:].set(0)  # last pos -> 0
+
+  # A position is a boundary if:
+  #   1. current segment != next segment (document boundary), OR
+  #   2. current segment == 0 (padding/EOD position)
+  is_boundary = (seg_current != seg_next) | (seg_current == 0)  # [batch, seq_len]
+
+  # Expand mask to match x's shape for broadcasting
+  mask = is_boundary
+  for _ in range(x.ndim - 2):
+    mask = jnp.expand_dims(mask, axis=-1)
+
+  return jnp.where(mask, 0, rolled)
+
+
 class MultiTokenPredictionLayer(nnx.Module):
   """Multi-Token Prediction layer: normalize, concatenate, project, and transform.
 
@@ -70,7 +123,8 @@ class MultiTokenPredictionLayer(nnx.Module):
       config: Config,
       mesh: Mesh,
       layer_number: int,
-      transformer_layer_module: Type[NNXDecoderLayer],
+      transformer_layer_module: Type[Union[DecoderLayer, NNXDecoderLayer]],
+      quant: Optional[quantizations.AqtQuantization] = None,
       *,
       rngs: nnx.Rngs,
   ):
@@ -98,6 +152,15 @@ class MultiTokenPredictionLayer(nnx.Module):
         kernel_axes=("norm",),
         rngs=rngs,
     )
+    if cfg.mtp_final_layernorm:
+      self.final_layernorm = RMSNorm(
+          num_features=cfg.emb_dim,
+          epsilon=cfg.normalization_layer_epsilon,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          kernel_axes=("norm",),
+          rngs=rngs,
+      )
     self.projection_layer = DenseGeneral(
         in_features_shape=2 * cfg.emb_dim,
         out_features_shape=cfg.emb_dim,
@@ -108,13 +171,34 @@ class MultiTokenPredictionLayer(nnx.Module):
         rngs=rngs,
     )
     # Use MODEL_MODE_TRAIN for initialization; runtime model_mode is passed dynamically.
-    self.transformer_layer = transformer_layer_module(
-        config=cfg,
-        mesh=mesh,
-        model_mode=MODEL_MODE_TRAIN,
-        name=f"mtp_{k}_transformer_layer",
-        rngs=rngs,
-    )
+    is_nnx_layer = issubclass(transformer_layer_module, nnx.Module)
+    if is_nnx_layer:
+      # Native NNX layer: instantiate directly (original upstream behavior).
+      self.transformer_layer = transformer_layer_module(
+          config=cfg,
+          mesh=mesh,
+          model_mode=MODEL_MODE_TRAIN,
+          name=f"mtp_{k}_transformer_layer",
+          rngs=rngs,
+      )
+    else:
+      # Linen layer: wrap with ToNNX and lazy_init for parameter setup.
+      mtp_transformer_layer = transformer_layer_module(
+          config=cfg,
+          mesh=mesh,
+          model_mode=MODEL_MODE_TRAIN,
+          name=f"mtp_{k}_transformer_layer",
+          quant=quant,
+      )
+      self.transformer_layer = nnx_wrappers.ToNNX(mtp_transformer_layer, rngs=rngs)
+      batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(cfg, MODEL_MODE_TRAIN)
+      self.transformer_layer.lazy_init(
+          inputs=jnp.zeros((batch_size, seq_len, cfg.emb_dim), dtype=cfg.dtype),
+          decoder_segment_ids=jnp.ones((batch_size, seq_len), dtype=jnp.int32),
+          decoder_positions=jnp.zeros((batch_size, seq_len), dtype=jnp.int32),
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
 
   @property
   def embedding_norm(self):
@@ -147,6 +231,14 @@ class MultiTokenPredictionLayer(nnx.Module):
   @transformer_layer.setter
   def transformer_layer(self, module):
     setattr(self, f"mtp_{self.layer_number}_transformer_layer", module)
+
+  @property
+  def final_layernorm(self):
+    return getattr(self, f"mtp_{self.layer_number}_final_layernorm")
+
+  @final_layernorm.setter
+  def final_layernorm(self, module):
+    setattr(self, f"mtp_{self.layer_number}_final_layernorm", module)
 
   def __call__(
       self,
@@ -192,7 +284,10 @@ class MultiTokenPredictionLayer(nnx.Module):
         model_mode=model_mode,
     )
 
-    return output[0] if isinstance(output, tuple) else output
+    output = output[0] if isinstance(output, tuple) else output
+    if self.config.mtp_final_layernorm:
+      output = self.final_layernorm(output)
+    return output
 
 
 class MultiTokenPredictionBlock(nnx.Module):
@@ -202,9 +297,10 @@ class MultiTokenPredictionBlock(nnx.Module):
       self,
       config: Config,
       mesh: Mesh,
-      transformer_layer_module: Type[NNXDecoderLayer],
+      transformer_layer_module: Type[Union[DecoderLayer, NNXDecoderLayer]],
       decoder: nnx.Module,
       rngs: nnx.Rngs,
+      quant: Optional[quantizations.AqtQuantization] = None,
   ):
     self.config = config
     self.mesh = mesh
@@ -219,6 +315,7 @@ class MultiTokenPredictionBlock(nnx.Module):
           mesh=mesh,
           layer_number=k,
           transformer_layer_module=transformer_layer_module,
+          quant=quant,
           rngs=rngs.fork(),
       )
       setattr(self, f"mtp_layer_{k}", layer)
@@ -249,19 +346,26 @@ class MultiTokenPredictionBlock(nnx.Module):
     mtp_weights_list = []
     mtp_preds_list = []
     mtp_masks_list = []
+    mtp_segment_ids_list = []
+
+    # Track segment boundaries for segment-aware rolling
+    rolled_segment_ids = decoder_segment_ids
 
     for k in range(1, cfg.mtp_num_layers + 1):
-      rolled_input_ids = roll_and_mask(rolled_input_ids)
-      rolled_target_ids = roll_and_mask(rolled_target_ids)
-      rolled_target_mask = roll_and_mask(rolled_target_mask)
-      rolled_position_id = roll_and_mask(rolled_position_id)
+      rolled_input_ids = roll_and_mask_by_segment(rolled_input_ids, rolled_segment_ids)
+      rolled_target_ids = roll_and_mask_by_segment(rolled_target_ids, rolled_segment_ids)
+      rolled_target_mask = roll_and_mask_by_segment(rolled_target_mask, rolled_segment_ids)
+      rolled_position_id = roll_and_mask_by_segment(rolled_position_id, rolled_segment_ids)
+      # Roll segment_ids itself for the next iteration (using plain roll)
+      if rolled_segment_ids is not None:
+        rolled_segment_ids = roll_and_mask(rolled_segment_ids)
 
       target_token_embedding = self.decoder._apply_embedding(
           shared_embedding,
           rolled_input_ids,
           rolled_position_id,
           deterministic,
-          model_mode=self.decoder.model_mode,
+          model_mode=model_mode,
       )
 
       mtp_layer = getattr(self, f"mtp_layer_{k}")
@@ -271,10 +375,17 @@ class MultiTokenPredictionBlock(nnx.Module):
           position_ids=position_ids,
           decoder_segment_ids=decoder_segment_ids,
           deterministic=deterministic,
-          model_mode=self.decoder.model_mode,
+          model_mode=model_mode,
       )
 
-      mtp_logits = self.decoder.apply_output_head(shared_embedding, mtp_hidden_state, deterministic, model_mode)
+      if cfg.mtp_final_layernorm:
+        # MTP layer has its own final_layernorm; skip shared decoder_norm
+        # to avoid double normalization. Matches Megatron's architecture.
+        mtp_logits = self.decoder.apply_output_projection(shared_embedding, mtp_hidden_state, deterministic, model_mode)
+      else:
+        # No MTP-specific final_layernorm; use apply_output_head which
+        # applies the shared decoder_norm before projection.
+        mtp_logits = self.decoder.apply_output_head(shared_embedding, mtp_hidden_state, deterministic, model_mode)
 
       mtp_xent, _ = max_utils.cross_entropy_with_logits(
           mtp_logits, jax.nn.one_hot(rolled_target_ids, cfg.vocab_size), 0.0
@@ -289,21 +400,31 @@ class MultiTokenPredictionBlock(nnx.Module):
         # Float32 to avoid gradient errors; converted back to int32 in acceptance calculation.
         mtp_preds_list.append(jnp.argmax(mtp_logits, axis=-1).astype(jnp.float32))
         mtp_masks_list.append(rolled_target_mask)
+        mtp_segment_ids_list.append(decoder_segment_ids)
 
     if mtp_losses_list:
-      # Not part of checkpoints, don't declare in __init__
-      self.losses = mtp_losses(jnp.stack(mtp_losses_list))
-      self.weights = mtp_losses(jnp.stack(mtp_weights_list))
+      # Use self.sow to output results instead of storing them in the module state.
+      # This ensures they are always materialized tracers and NOT subject to
+      # checkpoint template issues.
+      # Sow per-layer so the resulting tuple has mtp_num_layers entries.
+      for loss, weight in zip(mtp_losses_list, mtp_weights_list):
+        self.sow(mtp_losses, "losses", loss)
+        self.sow(mtp_losses, "weights", weight)
     if mtp_preds_list:
-      # Not part of checkpoints, don't declare in __init__
-      self.mtp_preds = mtp_acceptance(jnp.stack(mtp_preds_list))
-      self.mtp_mask = mtp_acceptance(jnp.stack(mtp_masks_list))
+      self.sow(mtp_acceptance, "mtp_preds", jnp.stack(mtp_preds_list))
+      self.sow(mtp_acceptance, "mtp_mask", jnp.stack(mtp_masks_list))
+      self.sow(mtp_acceptance, "segment_ids", jnp.stack(mtp_segment_ids_list))
 
     return {}
 
 
 def calculate_mtp_loss(intermediate_outputs, config):
-  """Calculates Multi-Token Prediction loss from intermediate outputs."""
+  """Calculates Multi-Token Prediction loss from intermediate outputs.
+
+  Returns:
+    A tuple of (scaled_mtp_loss, raw_mtp_loss) where raw_mtp_loss is the
+    unscaled per-token average for logging purposes.
+  """
   mtp_losses_data = maxtext_utils.get_nested_value(
       intermediate_outputs, ("mtp_losses", "mtp_block", "losses"), default=None
   )
@@ -312,22 +433,31 @@ def calculate_mtp_loss(intermediate_outputs, config):
   )
 
   if mtp_losses_data is None:
-    return 0.0
+    return 0.0, 0.0
 
   # Handle both tuple (Linen sow) and array (NNX Variable) formats.
   if isinstance(mtp_losses_data, (tuple, list)):
     if not mtp_losses_data:
-      return 0.0
+      return 0.0, 0.0
     mtp_losses_array = jnp.array(mtp_losses_data)
     mtp_weights_array = jnp.array(mtp_weights_data)
   else:
     if mtp_losses_data.size == 0:
-      return 0.0
+      return 0.0, 0.0
     mtp_losses_array = mtp_losses_data
     mtp_weights_array = mtp_weights_data
 
-  avg_mtp_loss = jnp.sum(mtp_losses_array) / (jnp.sum(mtp_weights_array) + EPS)
-  return avg_mtp_loss * config.mtp_loss_scaling_factor
+  if config.mtp_per_layer_loss_norm:
+    # Per-layer independent normalization (Megatron-LM style): each layer's loss
+    # is divided by its own valid token count, then averaged across layers.
+    # This ensures each MTP layer contributes equally to the final loss regardless
+    # of differing valid token counts across layers.
+    per_layer_avg_losses = mtp_losses_array / (mtp_weights_array + EPS)
+    avg_mtp_loss = jnp.mean(per_layer_avg_losses)
+  else:
+    # Global normalization (upstream default): sum all losses, divide by sum of all weights.
+    avg_mtp_loss = jnp.sum(mtp_losses_array) / (jnp.sum(mtp_weights_array) + EPS)
+  return avg_mtp_loss * config.mtp_loss_scaling_factor, avg_mtp_loss
 
 
 def calculate_mtp_acceptance_rate(intermediate_outputs, config):
@@ -341,6 +471,9 @@ def calculate_mtp_acceptance_rate(intermediate_outputs, config):
   mtp_preds = mtp_preds_raw[0] if isinstance(mtp_preds_raw, (tuple, list)) and mtp_preds_raw else mtp_preds_raw
   valid_mask = valid_mask_raw[0] if isinstance(valid_mask_raw, (tuple, list)) and valid_mask_raw else valid_mask_raw
 
+  segment_ids_raw = maxtext_utils.get_nested_value(sown_data, ("segment_ids",), None)
+  segment_ids = segment_ids_raw[0] if isinstance(segment_ids_raw, (tuple, list)) and segment_ids_raw else segment_ids_raw
+
   # Only populated during eval for the target MTP module.
   if mtp_preds is None or valid_mask is None:
     return 0.0
@@ -350,8 +483,14 @@ def calculate_mtp_acceptance_rate(intermediate_outputs, config):
 
   # Align main model predictions with MTP head target by rolling k steps.
   rolled_main_preds = main_model_preds
-  for _ in range(config.mtp_eval_target_module):
-    rolled_main_preds = roll_and_mask(rolled_main_preds)
+  if segment_ids is not None:
+    rolled_seg = segment_ids
+    for _ in range(config.mtp_eval_target_module):
+      rolled_main_preds = roll_and_mask_by_segment(rolled_main_preds, rolled_seg)
+      rolled_seg = roll_and_mask(rolled_seg)
+  else:
+    for _ in range(config.mtp_eval_target_module):
+      rolled_main_preds = roll_and_mask(rolled_main_preds)
 
   correct_predictions = jnp.sum((mtp_preds == rolled_main_preds) * valid_mask)
   total_valid_tokens = jnp.sum(valid_mask)
@@ -363,10 +502,11 @@ def multi_token_prediction_block_as_linen(
     *,
     config: Config,
     mesh: Mesh,
-    transformer_layer_module: Type[DecoderLayer],
+    transformer_layer_module: Type[Union[DecoderLayer, NNXDecoderLayer]],
     decoder: nnx.Module,
     rngs: nnx.Rngs,
     name: str | None = None,
+    quant: Optional[quantizations.AqtQuantization] = None,
 ) -> nn.Module:
   """Initializes MultiTokenPredictionBlock as a Linen module.
 
@@ -377,11 +517,12 @@ def multi_token_prediction_block_as_linen(
     decoder: The decoder module that provides embedding and output head.
     rngs: Random number generators for initialization.
     name: Optional name for the module.
+    quant: Optional quantization configuration.
 
   Returns:
     An instance of MultiTokenPredictionBlock wrapped as a Linen module.
   """
-  return nnx.bridge.to_linen(
+  return nnx_wrappers.to_linen(
       MultiTokenPredictionBlock,
       config=config,
       mesh=mesh,
@@ -390,4 +531,5 @@ def multi_token_prediction_block_as_linen(
       rngs=rngs,
       metadata_fn=variable_to_logically_partitioned,
       name=name,
+      quant=quant,
   )

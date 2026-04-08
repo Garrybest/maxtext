@@ -744,15 +744,38 @@ class NNXDecoder(nnx.Module):
 
   def apply_output_head(self, shared_embedding, y, deterministic, model_mode):
     """Applies final normalization and projects hidden states to logits."""
-
     cfg = self.config
     if cfg.shard_mode == ShardMode.EXPLICIT:
       norm_out_sharding = create_sharding(self.mesh, ("activation_batch", "activation_length_no_exp", "activation_embed"))
     else:
       norm_out_sharding = None
-
     y = self.decoder_norm(y, out_sharding=norm_out_sharding)
-    y = self.dropout(y, deterministic=deterministic)  # NNX call
+    return self.apply_output_projection(shared_embedding, y, deterministic, model_mode)
+
+  def apply_output_projection(
+      self,
+      shared_embedding: nn.Module | nnx.Module,
+      y: jnp.ndarray,
+      deterministic: bool,
+      model_mode: str,
+  ) -> jnp.ndarray:
+    """Projects hidden states to logits WITHOUT applying decoder_norm.
+
+    Used by MTP layers which have their own final_layernorm and should not
+    apply the shared decoder_norm again (which would cause double normalization).
+
+    Args:
+      shared_embedding: Shared embedding module for logit projection.
+      y: Hidden states of shape [batch, length, emb_dim], already normalized
+        by MTP's own final_layernorm.
+      deterministic: Whether to disable dropout.
+      model_mode: Operational mode (train, prefill, autoregressive).
+
+    Returns:
+      Logits of shape [batch, length, vocab_size].
+    """
+    cfg = self.config
+    y = self.dropout(y, deterministic=deterministic)
 
     if model_mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
       out_sharding = create_sharding(self.mesh, (None, None, "activation_vocab"))
@@ -761,9 +784,7 @@ class NNXDecoder(nnx.Module):
           self.mesh, ("activation_embed_and_logits_batch", "activation_length_no_exp", "activation_vocab")
       )
 
-    # [batch, length, emb_dim] -> [batch, length, vocab_size]
     if cfg.logits_via_embedding:
-      # Use the transpose of embedding matrix for logit transform.
       if isinstance(shared_embedding, nnx.Module):
         embedding_table = shared_embedding.embedding.value
       else:
@@ -774,7 +795,6 @@ class NNXDecoder(nnx.Module):
       logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
 
       if self.config.normalize_embedding_logits:
-        # Correctly normalize pre-softmax logits for this shared case.
         logits = logits / jnp.sqrt(y.shape[-1])
       if cfg.final_logits_soft_cap:
         logits = logits / cfg.final_logits_soft_cap

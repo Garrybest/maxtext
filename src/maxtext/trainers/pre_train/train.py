@@ -224,8 +224,9 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
 
   # Calculate and Add MTP Loss
   mtp_loss = 0.0
+  raw_mtp_loss = 0.0
   if config.mtp_num_layers > 0 and is_train:
-    mtp_loss = calculate_mtp_loss(intermediate_outputs, config)
+    mtp_loss, raw_mtp_loss = calculate_mtp_loss(intermediate_outputs, config)
     # Note: This differs from MaxText upstream which uses `loss += mtp_loss` unconditionally.
     # In GA raw-sum mode, aux losses must be scaled by total_weights so that when GA later
     # divides gradients by total_weights, aux loss gradients maintain their correct magnitude.
@@ -275,6 +276,14 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     if not found_loss:
       max_logging.debug("\nNo MoE load balance loss found. Defaulting to 0.0.")
 
+    # Collect MoE losses from MTP layers (matching Megatron's recursive module traversal)
+    if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
+      for k in range(1, config.mtp_num_layers + 1):
+        nested_key = ("intermediates", "mtp_block", f"mtp_layer_{k}", "transformer_layer", "moe_lb_loss")
+        raw = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
+        mtp_layer_lb = raw[-1] if isinstance(raw, tuple) else raw
+        total_moe_lb_loss = total_moe_lb_loss + mtp_layer_lb
+
     moe_lb_loss = jnp.mean(jnp.array(total_moe_lb_loss))
     if use_ga_raw_sum:
       loss += moe_lb_loss * total_weights
@@ -286,6 +295,25 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
     nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
     moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
+
+  # Collect MoE expert counts from MTP layers (matching Megatron's recursive module traversal)
+  mtp_expert_counts = None
+  if (
+      config.routed_bias
+      and config.routed_bias_update_rate > 0.0
+      and getattr(config, "mtp_num_layers", 0) > 0
+      and config.num_experts > 1
+  ):
+    mtp_per_layer = [
+        maxtext_utils.get_nested_value(
+            intermediate_outputs,
+            ("intermediates", "mtp_block", f"mtp_layer_{k}", "transformer_layer", "moe_expert_counts"),
+            None,
+        )
+        for k in range(1, config.mtp_num_layers + 1)
+    ]
+    if any(u is not None for u in mtp_per_layer):
+      mtp_expert_counts = mtp_per_layer
 
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
@@ -299,7 +327,9 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       "moe_lb_loss": moe_lb_loss,
       "indexer_loss": indexer_loss,
       "moe_bias_updates": moe_bias_updates,
+      "mtp_expert_counts": mtp_expert_counts,
       "mtp_loss": mtp_loss,
+      "raw_mtp_loss": raw_mtp_loss,
   }
   return loss, aux
 
@@ -372,7 +402,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   indexer_loss = aux["indexer_loss"]
   z_loss = aux["z_loss"]
   moe_bias_updates = aux["moe_bias_updates"]
+  mtp_expert_counts = aux.get("mtp_expert_counts", None)
   mtp_loss = aux["mtp_loss"]
+  raw_mtp_loss = aux["raw_mtp_loss"]
 
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
@@ -418,6 +450,32 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   else:
     lm_loss = total_loss / (total_weights + EPS)
 
+  # Apply MTP MoE expert bias updates (matching Megatron's recursive module traversal
+  # which updates ALL routers including MTP layers).
+  if config.routed_bias and config.routed_bias_update_rate > 0.0 and mtp_expert_counts is not None:
+    try:
+      from maxtext.layers.moe import expert_counts_to_bias_update  # pylint: disable=import-outside-toplevel
+    except ImportError:
+      expert_counts_to_bias_update = None
+      max_logging.log("Skipping MTP expert bias updates: expert_counts_to_bias_update not available.")
+    if expert_counts_to_bias_update is not None:
+      for k, expert_counts_for_layer in enumerate(mtp_expert_counts, start=1):
+        if expert_counts_for_layer is None:
+          continue
+        target_path = (
+            "params",
+            "mtp_block",
+            f"mtp_layer_{k}",
+            f"mtp_{k}_transformer_layer",
+            "DeepSeekMoeBlock_0",
+            "MoeBlock_0",
+            "gate",
+            "bias",
+        )
+        counts = jnp.array(expert_counts_for_layer[0])
+        update_value = expert_counts_to_bias_update(counts, config.num_experts, config.routed_bias_update_rate)
+        new_state = maxtext_utils.update_state_param(new_state, target_path, update_value)
+
   scalar_metrics = {
       "learning/loss": loss,
       "learning/lm_loss": lm_loss,
@@ -425,6 +483,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/moe_lb_loss": moe_lb_loss,
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,
+      "learning/raw_mtp_loss": raw_mtp_loss,
       "learning/total_weights": total_weights,
   }
   if config.use_qk_clip:
@@ -483,6 +542,7 @@ def eval_step(model, config, state, data, dropout_rng):
   moe_lb_loss = aux["moe_lb_loss"]
   indexer_loss = aux["indexer_loss"]
   mtp_loss = aux["mtp_loss"]
+  raw_mtp_loss = aux["raw_mtp_loss"]
   metrics = {
       "scalar": {
           "evaluation/loss": loss,
@@ -492,6 +552,7 @@ def eval_step(model, config, state, data, dropout_rng):
           "evaluation/moe_lb_loss": moe_lb_loss,
           "evaluation/indexer_loss": indexer_loss,
           "evaluation/mtp_loss": mtp_loss,
+          "evaluation/raw_mtp_loss": raw_mtp_loss,
           "evaluation/mtp_acceptance_rate_percent": mtp_acceptance_rate,
       },
   }

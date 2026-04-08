@@ -103,6 +103,7 @@ class TransformerLinenPure(nn.Module):
           transformer_layer_module=mtp_layer,
           decoder=self.decoder,
           rngs=self.make_rng("mtp_block"),
+          quant=self.quant,
       )
 
   def logits_from_hidden_states(self, hidden_states, deterministic, model_mode):
@@ -211,9 +212,15 @@ class TransformerLinenPure(nn.Module):
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if self.config.mtp_num_layers > 0:
+      # When mtp_final_layernorm=True (Megatron alignment mode), pass
+      # post-decoder_norm hidden state to MTP, matching Megatron's
+      # TransformerBlock which applies final_layernorm before MTP.
+      mtp_hidden_state = hidden_state
+      if self.config.mtp_final_layernorm:
+        mtp_hidden_state = self.decoder.apply_decoder_norm(hidden_state)
       self.mtp_block(
           shared_embedding=self.shared_embedding,
-          main_hidden_state=hidden_state,
+          main_hidden_state=mtp_hidden_state,
           input_ids=decoder_input_tokens,
           target_ids=decoder_target_tokens,
           target_mask=decoder_target_mask,
@@ -555,9 +562,18 @@ class Transformer(nnx.Module):
     #      logit projection.
     # Its only effect is to "sow" these losses; it does not alter the primary logits output.
     if self.config.mtp_num_layers > 0:
+      # When mtp_final_layernorm=True (Megatron alignment mode), pass
+      # post-decoder_norm hidden state to MTP, matching Megatron's
+      # TransformerBlock which applies final_layernorm before MTP.
+      mtp_hidden_state = hidden_state
+      if self.config.mtp_final_layernorm:
+        if self.config.pure_nnx_decoder:
+          mtp_hidden_state = self.decoder.decoder_norm(hidden_state)
+        else:
+          mtp_hidden_state = self.decoder.apply_decoder_norm(hidden_state)
       self.mtp_block(
           shared_embedding=self.token_embedder,
-          main_hidden_state=hidden_state,
+          main_hidden_state=mtp_hidden_state,
           input_ids=decoder_input_tokens,
           target_ids=decoder_target_tokens,
           target_mask=decoder_target_mask,
