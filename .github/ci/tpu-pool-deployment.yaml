@@ -1,0 +1,185 @@
+# Persistent CI TPU Pool - K8s Manifests
+# Replaces ephemeral per-PR Jobs with always-on Deployment pods.
+# CI workflows claim an idle pod, run tests, then release it.
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: ci-tpu-pool
+value: 1000000
+preemptionPolicy: Never
+globalDefault: false
+description: "Priority class for persistent CI TPU pool pods"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-tpu-pool-headless
+  namespace: default
+  labels:
+    pool: ci-tpu
+spec:
+  clusterIP: None
+  selector:
+    pool: ci-tpu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-tpu-pool
+  namespace: default
+  labels:
+    pool: ci-tpu
+spec:
+  replicas: 4
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      pool: ci-tpu
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+      labels:
+        pool: ci-tpu
+        status: idle
+    spec:
+      priorityClassName: ci-tpu-pool
+      subdomain: ci-tpu-pool-headless
+      serviceAccountName: gcs-account
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                pool: ci-tpu
+      initContainers:
+      - name: runtime-bootstrap
+        image: python:3.12
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # (a) Install uv and copy binary to shared tools directory
+          pip install --quiet uv
+          mkdir -p /opt/tools
+          cp "$(which uv)" /opt/tools/uv
+
+          # (b) Create base venv at /opt/base-env with jax[tpu]
+          /opt/tools/uv venv --python 3.12 --seed --clear /opt/base-env
+          /opt/tools/uv pip install --python /opt/base-env "jax[tpu]" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+        env:
+        - name: UV_CACHE_DIR
+          value: /tmp/ramdisk/.cache/uv
+        volumeMounts:
+        - mountPath: /opt/tools
+          name: tools
+        - mountPath: /opt/base-env
+          name: base-env
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command: ["sleep", "infinity"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: TPU_PROCESS_ADDRESSES
+          value: "$(POD_IP):8476"
+        - name: TPU_PROCESS_PORT
+          value: "8476"
+        - name: UV_CACHE_DIR
+          value: /tmp/ramdisk/.cache/uv
+        - name: PATH
+          value: /opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+            ephemeral-storage: 20Gi
+        securityContext:
+          privileged: true
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - >-
+              (test -r /dev/accel0 || test -r /dev/vfio/0) &&
+              mountpoint -q /models &&
+              test "$(ps -eo stat | grep -c Z)" -lt 500
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - mountPath: /opt/tools
+          name: tools
+        - mountPath: /opt/base-env
+          name: base-env
+        - mountPath: /opt/ci-env
+          name: ci-env
+        - mountPath: /workspace
+          name: workspace
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: gcs-fuse-csi-ephemeral
+      volumes:
+      - name: tools
+        emptyDir: {}
+      - name: base-env
+        emptyDir: {}
+      - name: ci-env
+        emptyDir: {}
+      - name: workspace
+        emptyDir: {}
+      - name: tmpfs
+        emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      - name: gke-gcsfuse-cache
+        emptyDir:
+          medium: Memory
+      - name: gcs-fuse-csi-ephemeral
+        persistentVolumeClaim:
+          claimName: ant-pretrain-pvc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ci-tpu-pool-pdb
+  namespace: default
+  labels:
+    pool: ci-tpu
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      pool: ci-tpu

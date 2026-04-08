@@ -21,8 +21,11 @@ on:
         default: "/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/"
 
 concurrency:
-  group: unit-tests-${{ github.head_ref || github.event.inputs.branch || github.ref_name }}
+  group: ci-tpu-ut-${{ github.head_ref || github.event.inputs.branch || github.ref_name }}
   cancel-in-progress: true
+
+env:
+  USE_TPU_POOL: 'true'
 
 jobs:
   unit_tests:
@@ -31,7 +34,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,7 +72,92 @@ jobs:
           JOB_NAME=$(echo "$JOB_NAME" | head -c 63)
           echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
 
+      # ── TPU Pool path ──────────────────────────────────────
+      - name: Acquire TPU pod
+        if: env.USE_TPU_POOL == 'true'
+        id: acquire
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          TASK_TYPE: unit-tests
+        run: |
+          source .github/ci/acquire-tpu-pod.sh
+          echo "pod=$POD" >> "$GITHUB_OUTPUT"
+
+      - name: "Run: clean + clone + install + unit tests"
+        if: env.USE_TPU_POOL == 'true'
+        env:
+          POD: ${{ steps.acquire.outputs.pod }}
+          BRANCH: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+          TOKEN: ${{ github.token }}
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          # Clean previous workspace and venv
+          kubectl exec "$POD" -- find /workspace /opt/ci-env -mindepth 1 -delete
+
+          # Clone code using per-run ephemeral token via stdin
+          echo "$TOKEN" | kubectl exec -i "$POD" -- bash -c '
+            read -r GITHUB_TOKEN
+            git clone --depth=1 --branch="'"$BRANCH"'" \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git" \
+              /workspace/maxtext
+          '
+
+          # Fresh venv + full install (includes test deps)
+          kubectl exec "$POD" -- bash -c '
+            cd /workspace/maxtext
+            /opt/tools/uv venv --python 3.12 --seed /opt/ci-env
+            . /opt/ci-env/bin/activate
+            /opt/tools/uv pip install -e ".[tpu]" --resolution=lowest
+            /opt/tools/uv pip install pytest pytest-timeout
+          '
+
+          # Run unit tests with timeout
+          kubectl exec "$POD" -- timeout 3600 bash -c '
+            . /opt/ci-env/bin/activate
+            cd /workspace/maxtext
+            export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/src
+            export LOCAL_BASE_OUTPUT=/tmp/test-logs
+
+            echo ""
+            echo "========================================================"
+            echo "Running unit tests"
+            echo "========================================================"
+
+            UNIT_TEST_EXIT=0
+            python3 -m pytest tests/unit/ -v -x --timeout=600 \
+              --ignore=tests/unit/test_env_smoke.py \
+              --ignore=tests/unit/maxengine_test.py \
+              --ignore=tests/unit/attention_test.py \
+              --ignore=tests/unit/context_parallelism_test.py \
+              --ignore=tests/unit/grain_data_processing_test.py \
+              --ignore=tests/unit/hf_data_processing_test.py \
+              --ignore=tests/unit/mhc_test.py \
+              --ignore=tests/unit/moe_test.py \
+              --ignore=tests/unit/multihost_dataloading_test.py \
+              --ignore=tests/unit/pipeline_parallelism_test.py \
+              --ignore=tests/unit/tfds_data_processing_test.py \
+              --ignore=tests/unit/tokenizer_test.py \
+              -k "not scheduled_only" \
+              2>&1 || UNIT_TEST_EXIT=$?
+
+            ENV_SMOKE_EXIT=0
+            python3 -m pytest tests/unit/test_env_smoke.py -v || ENV_SMOKE_EXIT=$?
+
+            [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ]
+          '
+
+      - name: Release TPU pod
+        if: always() && env.USE_TPU_POOL == 'true' && steps.acquire.outputs.pod != ''
+        env:
+          POD: ${{ steps.acquire.outputs.pod }}
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: source .github/ci/release-tpu-pod.sh
+
+      # ── Fallback: legacy Job path (USE_TPU_POOL=false) ────
       - name: Sanitize branch name for K8s label
+        if: env.USE_TPU_POOL != 'true'
         id: branch
         run: |
           RAW="${{ github.event.inputs.branch || github.head_ref || github.ref_name }}"
@@ -77,6 +165,7 @@ jobs:
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
       - name: Cleanup previous CI resources
+        if: env.USE_TPU_POOL != 'true'
         run: |
           BRANCH_LABEL="${{ steps.branch.outputs.label }}"
           echo "Cleaning up leftover CI resources for branch=$BRANCH_LABEL..."
@@ -85,6 +174,7 @@ jobs:
           kubectl delete secrets -l "app=ci-unit-tests,ci-branch=$BRANCH_LABEL" --ignore-not-found
 
       - name: Create GitHub token secret
+        if: env.USE_TPU_POOL != 'true'
         run: |
           JOB_NAME="${{ steps.job.outputs.name }}"
           kubectl create secret generic "${JOB_NAME}-token" \
@@ -97,6 +187,7 @@ jobs:
             --overwrite
 
       - name: Deploy K8s Job
+        if: env.USE_TPU_POOL != 'true'
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
           BRANCH: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
@@ -109,6 +200,7 @@ jobs:
             | kubectl apply -f -
 
       - name: Wait for pod to start
+        if: env.USE_TPU_POOL != 'true'
         run: |
           JOB_NAME="${{ steps.job.outputs.name }}"
           echo "Waiting for pod of job/$JOB_NAME to start..."
@@ -127,11 +219,10 @@ jobs:
           done
 
       - name: Stream logs & wait for completion
+        if: env.USE_TPU_POOL != 'true'
         run: |
           JOB_NAME="${{ steps.job.outputs.name }}"
-
           kubectl logs -f "job/$JOB_NAME" -c jax-tpu || true
-
           echo "Waiting for job completion status..."
           if kubectl wait --for=condition=complete --timeout=600s "job/$JOB_NAME" 2>/dev/null; then
             echo "Unit tests completed successfully!"
@@ -145,8 +236,8 @@ jobs:
           kubectl get "job/$JOB_NAME" -o wide
           exit 1
 
-      - name: Cleanup
-        if: always()
+      - name: Cleanup legacy resources
+        if: always() && env.USE_TPU_POOL != 'true'
         run: |
           JOB_NAME="${{ steps.job.outputs.name }}"
           kubectl delete job "$JOB_NAME" --ignore-not-found

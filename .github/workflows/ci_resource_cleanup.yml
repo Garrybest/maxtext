@@ -2,12 +2,12 @@ name: CI Resource Cleanup
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Every hour
+    - cron: '*/5 * * * *'  # Every 5 minutes (minimum for GitHub Actions)
   workflow_dispatch:
 
 jobs:
-  cleanup:
-    name: "Delete stale CI K8s resources"
+  cleanup_legacy:
+    name: "Delete stale CI K8s resources (legacy)"
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -48,3 +48,79 @@ jobs:
           done
 
           echo "Cleanup done. Deleted $FOUND stale resources."
+
+  watchdog:
+    name: "Reset stuck TPU pool pods"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Check and reset stuck pods
+        run: |
+          TIMEOUT_SECONDS=4200  # 70 min (gives workflow timeout-minutes:60 time to fire first)
+          NOW=$(date -u +%s)
+
+          reset_pod() {
+            local POD=$1
+            local REASON=$2
+            echo "Resetting pod $POD: $REASON"
+
+            # Kill user processes (preserve sleep infinity main process)
+            kubectl exec "$POD" -- bash -c \
+              'kill -9 $(pgrep -v -f "sleep infinity" | grep -v "^1$") 2>/dev/null || true' \
+              || true
+
+            # Clean workspace
+            kubectl exec "$POD" -- find /workspace /opt/ci-env -mindepth 1 -delete 2>/dev/null || true
+
+            # Atomic reset: label + annotations in one replace call
+            POD_JSON=$(kubectl get pod "$POD" -o json 2>/dev/null || true)
+            if [ -n "${POD_JSON:-}" ]; then
+              echo "$POD_JSON" \
+                | jq '
+                    .metadata.labels.status = "idle"
+                    | del(.metadata.annotations["ci.primatrix/claimed-by"])
+                    | del(.metadata.annotations["ci.primatrix/claimed-at"])
+                    | del(.metadata.annotations["ci.primatrix/task-type"])
+                  ' \
+                | kubectl replace -f - \
+                || echo "WARNING: atomic reset failed for pod $POD" >&2
+            fi
+          }
+
+          echo "=== TPU Pool Watchdog ==="
+          kubectl get pods -l "pool=ci-tpu,status=busy" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.ci\.primatrix/claimed-at}{"\t"}{.metadata.annotations.ci\.primatrix/claimed-by}{"\n"}{end}' \
+          | while IFS=$'\t' read -r POD CLAIMED_AT CLAIMED_BY; do
+              [ -z "$POD" ] && continue
+
+              # Case 1: busy but no claimed-at → broken acquire, reset immediately
+              if [ -z "$CLAIMED_AT" ]; then
+                reset_pod "$POD" "busy with no claimed-at (broken acquire by ${CLAIMED_BY:-unknown})"
+                continue
+              fi
+
+              # Case 2: busy for too long → stuck task, reset
+              CLAIMED_TS=$(date -u -d "$CLAIMED_AT" +%s)
+              ELAPSED=$((NOW - CLAIMED_TS))
+
+              if [ "$ELAPSED" -gt "$TIMEOUT_SECONDS" ]; then
+                reset_pod "$POD" "claimed by $CLAIMED_BY ${ELAPSED}s ago (timeout)"
+              else
+                echo "Pod $POD: busy for ${ELAPSED}s by $CLAIMED_BY (OK, under threshold)"
+              fi
+            done
+
+          echo "=== Watchdog complete ==="
