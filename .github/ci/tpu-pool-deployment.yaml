@@ -31,7 +31,7 @@ metadata:
   labels:
     pool: ci-tpu
 spec:
-  replicas: 4
+  replicas: 6
   strategy:
     type: Recreate
   selector:
@@ -160,7 +160,7 @@ spec:
       - name: tmpfs
         emptyDir:
           medium: Memory
-          sizeLimit: 200Gi
+          sizeLimit: 800Gi
       - name: dshm
         emptyDir:
           medium: Memory
