@@ -2324,6 +2324,255 @@ def OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   return hooks
 
 
+def LING2_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """Generates a parameter mapping from MaxText to Hugging Face for Ling2.
+
+  Ling2 has three structural complexities that require a custom mapping:
+  1. Heterogeneous layers: first `first_num_dense_layers` layers use dense MLP,
+     the rest use MoE (MaxText: dense_layers_X / moe_layers_X, HF: model.layers.X).
+  2. Mixed attention: within each `inhomogeneous_layer_cycle_interval` group,
+     the last layer uses MLA (Multi-Head Latent Attention), others use GLA
+     (Gated Linear Attention). The two have entirely different parameter sets.
+  3. Optional MTP layer: Multi-Token Prediction layer with its own norms,
+     projection, and an embedded transformer + MoE block.
+
+  Only scan_layers=False is supported (heterogeneous scan requires framework
+  extension, left for a future PR).
+
+  Args:
+    config: HF model configuration dictionary.
+    maxtext_config: MaxText configuration object.
+    scan_layers: Must be False.
+
+  Returns:
+    dict: Mapping from MaxText parameter keys to HF parameter key(s).
+  """
+  if scan_layers:
+    raise NotImplementedError("Ling2 conversion currently supports scan_layers=False only.")
+
+  num_layers = int(config["num_hidden_layers"])
+  first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
+  num_experts = int(config.get("num_experts", config.get("n_routed_experts", maxtext_config.num_experts)))
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+  # HF config uses layer_group_size; MaxText uses inhomogeneous_layer_cycle_interval (equivalent).
+  layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
+  q_lora_rank = int(config.get("q_lora_rank", maxtext_config.q_lora_rank))
+
+  def _is_mla(global_layer_idx: int) -> bool:
+    is_last_layer_of_group = (global_layer_idx + 1) % layer_group_size == 0
+    is_last_layer_of_model = global_layer_idx == num_layers - 1
+    return is_last_layer_of_group or is_last_layer_of_model
+
+  # pylint: disable=line-too-long
+  mapping = {
+      "params-token_embedder-embedding": "model.word_embeddings.weight",
+      "params-decoder-decoder_norm-scale": "model.norm.weight",
+      "params-decoder-logits_dense-kernel": "lm_head.weight",
+  }
+
+  for global_layer_idx in range(num_layers):
+    if global_layer_idx < first_num_dense_layers:
+      mt_prefix = f"params-decoder-dense_layers_{global_layer_idx}"
+      is_moe = False
+    else:
+      mt_prefix = f"params-decoder-moe_layers_{global_layer_idx - first_num_dense_layers}"
+      is_moe = True
+
+    hf_prefix = f"model.layers.{global_layer_idx}"
+
+    # Norm layers
+    mapping[f"{mt_prefix}-input_layernorm-scale"] = f"{hf_prefix}.input_layernorm.weight"
+    mapping[f"{mt_prefix}-post_attention_layernorm-scale"] = f"{hf_prefix}.post_attention_layernorm.weight"
+
+    # Attention
+    if _is_mla(global_layer_idx):
+      # MLA (Multi-Head Latent Attention) — Q/KV LoRA decomposition + output projection
+      if q_lora_rank > 0:
+        mapping[f"{mt_prefix}-attention-wq_a-kernel"] = f"{hf_prefix}.attention.q_a_proj.weight"
+        mapping[f"{mt_prefix}-attention-q_norm-scale"] = f"{hf_prefix}.attention.q_a_layernorm.weight"
+        mapping[f"{mt_prefix}-attention-wq_b-kernel"] = f"{hf_prefix}.attention.q_b_proj.weight"
+      else:
+        mapping[f"{mt_prefix}-attention-query-kernel"] = f"{hf_prefix}.attention.query.weight"
+      mapping[f"{mt_prefix}-attention-wkv_a-kernel"] = f"{hf_prefix}.attention.kv_a_proj_with_mqa.weight"
+      mapping[f"{mt_prefix}-attention-kv_norm-scale"] = f"{hf_prefix}.attention.kv_a_layernorm.weight"
+      mapping[f"{mt_prefix}-attention-wkv_b-kernel"] = f"{hf_prefix}.attention.kv_b_proj.weight"
+      mapping[f"{mt_prefix}-attention-out-kernel"] = f"{hf_prefix}.attention.dense.weight"
+    else:
+      # GLA (Gated Linear Attention) — fused QKV + gate projection
+      mapping[f"{mt_prefix}-attention-query_key_value-kernel"] = f"{hf_prefix}.attention.query_key_value.weight"
+      mapping[f"{mt_prefix}-attention-dense-kernel"] = f"{hf_prefix}.attention.dense.weight"
+      mapping[f"{mt_prefix}-attention-g_proj-kernel"] = f"{hf_prefix}.attention.g_proj.weight"
+      mapping[f"{mt_prefix}-attention-query_layernorm-scale"] = f"{hf_prefix}.attention.query_layernorm.weight"
+      mapping[f"{mt_prefix}-attention-key_layernorm-scale"] = f"{hf_prefix}.attention.key_layernorm.weight"
+      mapping[f"{mt_prefix}-attention-g_norm-scale"] = f"{hf_prefix}.attention.g_norm.weight"
+
+    # MLP
+    if not is_moe:
+      # Dense MLP
+      mapping[f"{mt_prefix}-mlp-wi_0-kernel"] = f"{hf_prefix}.mlp.gate_proj.weight"
+      mapping[f"{mt_prefix}-mlp-wi_1-kernel"] = f"{hf_prefix}.mlp.up_proj.weight"
+      mapping[f"{mt_prefix}-mlp-wo-kernel"] = f"{hf_prefix}.mlp.down_proj.weight"
+    else:
+      # Shared experts
+      mapping[f"{mt_prefix}-mlp-shared_experts-wi_0-kernel"] = f"{hf_prefix}.mlp.shared_experts.gate_proj.weight"
+      mapping[f"{mt_prefix}-mlp-shared_experts-wi_1-kernel"] = f"{hf_prefix}.mlp.shared_experts.up_proj.weight"
+      mapping[f"{mt_prefix}-mlp-shared_experts-wo-kernel"] = f"{hf_prefix}.mlp.shared_experts.down_proj.weight"
+      # Router gate
+      mapping[f"{mt_prefix}-mlp-MoeBlock_0-gate-kernel"] = f"{hf_prefix}.mlp.gate.weight"
+      mapping[f"{mt_prefix}-mlp-MoeBlock_0-gate-bias"] = f"{hf_prefix}.mlp.gate.expert_bias"
+      # Routed experts (list value → expert stacking: 1 MaxText tensor → num_experts HF tensors)
+      mapping[f"{mt_prefix}-mlp-MoeBlock_0-wi_0"] = [
+          f"{hf_prefix}.mlp.experts.{e}.gate_proj.weight" for e in range(num_experts)
+      ]
+      mapping[f"{mt_prefix}-mlp-MoeBlock_0-wi_1"] = [
+          f"{hf_prefix}.mlp.experts.{e}.up_proj.weight" for e in range(num_experts)
+      ]
+      mapping[f"{mt_prefix}-mlp-MoeBlock_0-wo"] = [
+          f"{hf_prefix}.mlp.experts.{e}.down_proj.weight" for e in range(num_experts)
+      ]
+
+  # Optional MTP (Multi-Token Prediction) layer — stored at model.layers.{num_layers} in HF.
+  if has_mtp and maxtext_config.mtp_num_layers > 0:
+    mtp_hf = f"model.layers.{num_layers}"
+    mtp_mt = "params-mtp_block-mtp_layer_1"
+    mtp_tf = f"{mtp_mt}-transformer_layer"
+    mapping.update(
+        {
+            # MTP-specific norms and projection
+            f"{mtp_mt}-embedding_norm-scale": f"{mtp_hf}.enorm.weight",
+            f"{mtp_mt}-hidden_state_norm-scale": f"{mtp_hf}.hnorm.weight",
+            f"{mtp_mt}-final_layernorm-scale": f"{mtp_hf}.final_layernorm.weight",
+            f"{mtp_mt}-projection_layer-kernel": f"{mtp_hf}.eh_proj.weight",
+            # MTP embedded transformer — norms
+            f"{mtp_tf}-input_layernorm-scale": f"{mtp_hf}.input_layernorm.weight",
+            f"{mtp_tf}-post_attention_layernorm-scale": f"{mtp_hf}.post_attention_layernorm.weight",
+            # MTP embedded transformer — MLA attention
+            f"{mtp_tf}-attention-wq_a-kernel": f"{mtp_hf}.attention.q_a_proj.weight",
+            f"{mtp_tf}-attention-q_norm-scale": f"{mtp_hf}.attention.q_a_layernorm.weight",
+            f"{mtp_tf}-attention-wq_b-kernel": f"{mtp_hf}.attention.q_b_proj.weight",
+            f"{mtp_tf}-attention-wkv_a-kernel": f"{mtp_hf}.attention.kv_a_proj_with_mqa.weight",
+            f"{mtp_tf}-attention-kv_norm-scale": f"{mtp_hf}.attention.kv_a_layernorm.weight",
+            f"{mtp_tf}-attention-wkv_b-kernel": f"{mtp_hf}.attention.kv_b_proj.weight",
+            f"{mtp_tf}-attention-out-kernel": f"{mtp_hf}.attention.dense.weight",
+            # MTP embedded transformer — MoE
+            f"{mtp_tf}-mlp-MoeBlock_0-gate-kernel": f"{mtp_hf}.mlp.gate.weight",
+            f"{mtp_tf}-mlp-MoeBlock_0-gate-bias": f"{mtp_hf}.mlp.gate.expert_bias",
+            f"{mtp_tf}-mlp-shared_experts-wi_0-kernel": f"{mtp_hf}.mlp.shared_experts.gate_proj.weight",
+            f"{mtp_tf}-mlp-shared_experts-wi_1-kernel": f"{mtp_hf}.mlp.shared_experts.up_proj.weight",
+            f"{mtp_tf}-mlp-shared_experts-wo-kernel": f"{mtp_hf}.mlp.shared_experts.down_proj.weight",
+            f"{mtp_tf}-mlp-MoeBlock_0-wi_0": [f"{mtp_hf}.mlp.experts.{e}.gate_proj.weight" for e in range(num_experts)],
+            f"{mtp_tf}-mlp-MoeBlock_0-wi_1": [f"{mtp_hf}.mlp.experts.{e}.up_proj.weight" for e in range(num_experts)],
+            f"{mtp_tf}-mlp-MoeBlock_0-wo": [f"{mtp_hf}.mlp.experts.{e}.down_proj.weight" for e in range(num_experts)],
+        }
+    )
+
+  return mapping
+
+
+def LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Transformation hooks for Ling2 checkpoint conversion.
+
+  All kernel parameters need a reshape_kernel (transpose + reshape) to convert
+  between MaxText and HF memory layouts. The logits_dense kernel needs a simple
+  transpose. No query scaling, RoPE permutation, or RMSNorm adjustment is needed
+  because Ling2's MaxText and HF implementations agree on these conventions.
+
+  Args:
+    config: HF model configuration dictionary.
+    maxtext_config: MaxText configuration object.
+    scan_layers: Must be False.
+    saving_to_hf: Direction flag. True = MaxText→HF, False = HF→MaxText.
+
+  Returns:
+    dict: Mapping from MaxText parameter keys to hook function(s).
+  """
+  if scan_layers:
+    raise NotImplementedError("Ling2 conversion currently supports scan_layers=False only.")
+
+  def reshape_kernel(input_tensor, target_shape):
+    if saving_to_hf:
+      return input_tensor.reshape(np.flip(np.array(target_shape))).T
+    return input_tensor.T.reshape(target_shape)
+
+  def transpose(input_tensor, target_shape=None):
+    del target_shape
+    return input_tensor.T
+
+  num_layers = int(config["num_hidden_layers"])
+  first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
+  layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
+  q_lora_rank = int(config.get("q_lora_rank", maxtext_config.q_lora_rank))
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+
+  def _is_mla(global_layer_idx: int) -> bool:
+    is_last_layer_of_group = (global_layer_idx + 1) % layer_group_size == 0
+    is_last_layer_of_model = global_layer_idx == num_layers - 1
+    return is_last_layer_of_group or is_last_layer_of_model
+
+  hooks = {"params-decoder-logits_dense-kernel": transpose}
+
+  for global_layer_idx in range(num_layers):
+    if global_layer_idx < first_num_dense_layers:
+      mt_prefix = f"params-decoder-dense_layers_{global_layer_idx}"
+      is_moe = False
+    else:
+      mt_prefix = f"params-decoder-moe_layers_{global_layer_idx - first_num_dense_layers}"
+      is_moe = True
+
+    # Attention kernel hooks
+    if _is_mla(global_layer_idx):
+      mla_kernels = ["wkv_a-kernel", "wkv_b-kernel", "out-kernel"]
+      if q_lora_rank > 0:
+        mla_kernels.extend(["wq_a-kernel", "wq_b-kernel"])
+      else:
+        mla_kernels.append("query-kernel")
+      for suffix in mla_kernels:
+        hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_kernel
+    else:
+      for suffix in ["query_key_value-kernel", "dense-kernel", "g_proj-kernel"]:
+        hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_kernel
+
+    # MLP kernel hooks
+    if not is_moe:
+      for suffix in ["wi_0-kernel", "wi_1-kernel", "wo-kernel"]:
+        hooks[f"{mt_prefix}-mlp-{suffix}"] = reshape_kernel
+    else:
+      for suffix in [
+          "shared_experts-wi_0-kernel",
+          "shared_experts-wi_1-kernel",
+          "shared_experts-wo-kernel",
+          "MoeBlock_0-gate-kernel",
+          "MoeBlock_0-wi_0",
+          "MoeBlock_0-wi_1",
+          "MoeBlock_0-wo",
+      ]:
+        hooks[f"{mt_prefix}-mlp-{suffix}"] = reshape_kernel
+
+  # MTP kernel hooks
+  if has_mtp and maxtext_config.mtp_num_layers > 0:
+    mtp_mt = "params-mtp_block-mtp_layer_1"
+    mtp_tf = f"{mtp_mt}-transformer_layer"
+    mtp_kernel_keys = [
+        f"{mtp_mt}-projection_layer-kernel",
+        f"{mtp_tf}-attention-wq_a-kernel",
+        f"{mtp_tf}-attention-wq_b-kernel",
+        f"{mtp_tf}-attention-wkv_a-kernel",
+        f"{mtp_tf}-attention-wkv_b-kernel",
+        f"{mtp_tf}-attention-out-kernel",
+        f"{mtp_tf}-mlp-MoeBlock_0-gate-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wi_0-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wi_1-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wo-kernel",
+        f"{mtp_tf}-mlp-MoeBlock_0-wi_0",
+        f"{mtp_tf}-mlp-MoeBlock_0-wi_1",
+        f"{mtp_tf}-mlp-MoeBlock_0-wo",
+    ]
+    for key in mtp_kernel_keys:
+      hooks[key] = reshape_kernel
+
+  return hooks
+
+
 # {maxtext model name: {maxtext weight name: hf weight name}}
 PARAM_MAPPING = {
     "gemma2-2b": GEMMA2_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -2360,6 +2609,7 @@ PARAM_MAPPING = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "ling2": LING2_MAXTEXT_TO_HF_PARAM_MAPPING,
 }
 
 # {maxtext model name: {maxtext weight name: bi-directional transform}}
@@ -2398,6 +2648,7 @@ HOOK_FNS = {
     "olmo3-7b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "ling2": LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN,
 }
 
 VLLM_HOOK_FNS = {

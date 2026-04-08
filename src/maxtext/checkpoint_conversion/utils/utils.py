@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Checkpoint conversion utility functions. """
+"""Checkpoint conversion utility functions."""
 
 import contextlib
 import io
@@ -903,7 +903,7 @@ def detect_and_extract_checkpoint(checkpoint_dict: dict) -> dict[str, np.ndarray
     return extract_linen_weights(actual_weights_dict)
 
 
-def get_hf_model(model_id: str, token: str, revision: str = None):
+def get_hf_model(model_id: str, token: str, revision: str = None, trust_remote_code: bool = False):
   """Loads the HuggingFace model based on model_id (Eager mode only), used in to_maxtext"""
   if model_id in ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]:
     from transformers import Qwen3OmniMoeForConditionalGeneration  # pylint: disable=import-outside-toplevel
@@ -912,5 +912,5 @@ def get_hf_model(model_id: str, token: str, revision: str = None):
   else:
     model_class = AutoModelForCausalLM
 
-  hf_model = model_class.from_pretrained(model_id, token=token, revision=revision)
+  hf_model = model_class.from_pretrained(model_id, token=token, revision=revision, trust_remote_code=trust_remote_code)
   return hf_model

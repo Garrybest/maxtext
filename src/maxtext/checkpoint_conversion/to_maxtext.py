@@ -32,6 +32,8 @@ Key Parameters (to be set in the config file or as command-line overrides):
       If unspecified, we use the default Hugging Face repository ID
       (e.g., openai/gpt-oss-20b; see `HF_IDS[model_name]` in `maxtext.utils.globals`).
       This is necessary for locally dequantized models like GPT-OSS or DeepSeek.
+  --trust_remote_code: (bool) Whether to allow loading model/config code from remote/local HF repo.
+              Required for models with custom architectures (e.g., Ling2). Defaults to False.
 
 Environment Variables:
   HF_AUTH_TOKEN: (Required) HuggingFace authentication token, needed to
@@ -575,6 +577,7 @@ def main(
     revision: str | None = None,
     lazy_load_tensors: bool = False,
     simulated_cpu_devices_count: int = 16,
+    trust_remote_code: bool = False,
 ) -> None:
   overall_start = time.time()
   # Check if the user is using an Instruct version. If so, use the base model architecture
@@ -618,13 +621,17 @@ def main(
   if lazy_load_tensors:
     max_logging.log(f"Lazy loading ENABLED. Initializing LazyHFLoader for: {model_id}...")
     hf_loader = LazyHFLoader(model_id, hf_token, revision=revision)
-    hf_config_obj = AutoConfig.from_pretrained(model_id, token=hf_token, revision=revision)
+    hf_config_obj = AutoConfig.from_pretrained(
+        model_id, token=hf_token, revision=revision, trust_remote_code=trust_remote_code
+    )
     print_ram_usage("After LazyLoader init")
     tensor_getter = hf_loader.get_tensor
   else:
     max_logging.log(f"Lazy loading DISABLED. Loading full HuggingFace model: {model_id}...")
-    hf_config_obj = AutoConfig.from_pretrained(model_id, token=hf_token, revision=revision)
-    hf_model = get_hf_model(model_id, token=hf_token, revision=revision)
+    hf_config_obj = AutoConfig.from_pretrained(
+        model_id, token=hf_token, revision=revision, trust_remote_code=trust_remote_code
+    )
+    hf_model = get_hf_model(model_id, token=hf_token, revision=revision, trust_remote_code=trust_remote_code)
     hf_state_dict_numpy = hf_model.state_dict()
     # Convert all to numpy immediately in eager mode
     for k, v in hf_state_dict_numpy.items():
@@ -781,6 +788,13 @@ if __name__ == "__main__":
       default=None,
       help="Specific Hugging Face revision (branch/tag/commit)",
   )
+  parser.add_argument(
+      "--trust_remote_code",
+      type=str2bool,
+      required=False,
+      default=False,
+      help="Whether to trust custom code in HF repo/local checkpoint.",
+  )
 
   # Parse local arguments
   # Parse known args returns the namespace AND the list of remaining arguments
@@ -797,4 +811,5 @@ if __name__ == "__main__":
       revision=local_args.revision,
       lazy_load_tensors=local_args.lazy_load_tensors,
       simulated_cpu_devices_count=local_args.simulated_cpu_devices_count,
+      trust_remote_code=local_args.trust_remote_code,
   )
