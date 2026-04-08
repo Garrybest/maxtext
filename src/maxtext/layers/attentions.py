@@ -744,7 +744,10 @@ class Attention(nnx.Module):
       The rotary embedding module that will be used in the model.
     """
     if self.config.attention_type == AttentionType.MLA.value:
-      # For MLA attention RoPE is applied to only `self.qk_rope_head_dim` portion the heads.
+      # For MLA attention RoPE is applied to only `self.qk_rope_head_dim` portion of the heads.
+      # When partial_rotary_factor < 1.0, only rotate a fraction of qk_rope_head_dim
+      # (matching Megatron's rotary_percent behavior). The split/concat is handled
+      # in apply_rotary_embedding, so the embedding is initialized with the reduced dims.
       rope_embedding_dims = self.qk_rope_head_dim
     else:
       rope_embedding_dims = self.head_dim
@@ -869,6 +872,14 @@ class Attention(nnx.Module):
       width = rope_kwargs.get("width")
       # Type cast required: Omni rotary embedding uses different __call__ parameters than other embeddings.
       return cast(Qwen3OmniMoeVisionRotaryEmbedding, self.rotary_embedding)(inputs, num_frames, height, width)
+    elif self.config.attention_type == AttentionType.MLA.value:
+      # For MLA, apply interleaved RoPE de-interleave if needed.
+      # Skip if YarnRotaryEmbedding with interleave=True already handles it internally.
+      if self.config.mla_interleaved_rope and not (
+          isinstance(self.rotary_embedding, YarnRotaryEmbedding) and self.rotary_embedding.interleave
+      ):
+        inputs = jnp.concatenate([inputs[..., 0::2], inputs[..., 1::2]], axis=-1)
+      return self.rotary_embedding(inputs, inputs_positions)
     else:
       return self.rotary_embedding(inputs, inputs_positions)
 
