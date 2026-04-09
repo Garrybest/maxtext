@@ -72,6 +72,11 @@ class MMapDatasetConfig:
   mmap_split_sentences: bool
   blend_cache_dir: str = ""
   blend_index_dir: str = ""
+  # mmap_npy-specific parameters
+  num_samples: int | None = None
+  seed: int = 1234
+  split_ratio: str | None = None
+  split_index: int = 0
 
 
 class MMapIndexedDataset:
@@ -1310,7 +1315,7 @@ def get_mmap_npy_dataset(
       split_index: Which partition to use (0=train, 1=eval, 2=test).
   """
   from maxtext.input_pipeline import _mmap_index_utils  # pylint: disable=import-outside-toplevel
-  from maxtext.input_pipeline._megatron_blending import MegatronBlendedDataSource  # pylint: disable=import-outside-toplevel,no-name-in-module  # avoid circular; module added in next PR
+  from maxtext.input_pipeline._megatron_blending import MegatronBlendedDataSource  # pylint: disable=import-outside-toplevel  # avoid circular at module level
 
   # Epoch management is always encoded in the npy indices (either via
   # explicit num_samples or via num_epoch auto-computation), so repeat
