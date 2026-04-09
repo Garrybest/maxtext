@@ -102,6 +102,7 @@ def gradient_accumulation_loss_and_grad(
     (_, aux), cur_batch_gradient = grad_func(model, config, data, dropout_rng, ga_params, *extra_dpo_args, is_train=True)
     acc_grad_and_loss["loss"] += aux["total_loss"]
     acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
+    acc_grad_and_loss["moe_z_loss"] += aux["moe_z_loss"]
     acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
     acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
     acc_grad_and_loss["raw_mtp_loss"] += aux["raw_mtp_loss"]
@@ -115,7 +116,10 @@ def gradient_accumulation_loss_and_grad(
   def reshape_to_microbatch_accumulations(batch_arr):
     """Reshape global batch to microbatches, assuming batch axis is leading."""
     num_microbatches = config.gradient_accumulation_steps
-    microbatch_shape = (batch_arr.shape[0] // num_microbatches, num_microbatches) + batch_arr.shape[1:]
+    microbatch_shape = (
+        batch_arr.shape[0] // num_microbatches,
+        num_microbatches,
+    ) + batch_arr.shape[1:]
     reshaped_batch_arr = jnp.reshape(batch_arr, microbatch_shape)
     return jnp.swapaxes(reshaped_batch_arr, 0, 1)
 
@@ -127,15 +131,19 @@ def gradient_accumulation_loss_and_grad(
       "grad": init_grad,
       "total_weights": 0,
       "moe_lb_loss": 0.0,
+      "moe_z_loss": 0.0,
       "indexer_loss": 0.0,
       "mtp_loss": 0.0,
-      "lm_loss_per_token": 0.0,
       "raw_mtp_loss": 0.0,
+      "lm_loss_per_token": 0.0,
       "ga_params": ga_params,
   }
 
   grad_and_loss, aux = jax.lax.scan(
-      accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
+      accumulate_gradient,
+      init_grad_and_loss,
+      data,
+      length=config.gradient_accumulation_steps,
   )
   # Gradient normalization strategy depends on calculate_per_token_loss:
   # - True (default): divide by total_weights (global per-token average across all micro-batches)
@@ -152,6 +160,7 @@ def gradient_accumulation_loss_and_grad(
   loss = (
       lm_loss
       + grad_and_loss["moe_lb_loss"] / config.gradient_accumulation_steps
+      + grad_and_loss["moe_z_loss"] / config.gradient_accumulation_steps
       + grad_and_loss["indexer_loss"] / config.gradient_accumulation_steps
       + grad_and_loss["mtp_loss"] / config.gradient_accumulation_steps
   )
@@ -165,6 +174,7 @@ def gradient_accumulation_loss_and_grad(
   aux["mtp_loss"] = aux["mtp_loss"] / config.gradient_accumulation_steps
   aux["raw_mtp_loss"] = aux["raw_mtp_loss"] / config.gradient_accumulation_steps
   aux["moe_lb_loss"] = aux["moe_lb_loss"] / config.gradient_accumulation_steps
+  aux["moe_z_loss"] = aux["moe_z_loss"] / config.gradient_accumulation_steps
   aux["indexer_loss"] = aux["indexer_loss"] / config.gradient_accumulation_steps
   # Inject pure LM loss for downstream metrics (comparable to Megatron's "lm loss").
   aux["lm_loss"] = lm_loss

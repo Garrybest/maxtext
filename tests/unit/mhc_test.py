@@ -153,10 +153,12 @@ class TestMHC(unittest.TestCase):
 
       b, s, k, d = self.x.shape
       output, metadata = module(self.pre_norm, layer, x=self.x, mhc_type=HyperConnectionType.MLP_MOE)
-      # metadata includes load_balance_loss & moe_bias_updates
-      self.assertEqual(len(metadata), 2)
-      for key, value in metadata.items():
-        self.assertIsNotNone(value, f"Key '{key}' has a value of None")
+      # metadata includes load_balance_loss, moe_z_loss, moe_expert_counts & router_stats
+      self.assertEqual(len(metadata), 4)
+      self.assertIn("load_balance_loss", metadata)
+      self.assertIn("moe_z_loss", metadata)
+      self.assertIn("moe_expert_counts", metadata)
+      self.assertIn("router_stats", metadata)
       self.assertEqual(output.shape, (b, s, k, d))
 
   def test_dense_layer_output_shape(self):
@@ -181,7 +183,11 @@ class TestMHC(unittest.TestCase):
       self.assertEqual(output.shape, (b, s, k, d))
 
   def test_attention_layer_output_shape(self):
-    inputs_shape = (self.config.per_device_batch_size, self.config.max_target_length, self.config.emb_dim)
+    inputs_shape = (
+        self.config.per_device_batch_size,
+        self.config.max_target_length,
+        self.config.emb_dim,
+    )
     with nn_partitioning.axis_rules(self.config.logical_axis_rules):
       module = mhc.ManifoldConstrainedHyperConnections(self.config, self.dim, self.mesh, self.rngs)
       layer = attention_mla.MLA(

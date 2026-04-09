@@ -39,12 +39,13 @@ from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
 from maxtext.configs import pyconfig
-from maxtext.common.common_types import ShardMode
+from maxtext.common.common_types import DecoderBlockType, ShardMode
 from maxtext.utils.globals import EPS
 # Placeholder: internal
 
 # pylint: disable=too-many-positional-arguments
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
+from maxtext.layers.moe import expert_counts_to_bias_update
 from maxtext.common import checkpointing, profiler
 from maxtext.common.goodput import (
     GoodputEvent,
@@ -77,6 +78,271 @@ VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 def get_first_step(state):
   return int(state.step)
+
+
+def _count_moe_layers(config):
+  """Return the number of MoE layers based on the model config."""
+  moe_layer_freq = getattr(config, "moe_layer_freq", None)
+  if moe_layer_freq:
+    count = sum(moe_layer_freq[: config.num_decoder_layers])
+  else:
+    num_moe_candidates = config.num_decoder_layers - config.first_num_dense_layers
+    # interleave_moe_layer_step > 1 means only every Nth layer is MoE (e.g. Llama4).
+    if config.interleave_moe_layer_step > 1:
+      num_moe_candidates = num_moe_candidates // config.interleave_moe_layer_step
+    count = max(num_moe_candidates, 1)
+  # MTP layers also contain MoE (matching Megatron's get_num_moe_layers)
+  if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
+    count += config.mtp_num_layers
+  return count
+
+
+def _collect_moe_intermediate_sum(config, intermediate_outputs, key):
+  """Collect and sum a sowed intermediate value (e.g. moe_lb_loss) from MoE decoder layers.
+
+  Handles all decoder block types and scan/unscan modes, mirroring the
+  moe_expert_counts collection logic.
+  """
+
+  def _get_sow_scalar(nested_key):
+    """Get a per-layer sowed scalar, unwrapping the Flax sow tuple accumulation."""
+    raw = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
+    # Flax/NNX sow() accumulates values into tuples (e.g. (value,)); unwrap to get the scalar.
+    return raw[-1] if isinstance(raw, tuple) else raw
+
+  if config.decoder_block == DecoderBlockType.DEEPSEEK:
+    if config.scan_layers:
+      nested_key = ("intermediates", "decoder", "moe_layers", key)
+      values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
+    else:
+      num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
+      values = []
+      for i in range(num_moe_layers):
+        nested_key = ("intermediates", "decoder", f"moe_layers_{i}", key)
+        values.append(_get_sow_scalar(nested_key))
+  elif config.decoder_block == DecoderBlockType.LING2:
+    if config.scan_layers:
+      cycle_interval = config.inhomogeneous_layer_cycle_interval
+      values = []
+      for i in range(cycle_interval):
+        nested_key = ("intermediates", "decoder", "moe_blocks", f"layer_{i}", key)
+        values.append(_get_sow_scalar(nested_key))
+      # Remainder MoE layers (unscanned tail)
+      dense_layers = min(config.first_num_dense_layers, config.num_decoder_layers)
+      remaining = config.num_decoder_layers - dense_layers
+      num_scan_blocks = remaining // cycle_interval
+      remainder_count = remaining % cycle_interval
+      if remainder_count > 0:
+        start_idx = dense_layers + num_scan_blocks * cycle_interval
+        for idx in range(remainder_count):
+          global_idx = start_idx + idx
+          nested_key = ("intermediates", "decoder", f"moe_layers_{global_idx}", key)
+          values.append(_get_sow_scalar(nested_key))
+    else:
+      values = []
+      for lyr in range(config.num_decoder_layers):
+        nested_key = ("intermediates", "decoder", f"layers_{lyr}", key)
+        values.append(_get_sow_scalar(nested_key))
+  else:
+    # Mixtral, Llama4, GPT_OSS, Qwen3, etc.
+    if config.scan_layers:
+      nested_key = ("intermediates", "decoder", "layers", key)
+      values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
+    else:
+      values = []
+      for lyr in range(config.num_decoder_layers):
+        nested_key = ("intermediates", "decoder", f"layers_{lyr}", key)
+        values.append(_get_sow_scalar(nested_key))
+  backbone_sum = jnp.sum(jnp.array(values))
+
+  # Collect from MTP block MoE layers
+  mtp_sum = 0.0
+  if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
+    for k in range(1, config.mtp_num_layers + 1):
+      nested_key = (
+          "intermediates",
+          "mtp_block",
+          f"mtp_layer_{k}",
+          "transformer_layer",
+          key,
+      )
+      mtp_sum += _get_sow_scalar(nested_key)
+
+  return backbone_sum + mtp_sum
+
+
+def _collect_moe_intermediate_mean(config, intermediate_outputs, key):
+  """Collect and average a sowed intermediate value across all MoE layers."""
+  total = _collect_moe_intermediate_sum(config, intermediate_outputs, key)
+  return total / max(_count_moe_layers(config), 1)
+
+
+def _try_update_bias(config, new_state, target_path, expert_counts, path_label):
+  """Try to apply a single MoE gate bias update at the given path.
+
+  Returns the (possibly updated) TrainState.
+  """
+  if not maxtext_utils.has_nested_key(new_state.params, target_path):
+    max_logging.log(f"Skipping {path_label}: gate.bias path not found.")
+    return new_state
+  counts = jnp.array(expert_counts[0])
+  update_value = expert_counts_to_bias_update(counts, config.num_experts, config.routed_bias_update_rate)
+  return maxtext_utils.update_state_param(
+      new_state,
+      target_path,
+      update_value,
+      zero_mean_update=config.routed_bias_zero_mean_update,
+  )
+
+
+def _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts):
+  """Apply bias updates for DeepSeek decoder blocks."""
+  if config.scan_layers:
+    target_path = (
+        "params",
+        "decoder",
+        "moe_layers",
+        moe_block_name,
+        "MoeBlock_0",
+        "gate",
+        "bias",
+    )
+    new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts, "moe_expert_counts")
+  else:
+    num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
+    for i in range(num_moe_layers):
+      if moe_expert_counts[i] is None:
+        continue
+      target_path = (
+          "params",
+          "decoder",
+          f"moe_layers_{i}",
+          moe_block_name,
+          "MoeBlock_0",
+          "gate",
+          "bias",
+      )
+      new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts[i], f"moe_layers_{i}")
+  return new_state
+
+
+def _update_ling2_bias(config, new_state, moe_block_name, moe_expert_counts):
+  """Apply bias updates for LING2 decoder blocks (scan + remainder)."""
+  if config.scan_layers:
+    cycle_interval = config.inhomogeneous_layer_cycle_interval
+    dense_layers = min(config.first_num_dense_layers, config.num_decoder_layers)
+    remaining = config.num_decoder_layers - dense_layers
+    num_scan_blocks = remaining // cycle_interval
+    remainder_count = remaining % cycle_interval
+    for i in range(cycle_interval):
+      if moe_expert_counts[i] is None:
+        continue
+      target_path = (
+          "params",
+          "decoder",
+          "moe_blocks",
+          f"layer_{i}",
+          moe_block_name,
+          "MoeBlock_0",
+          "gate",
+          "bias",
+      )
+      new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts[i], f"moe_blocks.layer_{i}")
+    if remainder_count > 0:
+      start_idx = dense_layers + num_scan_blocks * cycle_interval
+      for idx in range(remainder_count):
+        list_idx = cycle_interval + idx
+        if moe_expert_counts[list_idx] is None:
+          continue
+        global_idx = start_idx + idx
+        target_path = (
+            "params",
+            "decoder",
+            f"moe_layers_{global_idx}",
+            moe_block_name,
+            "MoeBlock_0",
+            "gate",
+            "bias",
+        )
+        new_state = _try_update_bias(
+            config,
+            new_state,
+            target_path,
+            moe_expert_counts[list_idx],
+            f"moe_layers_{global_idx}",
+        )
+  else:
+    for lyr in range(config.num_decoder_layers):
+      if moe_expert_counts[lyr] is None:
+        continue
+      target_path = (
+          "params",
+          "decoder",
+          f"layers_{lyr}",
+          moe_block_name,
+          "MoeBlock_0",
+          "gate",
+          "bias",
+      )
+      new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts[lyr], f"layers_{lyr}")
+  return new_state
+
+
+def _apply_moe_bias_updates(config, new_state, moe_expert_counts, mtp_expert_counts):
+  """Apply Auxiliary-Loss-Free load balancing bias updates from expert counts.
+
+  moe_expert_counts contains raw per-expert token counts (possibly summed
+  across gradient-accumulation micro-batches by the GA scan).  We convert
+  them to bias updates here so that the direction is computed from the
+  *total* counts, matching Megatron's accumulate-then-update semantics.
+
+  Args:
+    config: Model configuration.
+    new_state: The current TrainState (after apply_gradients).
+    moe_expert_counts: Per-layer expert token counts from backbone, or None.
+    mtp_expert_counts: Per-layer expert token counts from MTP layers, or None.
+
+  Returns:
+    Updated TrainState with bias corrections applied.
+  """
+  # Determine MoE sub-path based on decoder type
+  moe_block_name = None
+  if config.decoder_block == DecoderBlockType.DEEPSEEK:
+    moe_block_name = "DeepSeekMoeBlock_0"
+  elif config.decoder_block == DecoderBlockType.LING2:
+    moe_block_name = "mlp"
+
+  # --- Backbone MoE bias updates ---
+  if moe_expert_counts is not None:
+    if moe_block_name is None:
+      max_logging.log("Skipping moe_expert_counts: unsupported decoder block type.")
+    elif config.decoder_block == DecoderBlockType.DEEPSEEK:
+      new_state = _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts)
+    elif config.decoder_block == DecoderBlockType.LING2:
+      new_state = _update_ling2_bias(config, new_state, moe_block_name, moe_expert_counts)
+
+  # --- MTP MoE expert bias updates ---
+  # Matches Megatron's recursive module traversal which updates ALL routers including MTP layers.
+  if mtp_expert_counts is not None:
+    if moe_block_name is not None:
+      for k, expert_counts_for_layer in enumerate(mtp_expert_counts, start=1):
+        if expert_counts_for_layer is None:
+          continue
+        target_path = (
+            "params",
+            "mtp_block",
+            f"mtp_layer_{k}",
+            "transformer_layer",
+            moe_block_name,
+            "MoeBlock_0",
+            "gate",
+            "bias",
+        )
+        new_state = _try_update_bias(config, new_state, target_path, expert_counts_for_layer, f"mtp_layer_{k}")
+    else:
+      max_logging.log("Skipping mtp_expert_counts: unsupported decoder block type.")
+
+  return new_state
 
 
 # -----------------------------------------------------------------------------
@@ -256,45 +522,103 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     else:
       max_logging.debug("No indexer loss found.")
 
-  # get MoE load balance loss
+  # get MoE load balance loss and router z-loss
   moe_lb_loss = 0.0
+  moe_z_loss = 0.0
   if config.num_experts > 1:
-    # Note: the key is affected by the model implementation
-    possible_keys = [
-        ("intermediates", "decoder", "layers", "moe_lb_loss"),
-        ("intermediates", "decoder", "moe_layers", "moe_lb_loss"),
-    ]
-
-    total_moe_lb_loss = 0.0
-    found_loss = False
-    for nested_key in possible_keys:
-      total_moe_lb_loss = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
-      if total_moe_lb_loss != 0.0:
-        found_loss = True
-        break
-
-    if not found_loss:
-      max_logging.debug("\nNo MoE load balance loss found. Defaulting to 0.0.")
-
-    # Collect MoE losses from MTP layers (matching Megatron's recursive module traversal)
-    if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
-      for k in range(1, config.mtp_num_layers + 1):
-        nested_key = ("intermediates", "mtp_block", f"mtp_layer_{k}", "transformer_layer", "moe_lb_loss")
-        raw = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
-        mtp_layer_lb = raw[-1] if isinstance(raw, tuple) else raw
-        total_moe_lb_loss = total_moe_lb_loss + mtp_layer_lb
-
-    moe_lb_loss = jnp.mean(jnp.array(total_moe_lb_loss))
+    moe_lb_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_lb_loss")
     if use_ga_raw_sum:
       loss += moe_lb_loss * total_weights
     else:
       loss += moe_lb_loss
+    if config.moe_z_loss_weight > 0.0:
+      moe_z_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_z_loss")
+      if use_ga_raw_sum:
+        loss += moe_z_loss * total_weights
+      else:
+        loss += moe_z_loss
 
-  # get MoE routed bias term updates
-  moe_bias_updates = None
+  # Collect router monitoring stats (averaged across layers)
+  router_bias_mean = 0.0
+  router_bias_std = 0.0
+  router_topk_weight_mean = 0.0
+  router_probs_std = 0.0
+  if config.num_experts > 1:
+    router_topk_weight_mean = _collect_moe_intermediate_mean(config, intermediate_outputs, "router_topk_weight_mean")
+    router_probs_std = _collect_moe_intermediate_mean(config, intermediate_outputs, "router_probs_std")
+    if config.routed_bias:
+      router_bias_mean = _collect_moe_intermediate_mean(config, intermediate_outputs, "router_bias_mean")
+      router_bias_std = _collect_moe_intermediate_mean(config, intermediate_outputs, "router_bias_std")
+
+  # get MoE routed expert counts for bias updates
+  moe_expert_counts = None
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
-    nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
-    moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
+    if config.decoder_block == DecoderBlockType.DEEPSEEK:
+      if config.scan_layers:
+        # Scanned: single stacked tensor from scan intermediates
+        nested_key = ("intermediates", "decoder", "moe_layers", "moe_expert_counts")
+        moe_expert_counts = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
+      else:
+        # Unscanned: collect per-layer counts (local MoE index)
+        num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
+        per_layer_updates = []
+        for i in range(num_moe_layers):
+          nested_key = (
+              "intermediates",
+              "decoder",
+              f"moe_layers_{i}",
+              "moe_expert_counts",
+          )
+          per_layer_updates.append(maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None))
+        if any(u is not None for u in per_layer_updates):
+          moe_expert_counts = per_layer_updates
+    elif config.decoder_block == DecoderBlockType.LING2:
+      if config.scan_layers:
+        # Scanned: sub-layer intermediates within moe_blocks, plus remainder layers
+        cycle_interval = config.inhomogeneous_layer_cycle_interval
+        per_layer_updates = []
+        for i in range(cycle_interval):
+          nested_key = (
+              "intermediates",
+              "decoder",
+              "moe_blocks",
+              f"layer_{i}",
+              "moe_expert_counts",
+          )
+          per_layer_updates.append(maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None))
+        # Remainder MoE layers (unscanned tail)
+        dense_layers = min(config.first_num_dense_layers, config.num_decoder_layers)
+        remaining = config.num_decoder_layers - dense_layers
+        num_scan_blocks = remaining // cycle_interval
+        remainder_count = remaining % cycle_interval
+        if remainder_count > 0:
+          start_idx = dense_layers + num_scan_blocks * cycle_interval
+          for idx in range(remainder_count):
+            global_idx = start_idx + idx
+            nested_key = (
+                "intermediates",
+                "decoder",
+                f"moe_layers_{global_idx}",
+                "moe_expert_counts",
+            )
+            per_layer_updates.append(maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None))
+        if any(u is not None for u in per_layer_updates):
+          moe_expert_counts = per_layer_updates
+      else:
+        # Unscanned: iterate all decoder layers (dense layers will have None)
+        per_layer_updates = []
+        for lyr in range(config.num_decoder_layers):
+          nested_key = (
+              "intermediates",
+              "decoder",
+              f"layers_{lyr}",
+              "moe_expert_counts",
+          )
+          per_layer_updates.append(maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None))
+        if any(u is not None for u in per_layer_updates):
+          moe_expert_counts = per_layer_updates
+    else:
+      max_logging.log(f"Skipping moe_expert_counts collection: unsupported decoder_block={config.decoder_block}.")
 
   # Collect MoE expert counts from MTP layers (matching Megatron's recursive module traversal)
   mtp_expert_counts = None
@@ -307,7 +631,13 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     mtp_per_layer = [
         maxtext_utils.get_nested_value(
             intermediate_outputs,
-            ("intermediates", "mtp_block", f"mtp_layer_{k}", "transformer_layer", "moe_expert_counts"),
+            (
+                "intermediates",
+                "mtp_block",
+                f"mtp_layer_{k}",
+                "transformer_layer",
+                "moe_expert_counts",
+            ),
             None,
         )
         for k in range(1, config.mtp_num_layers + 1)
@@ -325,11 +655,16 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       "z_loss": total_z_loss,
       "total_weights": total_weights,
       "moe_lb_loss": moe_lb_loss,
-      "indexer_loss": indexer_loss,
-      "moe_bias_updates": moe_bias_updates,
+      "moe_z_loss": moe_z_loss,
+      "moe_expert_counts": moe_expert_counts,
       "mtp_expert_counts": mtp_expert_counts,
+      "indexer_loss": indexer_loss,
       "mtp_loss": mtp_loss,
       "raw_mtp_loss": raw_mtp_loss,
+      "router_bias_mean": router_bias_mean,
+      "router_bias_std": router_bias_std,
+      "router_topk_weight_mean": router_topk_weight_mean,
+      "router_probs_std": router_probs_std,
   }
   return loss, aux
 
@@ -395,16 +730,23 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       lambda x: x.astype(config.grad_dtype) if x.dtype == jnp.float32 else x,
       raw_grads,
   )
+  if config.routed_bias and not config.enable_routed_bias_grad:
+    raw_grads = maxtext_utils.zero_moe_gate_bias_grads(raw_grads)
   intermediate_outputs = aux["intermediate_outputs"]
   total_loss = aux["total_loss"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
+  moe_z_loss = aux["moe_z_loss"]
+  moe_expert_counts = aux.get("moe_expert_counts", None)
+  mtp_expert_counts = aux.get("mtp_expert_counts", None)
   indexer_loss = aux["indexer_loss"]
   z_loss = aux["z_loss"]
-  moe_bias_updates = aux["moe_bias_updates"]
-  mtp_expert_counts = aux.get("mtp_expert_counts", None)
   mtp_loss = aux["mtp_loss"]
   raw_mtp_loss = aux["raw_mtp_loss"]
+  router_bias_mean = aux["router_bias_mean"]
+  router_bias_std = aux["router_bias_std"]
+  router_topk_weight_mean = aux["router_topk_weight_mean"]
+  router_probs_std = aux["router_probs_std"]
 
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
@@ -435,14 +777,19 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         )
     )
   new_state = state.apply_gradients(grads=grads)
+  if config.routed_bias and not config.enable_routed_bias_grad:
+    new_state = new_state.replace(params=maxtext_utils.restore_moe_gate_bias_params(new_state.params, state.params))
 
-  # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
-  if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-    target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
-    # Flax 'sow' returns a tuple, so we take the first element [0].
-    # Updates the shape to be aligned with state.
-    moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
-    new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
+  if config.routed_bias and config.routed_bias_update_rate > 0.0:
+    new_state = _apply_moe_bias_updates(config, new_state, moe_expert_counts, mtp_expert_counts)
+
+  # Log raw z_loss (without coefficient, per-layer average) to match Megatron-LM convention.
+  raw_moe_z_loss = moe_z_loss
+  if config.moe_z_loss_weight > 0.0 and not isinstance(moe_z_loss, (int, float)):
+    tp_size = max(config.ici_tensor_parallelism * config.dcn_tensor_parallelism, 1)
+    effective_z_loss_weight = config.moe_z_loss_weight / tp_size
+    num_moe_layers = _count_moe_layers(config)
+    raw_moe_z_loss = moe_z_loss / effective_z_loss_weight / num_moe_layers
 
   # Compute lm_loss: pure LM cross-entropy per-token loss, matching Megatron's "lm loss".
   if config.gradient_accumulation_steps > 1:
@@ -453,38 +800,37 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   # Apply MTP MoE expert bias updates (matching Megatron's recursive module traversal
   # which updates ALL routers including MTP layers).
   if config.routed_bias and config.routed_bias_update_rate > 0.0 and mtp_expert_counts is not None:
-    try:
-      from maxtext.layers.moe import expert_counts_to_bias_update  # pylint: disable=import-outside-toplevel
-    except ImportError:
-      expert_counts_to_bias_update = None
-      max_logging.log("Skipping MTP expert bias updates: expert_counts_to_bias_update not available.")
-    if expert_counts_to_bias_update is not None:
-      for k, expert_counts_for_layer in enumerate(mtp_expert_counts, start=1):
-        if expert_counts_for_layer is None:
-          continue
-        target_path = (
-            "params",
-            "mtp_block",
-            f"mtp_layer_{k}",
-            f"mtp_{k}_transformer_layer",
-            "DeepSeekMoeBlock_0",
-            "MoeBlock_0",
-            "gate",
-            "bias",
-        )
-        counts = jnp.array(expert_counts_for_layer[0])
-        update_value = expert_counts_to_bias_update(counts, config.num_experts, config.routed_bias_update_rate)
-        new_state = maxtext_utils.update_state_param(new_state, target_path, update_value)
+    for k, expert_counts_for_layer in enumerate(mtp_expert_counts, start=1):
+      if expert_counts_for_layer is None:
+        continue
+      target_path = (
+          "params",
+          "mtp_block",
+          f"mtp_layer_{k}",
+          f"mtp_{k}_transformer_layer",
+          "DeepSeekMoeBlock_0",
+          "MoeBlock_0",
+          "gate",
+          "bias",
+      )
+      counts = jnp.array(expert_counts_for_layer[0])
+      update_value = expert_counts_to_bias_update(counts, config.num_experts, config.routed_bias_update_rate)
+      new_state = maxtext_utils.update_state_param(new_state, target_path, update_value)
 
   scalar_metrics = {
       "learning/loss": loss,
       "learning/lm_loss": lm_loss,
       "learning/z_loss": z_loss,
       "learning/moe_lb_loss": moe_lb_loss,
+      "learning/moe_z_loss": raw_moe_z_loss,
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,
       "learning/raw_mtp_loss": raw_mtp_loss,
       "learning/total_weights": total_weights,
+      "learning/router_bias_mean": router_bias_mean,
+      "learning/router_bias_std": router_bias_std,
+      "learning/router_topk_weight_mean": router_topk_weight_mean,
+      "learning/router_probs_std": router_probs_std,
   }
   if config.use_qk_clip:
     # Apply QK-Clip
@@ -500,7 +846,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
     scalar_metrics["learning/num_zeros"] = jax.tree_util.tree_reduce(
-        lambda acc, x: acc + jnp.sum(x == 0), raw_grads, initializer=jnp.array(0, dtype=jnp.int64)
+        lambda acc, x: acc + jnp.sum(x == 0),
+        raw_grads,
+        initializer=jnp.array(0, dtype=jnp.int64),
     )
   scalar_metrics["learning/is_nan"] = jnp.any(jnp.isnan(lm_loss)).astype(jnp.int32)
   scalar_metrics["learning/is_inf"] = jnp.any(jnp.isinf(lm_loss)).astype(jnp.int32)
@@ -540,7 +888,15 @@ def eval_step(model, config, state, data, dropout_rng):
   z_loss = aux["z_loss"]
   total_weights = aux["total_weights"]
   moe_lb_loss = aux["moe_lb_loss"]
+  moe_z_loss = aux["moe_z_loss"]
   indexer_loss = aux["indexer_loss"]
+  # Log raw z_loss (without coefficient, per-layer average) to match Megatron-LM convention.
+  raw_moe_z_loss = moe_z_loss
+  if config.moe_z_loss_weight > 0.0 and not isinstance(moe_z_loss, (int, float)):
+    tp_size = max(config.ici_tensor_parallelism * config.dcn_tensor_parallelism, 1)
+    effective_z_loss_weight = config.moe_z_loss_weight / tp_size
+    num_moe_layers = _count_moe_layers(config)
+    raw_moe_z_loss = moe_z_loss / effective_z_loss_weight / num_moe_layers
   mtp_loss = aux["mtp_loss"]
   raw_mtp_loss = aux["raw_mtp_loss"]
   metrics = {
@@ -550,6 +906,7 @@ def eval_step(model, config, state, data, dropout_rng):
           "evaluation/total_loss": total_loss,
           "evaluation/total_weights": total_weights,
           "evaluation/moe_lb_loss": moe_lb_loss,
+          "evaluation/moe_z_loss": raw_moe_z_loss,
           "evaluation/indexer_loss": indexer_loss,
           "evaluation/mtp_loss": mtp_loss,
           "evaluation/raw_mtp_loss": raw_mtp_loss,
@@ -626,7 +983,10 @@ def train_loop(config, recorder, state=None):
         # pylint: disable=not-callable
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
-          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+          with (
+              jax.set_mesh(mesh),
+              nn_partitioning.axis_rules(config.logical_axis_rules),
+          ):
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
@@ -660,7 +1020,10 @@ def train_loop(config, recorder, state=None):
             break
           # Ensure eval batch sharding matches train data sharding to avoid cross-device transfer.
           eval_batch = jax.device_put(eval_batch, data_loader.input_data_shardings)
-          with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+          with (
+              jax.set_mesh(mesh),
+              nn_partitioning.axis_rules(config.logical_axis_rules),
+          ):
             eval_metrics = p_eval_step(state, eval_batch, nextrng)
           metric_logger.record_eval_metrics(step, metrics=eval_metrics)
           max_logging.log(f"Completed eval step {eval_step_count}")

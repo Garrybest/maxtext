@@ -99,6 +99,8 @@ class MetricLogger:
     self.learning_rate_schedule = learning_rate_schedule
     self.cumulative_eval_metrics = {"scalar": defaultdict(float)}
     self.buffered_train_metrics = None
+    self.cumulative_skipped_iterations = 0
+    self.cumulative_nan_iterations = 0
     if self.config.managed_mldiagnostics:
       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
 
@@ -173,10 +175,48 @@ class MetricLogger:
         ]
     )
 
+    # LM loss (cross-entropy before MoE/MTP additions)
+    lm_loss = scalars.get("learning/lm_loss", 0.0)
+    log_parts.append(f"lm_loss: {float(lm_loss):.3f}")
+
+    # Learning rate and global batch size (always printed)
+    lr = scalars.get("learning/current_learning_rate", 0.0)
+    log_parts.append(f"lr: {float(lr):.6e}")
+    global_bs = scalars.get("learning/global_batch_size", 0)
+    log_parts.append(f"global_batch_size: {int(global_bs)}")
+
     if self.config.mtp_num_layers > 0:
       mtp_loss = scalars.get("learning/mtp_loss", 0.0)
-      log_parts.append(f"main_model_loss: {loss - mtp_loss:.3f}")
+      raw_mtp_loss = scalars.get("learning/raw_mtp_loss", 0.0)
       log_parts.append(f"mtp_loss: {mtp_loss:.3f}")
+      log_parts.append(f"raw_mtp_loss: {raw_mtp_loss:.3f}")
+
+    if self.config.num_experts > 1:
+      moe_lb_loss = float(scalars.get("learning/moe_lb_loss", 0.0))
+      log_parts.append(f"moe_lb_loss: {moe_lb_loss:.6f}")
+      if self.config.moe_z_loss_weight > 0.0:
+        moe_z_loss = float(scalars.get("learning/moe_z_loss", 0.0))
+        log_parts.append(f"moe_z_loss: {moe_z_loss:.4f}")
+      # Router stats
+      log_parts.append(f"router_topk_weight_mean: {float(scalars.get('learning/router_topk_weight_mean', 0.0)):.6e}")
+      log_parts.append(f"router_probs_std: {float(scalars.get('learning/router_probs_std', 0.0)):.6e}")
+      if self.config.routed_bias:
+        log_parts.append(f"router_bias_mean: {float(scalars.get('learning/router_bias_mean', 0.0)):.6e}")
+        log_parts.append(f"router_bias_std: {float(scalars.get('learning/router_bias_std', 0.0)):.6e}")
+
+    # Gradient metrics (when available)
+    if "learning/grad_norm" in scalars:
+      log_parts.append(f"grad_norm: {float(scalars['learning/grad_norm']):.3f}")
+      log_parts.append(f"raw_grad_norm: {float(scalars.get('learning/raw_grad_norm', 0.0)):.3f}")
+      log_parts.append(f"num_zeros: {int(scalars.get('learning/num_zeros', 0))}")
+
+    # Iteration health (cumulative counters)
+    is_nan = int(scalars.get("learning/is_nan", 0))
+    is_inf = int(scalars.get("learning/is_inf", 0))
+    self.cumulative_nan_iterations += is_nan
+    self.cumulative_skipped_iterations += max(is_nan, is_inf)
+    log_parts.append(f"skipped_iters: {self.cumulative_skipped_iterations}")
+    log_parts.append(f"nan_iters: {self.cumulative_nan_iterations}")
 
     max_logging.log(", ".join(log_parts))
 
@@ -196,6 +236,11 @@ class MetricLogger:
               f"avg_mtp_acceptance_rate={scalars['eval/avg_mtp_acceptance_rate_percent']:.2f}%",
           ]
       )
+
+    if self.config.num_experts > 1:
+      log_parts.append(f"avg_moe_lb_loss={float(scalars.get('eval/avg_moe_lb_loss', 0.0)):.6f}")
+      if self.config.moe_z_loss_weight > 0.0:
+        log_parts.append(f"avg_moe_z_loss={float(scalars.get('eval/avg_moe_z_loss', 0.0)):.4f}")
 
     max_logging.log(", ".join(log_parts))
 
@@ -313,7 +358,11 @@ class MetricLogger:
   def record_train_metrics(self, metrics, step, step_time):
     """Records training metrics for the current step."""
     metrics["scalar"].update({"perf/step_time_seconds": step_time})
-    metrics["scalar"].update({"learning/current_learning_rate": self.learning_rate_schedule(step)})
+    # Log schedule(step + 1): after p_train_step, optax's internal count has
+    # already advanced to step+1. This logs the LR currently set on the optimizer,
+    # matching Megatron-LM's convention of logging after scheduler.step().
+    metrics["scalar"].update({"learning/current_learning_rate": self.learning_rate_schedule(step + 1)})
+    metrics["scalar"].update({"learning/global_batch_size": self.config.global_batch_size_to_train_on})
     if step >= self.config.rampup_end_step:
       metrics["scalar"].update({"perf/per_device_tflops": self.metadata[MetadataKey.PER_DEVICE_TFLOPS]})
       metrics["scalar"].update(
@@ -338,6 +387,9 @@ class MetricLogger:
       self.cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] += float(
           metrics["scalar"].get("evaluation/moe_lb_loss", 0.0)
       )
+      self.cumulative_eval_metrics["scalar"]["eval/moe_z_loss"] += float(
+          metrics["scalar"].get("evaluation/moe_z_loss", 0.0)
+      )
       self.cumulative_eval_metrics["scalar"]["eval/indexer_loss"] += float(
           metrics["scalar"].get("evaluation/indexer_loss", 0.0)
       )
@@ -357,6 +409,9 @@ class MetricLogger:
       self.cumulative_eval_metrics["scalar"]["eval/avg_loss"] = eval_loss
       self.cumulative_eval_metrics["scalar"]["eval/avg_moe_lb_loss"] = (
           self.cumulative_eval_metrics["scalar"]["eval/moe_lb_loss"] / eval_step_count
+      )
+      self.cumulative_eval_metrics["scalar"]["eval/avg_moe_z_loss"] = (
+          self.cumulative_eval_metrics["scalar"]["eval/moe_z_loss"] / eval_step_count
       )
       self.cumulative_eval_metrics["scalar"]["eval/avg_indexer_loss"] = (
           self.cumulative_eval_metrics["scalar"]["eval/indexer_loss"] / eval_step_count

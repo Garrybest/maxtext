@@ -1,6 +1,6 @@
 # CI Unit Tests - K8s Manifests
 # This template is rendered by envsubst with: $JOB_NAME $BRANCH $DUMP_DIR $CKPT_PATH $BRANCH_LABEL
-# Runs pytest unit tests + GLA compare test + MLA alignment test on TPU.
+# Runs pytest unit tests + GLA compare + MLA alignment + MoE cross-compare test on TPU.
 ---
 # Headless Service for TPU pod DNS resolution (required for JAX coordinator)
 apiVersion: v1
@@ -233,13 +233,14 @@ spec:
             --ignore=tests/unit/grain_data_processing_test.py \
             --ignore=tests/unit/hf_data_processing_test.py \
             --ignore=tests/unit/mhc_test.py \
-            --ignore=tests/unit/moe_test.py \
             --ignore=tests/unit/multihost_dataloading_test.py \
             --ignore=tests/unit/pipeline_parallelism_test.py \
             --ignore=tests/unit/tfds_data_processing_test.py \
             --ignore=tests/unit/tokenizer_test.py \
             --ignore=tests/unit/gla_compare_test.py \
             --ignore=tests/unit/mla_compare_test.py \
+            --ignore=tests/unit/moe_cross_compare.py \
+            --ignore=tests/unit/sharding_compare_test.py \
             -k "not scheduled_only" \
             2>&1 || UNIT_TEST_EXIT=$?
 
@@ -269,7 +270,23 @@ spec:
               --atol 1e-2 --rtol 1e-2 \
               2>&1 || MLA_EXIT=$?
 
-          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ]
+          # MoE cross-compare test (Megatron dump precision comparison)
+          MOE_EXIT=0
+          echo ""
+          echo "========================================================"
+          echo "Running MoE cross-framework comparison"
+          echo "  dump-dir: ${RESOLVED_DUMP_DIR}"
+          echo "  ckpt-path: ${ACTIVE_CKPT}"
+          echo "========================================================"
+          python3 tests/unit/moe_cross_compare.py \
+            --megatron-dump-dir "${RESOLVED_DUMP_DIR}/step_1" \
+            --orbax-ckpt-path "${ACTIVE_CKPT}" \
+            --ling2-profile \
+            --layers 0,1 \
+            --ci \
+            2>&1 || MOE_EXIT=$?
+
+          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ]
         env:
         # --- Unit test config (from workflow dispatch inputs) ---
         - name: DUMP_DIR

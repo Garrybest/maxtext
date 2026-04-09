@@ -15,6 +15,7 @@
 # pylint: disable=line-too-long, disable=bare-except, consider-using-generator
 """ Utils that are only interesting to MaxText. """
 
+from collections.abc import Mapping
 import functools
 import pickle
 import os
@@ -962,7 +963,57 @@ def get_intermediate_value(model, nested_key, default=None, clear=False):
   return intermediate_value
 
 
-def update_state_param(state, target_path, value):
+def _path_tokens(path):
+  tokens = []
+  for p in path:
+    if isinstance(p, jax.tree_util.DictKey):
+      tokens.append(str(p.key))
+    elif isinstance(p, jax.tree_util.SequenceKey):
+      tokens.append(str(p.idx))
+    else:
+      tokens.append(str(p))
+  return tuple(tokens)
+
+
+def _is_moe_gate_bias_path(path_tokens):
+  return len(path_tokens) >= 2 and path_tokens[-2:] == ("gate", "bias") and any("MoeBlock_0" in t for t in path_tokens)
+
+
+def zero_moe_gate_bias_grads(grads):
+  """Zeros routed MoE gate bias gradients."""
+
+  def _maybe_zero(path, grad):
+    if grad is None:
+      return grad
+    if _is_moe_gate_bias_path(_path_tokens(path)):
+      return jnp.zeros_like(grad)
+    return grad
+
+  return jax.tree_util.tree_map_with_path(_maybe_zero, grads)
+
+
+def restore_moe_gate_bias_params(params, ref_params):
+  """Restores routed MoE gate bias params from a reference tree."""
+
+  def _restore(path, param, ref_param):
+    if _is_moe_gate_bias_path(_path_tokens(path)):
+      return ref_param
+    return param
+
+  return jax.tree_util.tree_map_with_path(_restore, params, ref_params)
+
+
+def has_nested_key(mapping, nested_key):
+  """Returns True if a nested key path exists in a Mapping tree."""
+  current_level = mapping
+  for key in nested_key:
+    if not isinstance(current_level, Mapping) or key not in current_level:
+      return False
+    current_level = current_level[key]
+  return True
+
+
+def update_state_param(state, target_path, value, zero_mean_update=False):
   """
   Updates a specific parameter in state.params at the given path.
 
@@ -970,6 +1021,7 @@ def update_state_param(state, target_path, value):
       state: The current TrainState.
       target_path: A tuple of keys matching the structure inside state.params.
       value: The value to apply.
+      zero_mean_update: Whether to re-center updated tensor along the last axis.
   """
 
   def create_jax_path(target_path):
@@ -980,11 +1032,41 @@ def update_state_param(state, target_path, value):
 
   def _apply_update(path, param):
     if path == updated_target_path:
-      return param + value
+      updated = param + value
+      if zero_mean_update:
+        updated = updated - jnp.mean(updated, axis=-1, keepdims=True)
+      return updated
     return param
 
   updated_target_path = create_jax_path(target_path)
   new_params = jax.tree_util.tree_map_with_path(_apply_update, state.params)
+  return state.replace(params=new_params)
+
+
+def zero_mean_state_param(state, target_path):
+  """Subtracts the mean from a specific parameter in state.params at the given path.
+
+  Used to zero-center expert bias after updates, preventing drift
+  (matching Megatron's routed_bias_zero_mean_update behavior).
+
+  Args:
+      state: The current TrainState.
+      target_path: A tuple of keys matching the structure inside state.params.
+  """
+
+  def create_jax_path(target_path):
+    path = []
+    for k in target_path:
+      path.append(jax.tree_util.DictKey(key=k))
+    return tuple(path)
+
+  def _apply_zero_mean(path, param):
+    if path == target_jax_path:
+      return param - param.mean()
+    return param
+
+  target_jax_path = create_jax_path(target_path)
+  new_params = jax.tree_util.tree_map_with_path(_apply_zero_mean, state.params)
   return state.replace(params=new_params)
 
 

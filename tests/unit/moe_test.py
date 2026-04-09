@@ -18,6 +18,7 @@ import unittest
 from flax import nnx
 import flax.linen as nn
 from flax.linen import partitioning as nn_partitioning
+from flax.training import train_state
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -278,10 +279,87 @@ class DeepSeekRoutingTest(unittest.TestCase):
     # expert 3 assigned 4 tokens --> same, update: 0.0
     # [batch, sequence, top_k] = [2, 4, 2]
     top_k_indices = jnp.array([[[0, 1], [3, 0], [3, 1], [1, 0]], [[0, 3], [2, 0], [1, 2], [2, 3]]])
-    expected_updates = jnp.array([-0.01, 0.0, 0.01, 0.0])
-    actual_updates = moe.calculate_load_balance_updates(top_k_indices, num_experts, rate)
+    expected_counts = jnp.array([5, 4, 3, 4])
+    actual_counts = moe.calculate_expert_counts(top_k_indices, num_experts)
+    self.assertTrue(jax.numpy.allclose(expected_counts, actual_counts))
 
+    expected_updates = jnp.array([-0.01, 0.0, 0.01, 0.0])
+    actual_updates = moe.expert_counts_to_bias_update(actual_counts, num_experts, rate)
     self.assertTrue(jax.numpy.allclose(expected_updates, actual_updates, rtol=1e-05, atol=1e-05, equal_nan=False))
+
+
+class Ling2RoutingTest(unittest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    extra_args = get_decoupled_parallelism_overrides()
+    self.cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="ling2_routing_test",
+        enable_checkpointing=False,
+        decoder_block="ling2",
+        dtype="bfloat16",
+        max_target_length=2,
+        max_prefill_predict_length=1,
+        per_device_batch_size=1,
+        n_routing_groups=4,
+        topk_routing_group=2,
+        num_experts=16,
+        num_experts_per_tok=4,
+        sparse_matmul=True,
+        routed_score_func="sigmoid",
+        routed_scaling_factor=2.5,
+        norm_topk_prob=True,
+        **extra_args,
+    )
+    self.rngs = nnx.Rngs(params=0)
+    devices_array = maxtext_utils.create_device_mesh(self.cfg)
+    self.model = moe.RoutedMoE(
+        config=self.cfg,
+        num_experts=self.cfg.num_experts,
+        num_experts_per_tok=self.cfg.num_experts_per_tok,
+        mesh=Mesh(devices_array, self.cfg.mesh_axes),
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        dtype=self.cfg.dtype,
+        rngs=self.rngs,
+    )
+
+  def test_ling2_routing(self):
+    """LING2 should use group routing (deepseek_routing) like DeepSeek."""
+    # shape as [batch, sequence, num_experts] = [1,2,16]
+    gate_logits = jnp.array(
+        [
+            [
+                [0.20, 0.10, 0.05, 0.10, 0.10, 0.60, 0.30, 0.10, 0.80, 0.01, 0.01, 0.01, 0.05, 0.80, 0.20, 0.10],
+                [0.68, 0.20, 0.06, 0.03, 0.32, 0.10, 0.05, 0.02, 0.65, 0.20, 0.04, 0.01, 0.32, 0.10, 0.05, 0.02],
+            ]
+        ]
+    )
+    pre_bias_logits = gate_logits - 0.5
+
+    # Same group structure as DeepSeekRoutingTest:
+    # 4 groups of 4 experts each, select top-2 groups, then top-4 experts.
+    expected_top_k_indices = jnp.array([[[13, 5, 6, 14], [0, 8, 1, 9]]])
+    expected_top_k_weights = jnp.take_along_axis(pre_bias_logits, expected_top_k_indices, axis=-1)
+    actual_top_k_weights, actual_top_k_indices = self.model.deepseek_routing(gate_logits, pre_bias_logits)
+    self.assertTrue(
+        jax.numpy.allclose(expected_top_k_indices, actual_top_k_indices, rtol=1e-05, atol=1e-05, equal_nan=False)
+    )
+    self.assertTrue(
+        jax.numpy.allclose(expected_top_k_weights, actual_top_k_weights, rtol=1e-05, atol=1e-05, equal_nan=False)
+    )
+
+  def test_ling2_weight_scaling(self):
+    """LING2 weights should be normalized then scaled (no softmax, no double normalization)."""
+    # Simulate pre-selected top-k weights (post-sigmoid, pre-bias scores)
+    top_k_weights = jnp.array([[[0.3, 0.2, 0.4, 0.1]]])
+    expected_sum = top_k_weights.sum(-1, keepdims=True)
+    expected = (top_k_weights / expected_sum) * 2.5  # scaling_factor
+    actual = self.model.deepseek_scale_weights(top_k_weights)
+    self.assertTrue(jax.numpy.allclose(expected, actual, rtol=1e-05, atol=1e-05, equal_nan=False))
+    # Verify weights sum to scaling_factor
+    self.assertTrue(jax.numpy.allclose(actual.sum(-1), jnp.array([[2.5]]), rtol=1e-05, atol=1e-05, equal_nan=False))
 
 
 class MoeLoopBlock(nnx.Module):
@@ -477,7 +555,7 @@ class RoutedMoeTest(unittest.TestCase):
     devices_array = maxtext_utils.create_device_mesh(cfg)
     mesh = Mesh(devices_array, cfg.mesh_axes)
     variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-    actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+    actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
     self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -506,7 +584,7 @@ class RoutedMoeTest(unittest.TestCase):
     devices_array = maxtext_utils.create_device_mesh(cfg)
     mesh = Mesh(devices_array, cfg.mesh_axes)
     variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-    actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+    actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
     self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -535,7 +613,7 @@ class RoutedMoeTest(unittest.TestCase):
     devices_array = maxtext_utils.create_device_mesh(cfg)
     mesh = Mesh(devices_array, cfg.mesh_axes)
     variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-    actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+    actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
     self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-05, atol=1e-05, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -566,7 +644,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -599,7 +677,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -632,7 +710,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -676,8 +754,8 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, _ = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      tp_transpose_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
-      tp_output, _, _ = self.get_moe_output(variables, hidden_states, cfg2, mesh)
+      tp_transpose_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      tp_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg2, mesh)
       self.assertTrue(jax.numpy.allclose(tp_output, tp_transpose_output, rtol=1e-05, atol=1e-05, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -708,7 +786,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -741,7 +819,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   @pytest.mark.tpu_only
@@ -773,7 +851,7 @@ class RoutedMoeTest(unittest.TestCase):
     mesh = Mesh(devices_array, cfg.mesh_axes)
     with nn_partitioning.axis_rules(cfg.logical_axis_rules):
       variables, expected_output = self.get_expected_output(rng_model, hidden_states, cfg, mesh)
-      actual_output, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
+      actual_output, _, _, _, _ = self.get_moe_output(variables, hidden_states, cfg, mesh)
       self.assertTrue(jax.numpy.allclose(expected_output, actual_output, rtol=1e-02, atol=1e-02, equal_nan=False))
 
   def test_random_routing(self):
@@ -1064,6 +1142,76 @@ class RoutedMoeTest(unittest.TestCase):
       self.assertTrue(
           jnp.array_equal(recv_sz, exp_recv_sz), f"Unsharded Batch: Receive sizes mismatch for shard {expert_shard_id}"
       )
+
+
+class ZeroMeanStateParamTest(unittest.TestCase):
+  """Tests that zero_mean_state_param correctly zero-centers a target parameter."""
+
+  def test_zero_mean_centering(self):
+    """After applying zero_mean_state_param, the target parameter should have zero mean."""
+
+    # Create a dummy state with nested params mimicking the MoE bias path
+    params = {
+        "params": {
+            "decoder": {
+                "moe_layers": {
+                    "ALMoeBlock_0": {
+                        "MoeBlock_0": {
+                            "gate": {
+                                "bias": jnp.array([0.5, -0.1, 0.3, -0.2, 0.1]),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    state = train_state.TrainState(step=0, apply_fn=None, params=params, tx=None, opt_state={})
+
+    target_path = ("params", "decoder", "moe_layers", "ALMoeBlock_0", "MoeBlock_0", "gate", "bias")
+    new_state = maxtext_utils.zero_mean_state_param(state, target_path)
+
+    # Extract the updated bias
+    new_bias = new_state.params["params"]["decoder"]["moe_layers"]["ALMoeBlock_0"]["MoeBlock_0"]["gate"]["bias"]
+
+    # Verify mean is zero
+    self.assertAlmostEqual(float(new_bias.mean()), 0.0, places=6)
+    # Verify relative differences preserved
+    original_bias = params["params"]["decoder"]["moe_layers"]["ALMoeBlock_0"]["MoeBlock_0"]["gate"]["bias"]
+    expected = original_bias - original_bias.mean()
+    self.assertTrue(jnp.allclose(new_bias, expected))
+
+  def test_non_target_params_unchanged(self):
+    """Non-target parameters should not be modified."""
+
+    params = {
+        "params": {
+            "other_param": jnp.array([1.0, 2.0, 3.0]),
+            "decoder": {
+                "moe_layers": {
+                    "ALMoeBlock_0": {
+                        "MoeBlock_0": {
+                            "gate": {
+                                "bias": jnp.array([0.5, -0.1, 0.3]),
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+    state = train_state.TrainState(step=0, apply_fn=None, params=params, tx=None, opt_state={})
+
+    target_path = ("params", "decoder", "moe_layers", "ALMoeBlock_0", "MoeBlock_0", "gate", "bias")
+    new_state = maxtext_utils.zero_mean_state_param(state, target_path)
+
+    # other_param should be unchanged
+    self.assertTrue(
+        jnp.array_equal(
+            new_state.params["params"]["other_param"],
+            params["params"]["other_param"],
+        )
+    )
 
 
 if __name__ == "__main__":

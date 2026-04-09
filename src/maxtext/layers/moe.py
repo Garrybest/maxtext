@@ -141,28 +141,56 @@ def random_routing(rng_key, gate_logits, num_experts_per_tok):
   return top_k_weights, top_k_indices
 
 
-def calculate_load_balance_updates(top_k_indices, num_experts, rate):
+def calculate_expert_counts(top_k_indices, num_experts):
   """
-  Computes a bias adjustment update based on expert load.
-  Used in DeepSeek V3: https://arxiv.org/html/2412.19437v1.
-  Implementation reference: https://arxiv.org/pdf/2408.15664.
+  Counts how many tokens are routed to each expert.
+
+  Returns raw *local* expert counts (not the final bias update direction).
+  The caller is responsible for:
+
+  1. **Cross-device reduction** -- inside ``shard_map`` use
+     ``jax.lax.psum(expert_counts, axis_name=...)``, outside use
+     ``maybe_shard_with_logical(expert_counts, (None,), ...)``.
+  2. **GA micro-batch accumulation** -- sum counts across micro-batches
+     before converting to a bias update.
+  3. Converting counts to a bias update via
+     :func:`expert_counts_to_bias_update`.
 
   Args:
       top_k_indices: Shape (batch, sequence, top_k).
       num_experts: Total number of experts.
-      rate: The update rate.
 
   Returns:
-      update: The value to add to the expert bias. Shape (num_experts,).
+      expert_counts: Per-expert token counts.  Shape (num_experts,).
   """
   flat_indices = top_k_indices.ravel()
-  expert_counts = jnp.bincount(flat_indices, length=num_experts)
+  return jnp.bincount(flat_indices, length=num_experts)
 
-  total_tokens = flat_indices.size
-  average_load = total_tokens / num_experts
+
+def expert_counts_to_bias_update(expert_counts, num_experts, rate):
+  """Converts (possibly accumulated) expert counts into a bias update.
+
+  Computes ``sign(average_load - expert_counts) * rate``.  Overloaded experts
+  receive a negative update (lower bias => less likely to be selected) and
+  underloaded experts receive a positive update.
+
+  This is separated from :func:`calculate_expert_counts` so that counts can
+  first be summed across gradient-accumulation micro-batches (matching
+  Megatron's ``local_tokens_per_expert`` accumulation).
+
+  Args:
+      expert_counts: Shape ``(num_experts,)`` or ``(num_layers, num_experts)``
+          for scanned layers.
+      num_experts: Total number of experts.
+      rate: The bias update rate.
+
+  Returns:
+      update: The value to add to the expert bias.  Same shape as
+          ``expert_counts``.
+  """
+  average_load = jnp.sum(expert_counts, axis=-1, keepdims=True) / num_experts
   direction = jnp.sign(average_load - expert_counts)
-  output = direction * rate
-  return output
+  return direction * rate
 
 
 class GateLogit(nnx.Module):
@@ -181,10 +209,12 @@ class GateLogit(nnx.Module):
       kernel_init: NdInitializer = nd_dense_init(1.0, "fan_in", "truncated_normal"),
       kernel_axes: Tuple[Optional[str], ...] = (),
       use_bias: bool = False,
+      bias_dtype: Optional[ctypes.DType] = None,
       score_func: str = "",
       quant: Optional[quantizations.AqtQuantization] = None,
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
+      moe_z_loss_weight: float = 0.0,
   ):
     """Initializes the GateLogit module.
 
@@ -204,6 +234,7 @@ class GateLogit(nnx.Module):
       score_func: Scoring function for output normalization before applying bias.
       quant: The quantization configuration. If None, no quantization is applied.
       matmul_precision: The precision level for the matrix multiplication.
+      moe_z_loss_weight: Weight for router z-loss (ST-MoE paper). 0.0 disables.
     """
     self.in_features_shape = linears.canonicalize_tuple(in_features_shape)
     self.out_features_shape = linears.canonicalize_tuple(out_features_shape)
@@ -215,10 +246,12 @@ class GateLogit(nnx.Module):
     self.kernel_init = kernel_init
     self.kernel_axes = kernel_axes
     self.use_bias = use_bias
+    self.bias_dtype = bias_dtype if bias_dtype else weight_dtype
     self.score_func = score_func
     self.quant = quant
     self.shard_mode = shard_mode
     self.matmul_precision = matmul_precision
+    self.moe_z_loss_weight = moe_z_loss_weight
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -241,7 +274,7 @@ class GateLogit(nnx.Module):
       bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
       bias_shape = kernel_shape[-len(self.out_features_shape) :]
       self.bias = nnx.Param(
-          default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
+          default_bias_init(rngs.params(), bias_shape, self.bias_dtype),
           sharding=bias_axes,
       )
     else:
@@ -264,17 +297,21 @@ class GateLogit(nnx.Module):
       return None
     return getattr(self, self._quant_dot_general_name)
 
-  def __call__(self, inputs: jax.Array, _initializing: bool = False) -> Tuple[jax.Array, Optional[jax.Array]]:
+  def __call__(
+      self, inputs: jax.Array, _initializing: bool = False
+  ) -> Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
 
-    inputs = jnp.asarray(inputs, self.dtype)
+    # Keep router gate matmul in fp32 for stable top-k routing decisions.
+    router_dtype = jnp.float32
+    inputs = jnp.asarray(inputs, router_dtype)
     norm_axis = linears.normalize_axes(self.axis, inputs.ndim)
 
     if quantizations.in_serve_mode(self.quant):
       kernel_shape = self.in_features_shape + self.out_features_shape
-      kernel = jnp.zeros(kernel_shape, dtype=self.dtype)
+      kernel = jnp.zeros(kernel_shape, dtype=router_dtype)
     else:
       kernel = self.kernel[...]
-    kernel = jnp.asarray(kernel, self.dtype)
+    kernel = jnp.asarray(kernel, router_dtype)
 
     contract_ind = tuple(range(0, len(norm_axis)))
     output_sharding = (
@@ -292,17 +329,28 @@ class GateLogit(nnx.Module):
         _initializing,
         out_sharding=output_sharding,
     )
+
+    # Compute z-loss on raw logits before score_func (ST-MoE paper)
+    z_loss = None
+    if self.moe_z_loss_weight > 0.0:
+      log_z = jax.nn.logsumexp(output.astype(jnp.float32), axis=-1)
+      z_loss = jnp.mean(jnp.square(log_z)) * self.moe_z_loss_weight  # keep float32 for metric precision
+
     pre_bias_logits = None
 
     if self.score_func:
       output = linears._convert_to_activation_function(self.score_func)(output)
-      if self.model_name.startswith("deepseek3"):
-        pre_bias_logits = output
+
+    # Preserve scores before adding gate bias whenever a bias exists.
+    # Grouped-topk routing (e.g. LING2) uses these pre-bias scores
+    # as returned top-k weights.
+    if self.model_name.startswith("deepseek3") or self.use_bias:
+      pre_bias_logits = output
 
     if self.use_bias:
-      bias = jnp.asarray(self.bias[...], self.dtype)
+      bias = jnp.asarray(self.bias[...], self.bias_dtype)
       output += bias
-    return output, pre_bias_logits
+    return output, pre_bias_logits, z_loss
 
 
 class RoutedMoE(nnx.Module):
@@ -321,13 +369,13 @@ class RoutedMoE(nnx.Module):
       weight_dtype: ctypes.DType = jnp.float32,
       dtype: ctypes.DType = jnp.float32,
       quant: Optional[quantizations.AqtQuantization] = None,
+      layer_idx: Optional[int] = None,
   ):
     """Initializes the RoutedMoE module.
 
     Attributes:
       config: The main config setting.
       num_experts: Number of experts.
-      num_experts_per_tok: Number of experts for each token.
       mesh: Mesh, device mesh.
       kernel_init: The initializer function for the kernel weight matrix.
       kernel_axes: A tuple of logical axis names for partitioning the kernel.
@@ -348,6 +396,7 @@ class RoutedMoE(nnx.Module):
     self.dtype = dtype
     self.quant = quant
     self.rngs = rngs
+    self.layer_idx = layer_idx
 
     if self.config.shard_exp_on_fsdp:
       # special sharding for dsv3
@@ -373,6 +422,9 @@ class RoutedMoE(nnx.Module):
     else:
       self._expert_parallelism_name = "expert"
 
+    tp_size = max(config.ici_tensor_parallelism * config.dcn_tensor_parallelism, 1)
+    effective_z_loss_weight = config.moe_z_loss_weight / tp_size
+
     self.gate = GateLogit(
         in_features_shape=self.config.emb_dim,
         out_features_shape=self.num_experts,
@@ -384,9 +436,12 @@ class RoutedMoE(nnx.Module):
         kernel_init=self.kernel_init,
         kernel_axes=self.kernel_axes,
         use_bias=self.config.routed_bias,
+        bias_dtype=self.config.routed_bias_dtype,
         score_func=self.config.routed_score_func,
-        matmul_precision=self.config.matmul_precision,
+        # Force high-precision router matmul to stabilize top-k routing alignment.
+        matmul_precision="highest",
         shard_mode=config.shard_mode,
+        moe_z_loss_weight=effective_z_loss_weight,
         rngs=self.rngs,
     )
 
@@ -492,27 +547,54 @@ class RoutedMoE(nnx.Module):
     """Determines if loss-free load balancing updates should be applied."""
     return self.config.routed_bias and self.config.routed_bias_update_rate > 0.0
 
+  def should_use_grouped_topk(self) -> bool:
+    """Whether router should apply group-limited top-k expert selection."""
+    return (
+        self.config.decoder_block
+        in (
+            ctypes.DecoderBlockType.DEEPSEEK,
+            ctypes.DecoderBlockType.LING2,
+        )
+        and self.config.n_routing_groups != -1
+        and self.config.topk_routing_group != -1
+    )
+
+  def should_use_pre_bias_logits(self) -> bool:
+    """Whether routing path expects pre-bias router scores."""
+    return self.config.model_name.startswith("deepseek3") or self.should_use_grouped_topk()
+
   def get_topk(self, gate_logits, pre_bias_logits, rngs=None):
     """get topk."""
+    # Keep top-k routing in fp32 to minimize discrete selection drift.
+    gate_logits = jnp.asarray(gate_logits, jnp.float32)
+    if pre_bias_logits is not None:
+      pre_bias_logits = jnp.asarray(pre_bias_logits, jnp.float32)
+
     # shape of top_k_weights & top_k_indices:
     # (batch, sequence, num_experts_per_tok).
     if self.config.use_random_routing:
       if rngs is None:
         raise ValueError("The random key cannot be None for random routing.")
-      # Reuse the 'params' RNG stream to ensure random routing
-      rng = rngs.params()
+      # Reuse the 'dropout' RNG stream to ensure random routing
+      rng = rngs.dropout()
       top_k_weights, top_k_indices = random_routing(rng, gate_logits, self.num_experts_per_tok)
       return top_k_weights, top_k_indices
 
-    if self.config.model_name.startswith("deepseek3"):
+    if self.should_use_pre_bias_logits():
+      if pre_bias_logits is None:
+        # Fall back to gate logits to avoid hard failure in atypical configs.
+        pre_bias_logits = gate_logits
       top_k_weights, top_k_indices = self.deepseek_routing(gate_logits, pre_bias_logits)
     else:
       top_k_weights, top_k_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
 
-    if self.config.decoder_block == ctypes.DecoderBlockType.DEEPSEEK:
+    if self.config.decoder_block in (
+        ctypes.DecoderBlockType.DEEPSEEK,
+        ctypes.DecoderBlockType.LING2,
+    ):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
     elif self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
-      top_k_weights = jax.nn.softmax(top_k_weights.astype(jnp.float32), axis=-1).astype(self.dtype)
+      top_k_weights = jax.nn.softmax(top_k_weights.astype(jnp.float32), axis=-1)
 
     # This is the Qwen3-specific normalization of router weights.
     if self.config.norm_topk_prob:
@@ -523,6 +605,7 @@ class RoutedMoE(nnx.Module):
   def deepseek_scale_weights(self, weights):
     """Scales weights according to DeepSeek's v3 reference implementation."""
     # https://github.com/deepseek-ai/DeepSeek-V3/blob/2f7b80eecebf3d1c84da5a0d465f6639ea175012/inference/model.py#L592-L594.
+    weights = jnp.asarray(weights, jnp.float32)
     if self.config.routed_score_func == "sigmoid":
       weights /= weights.sum(-1, keepdims=True)
     weights *= self.config.routed_scaling_factor
@@ -622,11 +705,12 @@ class RoutedMoE(nnx.Module):
       lb_loss = self.load_balance_loss(selected_experts, softmax_probs)
 
     if self.should_update_load_balance():
-      bias_updates = calculate_load_balance_updates(
-          selected_experts, self.config.num_experts, self.config.routed_bias_update_rate
+      expert_counts = calculate_expert_counts(
+          selected_experts,
+          self.config.num_experts,
       )
     else:
-      bias_updates = None
+      expert_counts = None
 
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
       # weights will be of shape (batch_size, seq_len, num_experts_per_tok)
@@ -658,7 +742,7 @@ class RoutedMoE(nnx.Module):
         group_size,
         sorted_experts,
         lb_loss,
-        bias_updates,
+        expert_counts,
     )
 
   def unpermute(
@@ -1046,10 +1130,10 @@ class RoutedMoE(nnx.Module):
       wo_bias_pspec = self._logical_to_mesh_axes(("exp", "activation_embed"))
 
     gate_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
-    if self.config.model_name.startswith("deepseek3"):
+    if self.should_use_pre_bias_logits():
       pre_bias_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
     else:
-      # pre_bias_logits is None for non-DeepSeek v3 models
+      # pre_bias_logits is not used on this routing path.
       pre_bias_logits_pspec = None
 
     # w0, w1, wo needs to be un sharded on fsdp / fsdp_transpose axis, so use
@@ -1082,6 +1166,20 @@ class RoutedMoE(nnx.Module):
       w1_pspec = aqt.partition_spec(w1_pspec, (1,), w1_kernel.dtype, use_bias=False)
     if isinstance(wo_kernel, aqt.QTensor):
       wo_pspec = aqt.partition_spec(wo_pspec, (1,), wo_kernel.dtype, use_bias=False)
+
+    # Determine which mesh axes the batch dimension is sharded over.
+    # Inside the shard_map wrapper we need jax.lax.psum (not sharding
+    # constraints) to all-reduce expert_counts across these axes so that
+    # every shard sees the global token distribution.
+    _batch_spec = input_partition_pspec[0]
+    if _batch_spec is None:
+      batch_reduce_axes = ()
+    elif isinstance(_batch_spec, str):
+      batch_reduce_axes = (_batch_spec,)
+    elif isinstance(_batch_spec, tuple):
+      batch_reduce_axes = tuple(ax for ax in _batch_spec if ax is not None)
+    else:
+      batch_reduce_axes = ()
 
     @functools.partial(
         jax.shard_map,
@@ -1118,14 +1216,20 @@ class RoutedMoE(nnx.Module):
         # expert shards, and then routes within each shard.
 
         # Duplicate inputs to all expert shards.
-        x, logits, pre_bias_logits = tuple(
-            jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True)
-            for z in (x, logits, pre_bias_logits)
+        gather_tensors = [x, logits]
+        if pre_bias_logits is not None:
+          gather_tensors.append(pre_bias_logits)
+        gathered = tuple(
+            jax.lax.all_gather(z, axis_name=self._expert_parallelism_name, tiled=True) for z in gather_tensors
         )
+        if pre_bias_logits is not None:
+          x, logits, pre_bias_logits = gathered
+        else:
+          x, logits = gathered
 
         # "Route" tokens within each shard.
         num_experts_per_shard = self.config.num_experts // num_expert_parallelism
-        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
+        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, expert_counts = self.permute(
             x,
             logits,
             pre_bias_logits,
@@ -1140,9 +1244,15 @@ class RoutedMoE(nnx.Module):
         mask = jnp.arange(x.shape[0]) < jnp.sum(group_sizes)
         x = jnp.where(mask[:, None], x, 0)
       else:
-        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
+        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, expert_counts = self.permute(
             x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
         )
+
+        # All-reduce expert_counts across batch-sharding axes so that every
+        # shard sees the global token distribution.  Inside shard_map we must
+        # use jax.lax.psum (sharding constraints have no effect here).
+        if expert_counts is not None and batch_reduce_axes:
+          expert_counts = jax.lax.psum(expert_counts, axis_name=batch_reduce_axes)
 
         if num_expert_parallelism > 1:
           batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
@@ -1389,7 +1499,7 @@ class RoutedMoE(nnx.Module):
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,
         )
 
-      return output, lb_loss, bias_updates
+      return output, lb_loss, expert_counts
 
     if self.config.moe_fsdp_use_two_stage_all_gather:
       # Unshard on fsdp axis
@@ -1416,14 +1526,15 @@ class RoutedMoE(nnx.Module):
       input_axes = (batch_logical_axis, "activation_norm_length", None)
 
     gate_logits_axes = (batch_logical_axis, "activation_norm_length", None)
-    if self.config.model_name.startswith("deepseek3"):
+    if self.should_use_pre_bias_logits():
       pre_bias_logits_axes = (batch_logical_axis, "activation_norm_length", None)
     else:
       pre_bias_logits_axes = None
 
     inputs = self._maybe_shard_with_logical(inputs, input_axes)
     gate_logits = self._maybe_shard_with_logical(gate_logits, gate_logits_axes)
-    pre_bias_logits = self._maybe_shard_with_logical(pre_bias_logits, pre_bias_logits_axes)
+    if pre_bias_logits_axes is not None:
+      pre_bias_logits = self._maybe_shard_with_logical(pre_bias_logits, pre_bias_logits_axes)
 
     return wrapper(
         inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias, self.rngs
@@ -1692,8 +1803,8 @@ class RoutedMoE(nnx.Module):
     """Dense matrix multiplication."""
     # gate_logits: batch, length, expert
     gate_logits = self._maybe_shard_with_logical(gate_logits, ("activation_batch", "activation_norm_length", None))
-    if self.config.model_name.startswith("deepseek3"):
-      # pre_bias_logits is None for non-DeepSeek v3 models
+    if self.should_use_pre_bias_logits():
+      # pre_bias_logits can be used for grouped/deepseek-style routing.
       pre_bias_logits = self._maybe_shard_with_logical(
           pre_bias_logits, ("activation_batch", "activation_norm_length", None)
       )
@@ -1717,11 +1828,20 @@ class RoutedMoE(nnx.Module):
 
     # Calculate routed bias updates (loss-free)
     if self.should_update_load_balance():
-      bias_updates = calculate_load_balance_updates(
-          top_k_indices, self.config.num_experts, self.config.routed_bias_update_rate
+      expert_counts = calculate_expert_counts(
+          top_k_indices,
+          self.config.num_experts,
+      )
+      # Outside shard_map: force replicated sharding to trigger XLA SPMD
+      # all-reduce across data-parallel ranks.
+      expert_counts = maybe_shard_with_logical(
+          expert_counts,
+          (None,),
+          self.mesh,
+          self.config.shard_mode,
       )
     else:
-      bias_updates = None
+      expert_counts = None
 
     batch_size = inputs.shape[0]
     seq_len = inputs.shape[1]
@@ -1920,7 +2040,7 @@ class RoutedMoE(nnx.Module):
                   output.shape[3],
               ),
           )
-      return output, lb_loss, bias_updates
+      return output, lb_loss, expert_counts
     else:
       inputs = self._maybe_shard_with_logical(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
       with jax.named_scope("wi_0"):
@@ -1968,7 +2088,7 @@ class RoutedMoE(nnx.Module):
             weights,
             precision=matmul_precision,
         ).astype(self.dtype)
-      return output, lb_loss, bias_updates
+      return output, lb_loss, expert_counts
 
   def retrieve_quantized_weight(
       self,
@@ -2001,10 +2121,10 @@ class RoutedMoE(nnx.Module):
 
   def __call__(
       self, inputs: jax.Array, out_sharding: NamedSharding | None = None
-  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array], Optional[jax.Array], Optional[dict]]:
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
-    gate_logits, pre_bias_logits = self.gate(inputs)
+    gate_logits, pre_bias_logits, z_loss = self.gate(inputs)
 
     w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
     w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
@@ -2030,14 +2150,33 @@ class RoutedMoE(nnx.Module):
             w1_bias,
             wo_bias,
         )
-      output, lb_loss, bias_updates = self.sparse_matmul(
+      output, lb_loss, expert_counts = self.sparse_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
       )
     else:
-      output, lb_loss, bias_updates = self.dense_matmul(
+      output, lb_loss, expert_counts = self.dense_matmul(
           inputs, gate_logits, pre_bias_logits, w0_kernel, w1_kernel, wo_kernel, w0_bias, w1_bias, wo_bias
       )
-    return output, lb_loss, bias_updates
+
+    # Compute router stats for training diagnostics
+    if cfg.model_call_mode != "inference":
+      router_stats = {}
+      # Router bias stats (only when bias is enabled)
+      if self.gate.use_bias and self.gate.bias is not None:
+        bias_f32 = self.gate.bias[...].astype(jnp.float32)
+        router_stats["router_bias_mean"] = jnp.mean(bias_f32)
+        router_stats["router_bias_std"] = jnp.std(bias_f32)
+      # Top-k weight mean: average probability of selected experts (softmax over all experts first)
+      gate_logits_f32 = gate_logits.astype(jnp.float32)
+      full_probs = jax.nn.softmax(gate_logits_f32, axis=-1)
+      topk_probs = jax.lax.top_k(full_probs, self.num_experts_per_tok)[0]
+      router_stats["router_topk_weight_mean"] = jnp.mean(topk_probs)
+      # Router probs std: mean of per-token std of full softmax routing probs
+      router_stats["router_probs_std"] = jnp.mean(jnp.std(full_probs, axis=-1))
+    else:
+      router_stats = None
+
+    return output, lb_loss, z_loss, expert_counts, router_stats
 
 
 class RoutedAndSharedMoE(nnx.Module):
@@ -2053,6 +2192,7 @@ class RoutedAndSharedMoE(nnx.Module):
       weight_dtype: ctypes.DType = jnp.float32,
       dtype: ctypes.DType = jnp.float32,
       quant: Optional[quantizations.AqtQuantization] = None,
+      layer_idx: Optional[int] = None,
   ):
     """Initializes the RoutedAndSharedMoE module.
 
@@ -2074,6 +2214,7 @@ class RoutedAndSharedMoE(nnx.Module):
     self.dtype = dtype
     self.quant = quant
     self.rngs = rngs
+    self.layer_idx = layer_idx
     # NOTE: the name MoeBlock_0 is to ensure reverse compatibility with
     # existing checkpoints for routed experts.
     self.MoeBlock_0 = RoutedMoE(
@@ -2088,11 +2229,12 @@ class RoutedAndSharedMoE(nnx.Module):
         weight_dtype=self.config.weight_dtype,
         quant=self.quant,
         rngs=self.rngs,
+        layer_idx=layer_idx,
     )
     self.shared_experts = linears.MlpBlock(
         mesh=self.mesh,
         in_features=self.config.emb_dim,
-        intermediate_dim=self.config.shared_experts * self.config.moe_mlp_dim,
+        intermediate_dim=self.config.shared_experts * (self.config.moe_shared_expert_dim or self.config.moe_mlp_dim),
         activations=self.config.mlp_activations,
         intermediate_dropout_rate=self.config.dropout_rate,
         dtype=self.config.dtype,
@@ -2111,10 +2253,14 @@ class RoutedAndSharedMoE(nnx.Module):
       inputs: jax.Array,
       intermediate_sharding: NamedSharding | None = None,
       out_sharding: NamedSharding | None = None,
-  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    routed_experts, load_balance_loss, moe_bias_updates = self.routed_moe(inputs, out_sharding=out_sharding)
+  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array], Optional[jax.Array], Optional[dict]]:
+    routed_experts, load_balance_loss, z_loss, moe_expert_counts, router_stats = self.routed_moe(
+        inputs, out_sharding=out_sharding
+    )
     shared_experts = self.shared_experts(inputs, intermediate_sharding=intermediate_sharding, out_sharding=out_sharding)
-    return routed_experts + shared_experts, load_balance_loss, moe_bias_updates
+    output = routed_experts + shared_experts
+
+    return output, load_balance_loss, z_loss, moe_expert_counts, router_stats
 
 
 def get_gate_logit(
@@ -2130,6 +2276,7 @@ def get_gate_logit(
     score_func: str = "",
     quant: Optional[quantizations.AqtQuantization] = None,
     matmul_precision: str = "default",
+    moe_z_loss_weight: float = 0.0,
     name: Optional[str] = None,
 ):
   """Creates a GateLogit Linen module."""
@@ -2151,6 +2298,7 @@ def get_gate_logit(
       score_func=score_func,
       quant=quant,
       matmul_precision=matmul_precision,
+      moe_z_loss_weight=moe_z_loss_weight,
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,

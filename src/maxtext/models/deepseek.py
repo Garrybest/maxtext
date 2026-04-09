@@ -238,14 +238,23 @@ class DeepSeekGenericLayer(nnx.Module):
     axis_names = ["activation_batch", length_name, "activation_mlp"]
     return axis_names
 
-  def post_process(self, layer_output, load_balance_loss, moe_bias_updates, kv_cache=None):
+  def post_process(
+      self, layer_output, load_balance_loss, moe_z_loss, moe_expert_counts, router_stats=None, kv_cache=None
+  ):
     """postprocessing."""
 
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow(nnx.Intermediate, "moe_lb_loss", load_balance_loss)
 
-    if self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      self.sow(nnx.Intermediate, "moe_bias_updates", moe_bias_updates)
+    if self.config.moe_z_loss_weight > 0.0 and moe_z_loss is not None:
+      self.sow(nnx.Intermediate, "moe_z_loss", moe_z_loss)
+
+    if self.config.routed_bias and self.config.routed_bias_update_rate > 0.0 and moe_expert_counts is not None:
+      self.sow(nnx.Intermediate, "moe_expert_counts", moe_expert_counts)
+
+    if router_stats is not None:
+      for key, value in router_stats.items():
+        self.sow(nnx.Intermediate, key, value)
 
     if self.config.record_internal_nn_metrics:
       self.sow(nnx.Intermediate, "activation_mean", jnp.mean(layer_output))
@@ -386,7 +395,7 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
-    return self.post_process(layer_output, None, None, kv_cache)
+    return self.post_process(layer_output, None, None, None, None, kv_cache)
 
 
 DeepSeekDenseLayerToLinen = nnx_wrappers.to_linen_class(
@@ -510,19 +519,21 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
           mhc_type=HyperConnectionType.MLP_MOE,
       )
       load_balance_loss = metadata["load_balance_loss"]
-      moe_bias_updates = metadata["moe_bias_updates"]
+      moe_z_loss = metadata.get("moe_z_loss")
+      moe_expert_counts = metadata.get("moe_expert_counts")
+      router_stats = metadata.get("router_stats")
     else:
-      mlp_lnx, load_balance_loss, moe_bias_updates = self.mlp_op(hidden_states, deterministic)
+      mlp_lnx, load_balance_loss, moe_z_loss, moe_expert_counts, router_stats = self.mlp_op(hidden_states, deterministic)
       layer_output = mlp_lnx + intermediate_inputs
     layer_output = self.dropout_op(layer_output, deterministic=deterministic)
 
-    return self.post_process(layer_output, load_balance_loss, moe_bias_updates, kv_cache)
+    return self.post_process(layer_output, load_balance_loss, moe_z_loss, moe_expert_counts, router_stats, kv_cache)
 
   def mlp_op(self, x, deterministic, *args, **kwargs):
-    mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
+    mlp_lnx, load_balance_loss, moe_z_loss, moe_expert_counts, router_stats = self.DeepSeekMoeBlock_0(
         x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
     )
-    return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
+    return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_z_loss, moe_expert_counts, router_stats
 
 
 DeepSeekMoELayerToLinen = nnx_wrappers.to_linen_class(

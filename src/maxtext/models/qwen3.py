@@ -821,7 +821,7 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
         rngs=rngs,
     )
 
-  def __call__(self, hidden_states: Array, deterministic: bool) -> tuple[Array, Array | None]:
+  def __call__(self, hidden_states: Array, deterministic: bool) -> tuple[Array, Array | None, Array | None, dict | None]:
     """
     Applies the sparse MoE block to the input hidden states.
 
@@ -833,9 +833,11 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
       A tuple containing:
         - The output array of the MoE block.
         - The load balancing loss from the routed experts, if applicable during training.
+        - The z-loss from the routed experts, if applicable during training.
+        - Router stats dictionary, if applicable.
     """
     # 1. Apply the routed experts block.
-    routed_output, load_balance_loss, _ = self.routed_experts(hidden_states)
+    routed_output, load_balance_loss, z_loss, _, router_stats = self.routed_experts(hidden_states)
 
     # 2. Apply the shared expert.
     shared_expert_output = self.shared_expert(hidden_states, deterministic=deterministic)
@@ -846,7 +848,7 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
     # 4. Combine the outputs.
     final_output = routed_output + jax.nn.sigmoid(shared_gate_output) * shared_expert_output
 
-    return final_output, load_balance_loss
+    return final_output, load_balance_loss, z_loss, router_stats
 
 
 class Qwen3NextScannableBlock(nnx.Module):
@@ -1050,12 +1052,19 @@ class Qwen3NextDecoderLayer(nnx.Module):
     hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
 
     # Instantiate and call our `Qwen3NextSparseMoeBlock`.
-    mlp_output, load_balance_loss = self.mlp(hidden_states, deterministic=deterministic)
+    mlp_output, load_balance_loss, moe_z_loss, router_stats = self.mlp(hidden_states, deterministic=deterministic)
 
     # We sow the load balancing loss so it can be collected and added to the total loss
     # during training.
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+
+    if self.config.moe_z_loss_weight > 0.0 and moe_z_loss is not None:
+      self.sow("intermediates", "moe_z_loss", moe_z_loss)
+
+    if router_stats is not None:
+      for key, value in router_stats.items():
+        self.sow("intermediates", key, value)
 
     # Final residual connection (after the MoE block)
     layer_output = residual + mlp_output
@@ -1296,10 +1305,17 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
         attention_metadata=attention_metadata,
     )
 
-    mlp_lnx, load_balance_loss, _ = self.moe_block(hidden_states)
+    mlp_lnx, load_balance_loss, moe_z_loss, _, router_stats = self.moe_block(hidden_states)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, self.activation_axis_names)
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+
+    if self.config.moe_z_loss_weight > 0.0 and moe_z_loss is not None:
+      self.sow("intermediates", "moe_z_loss", moe_z_loss)
+
+    if router_stats is not None:
+      for key, value in router_stats.items():
+        self.sow("intermediates", key, value)
 
     layer_output = intermediate_inputs + mlp_lnx
     layer_output = nn.with_logical_constraint(layer_output, self.activation_axis_names)

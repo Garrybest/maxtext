@@ -482,8 +482,10 @@ class Llama4DecoderLayer(nnx.Module):
     hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
 
     load_balance_loss = None
+    moe_z_loss = None
+    router_stats = None
     if self.is_moe_layer:
-      mlp_lnx, load_balance_loss, _ = self.moe_block(hidden_states)
+      mlp_lnx, load_balance_loss, moe_z_loss, _, router_stats = self.moe_block(hidden_states)
     else:
       mlp_lnx = self.mlp(hidden_states, deterministic=deterministic)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, self.activation_axis_names)
@@ -494,6 +496,13 @@ class Llama4DecoderLayer(nnx.Module):
 
     if self.config.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+
+    if self.config.moe_z_loss_weight > 0.0 and moe_z_loss is not None:
+      self.sow("intermediates", "moe_z_loss", moe_z_loss)
+
+    if router_stats is not None:
+      for key, value in router_stats.items():
+        self.sow("intermediates", key, value)
 
     if cfg.record_internal_nn_metrics:
       self.sow("intermediates", "activation_mean", jnp.mean(layer_output))

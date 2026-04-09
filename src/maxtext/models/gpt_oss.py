@@ -177,7 +177,7 @@ class GptOssDecoderLayer(nnx.Module):
     )
 
     load_balance_loss = None
-    mlp_lnx, load_balance_loss, _ = self.GptOssMlp(hidden_states)
+    mlp_lnx, load_balance_loss, moe_z_loss, _, router_stats = self.GptOssMlp(hidden_states)
     mlp_lnx = nn.with_logical_constraint(mlp_lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     layer_output = mlp_lnx + intermediate_inputs
@@ -190,6 +190,13 @@ class GptOssDecoderLayer(nnx.Module):
 
     if cfg.load_balance_loss_weight > 0.0 and load_balance_loss is not None:
       self.sow("intermediates", "moe_lb_loss", load_balance_loss)
+
+    if cfg.moe_z_loss_weight > 0.0 and moe_z_loss is not None:
+      self.sow("intermediates", "moe_z_loss", moe_z_loss)
+
+    if router_stats is not None:
+      for key, value in router_stats.items():
+        self.sow("intermediates", key, value)
 
     if cfg.record_internal_nn_metrics:
       self.sow("intermediates", "activation_mean", jnp.mean(layer_output))
