@@ -138,6 +138,33 @@ def parse_split_range(split_str, split_index, num_docs):
   return start_doc, end_doc
 
 
+def _normalize_weights(weights):
+  """Normalize weights using numpy float64 arithmetic.
+
+  Matches Megatron-LM's ``megatron.core.datasets.utils.normalize`` exactly::
+
+      w = numpy.array(weights, dtype=numpy.float64)
+      w = (w / numpy.sum(w)).tolist()
+
+  Megatron applies this normalization **twice** during dataset construction:
+
+  1. In ``BlendedMegatronDatasetBuilder`` before computing per-dataset buffer
+     sizes (determines how many samples each sub-dataset must produce).
+  2. In ``BlendedDataset.__init__`` on the already-normalized weights before
+     building the blend index (determines the interleaved sampling order)
+     and computing the cache hash.
+
+  Due to floating-point arithmetic, the second pass can produce values that
+  differ from the first by ~1 ULP.  Both passes must use numpy float64
+  division (not Python float) to stay bit-identical with Megatron's cache
+  keys and index arrays.
+  """
+  w = np.array(weights, dtype=np.float64)
+  w_sum = np.sum(w)
+  w = (w / w_sum).tolist()
+  return w
+
+
 def compute_blend_buffers(num_samples, weights, margin):
   """Compute per-dataset buffer sizes for Megatron-style blending.
 
@@ -145,7 +172,8 @@ def compute_blend_buffers(num_samples, weights, margin):
 
   Args:
       num_samples: Total number of blended samples.
-      weights: Normalized per-dataset weights.
+      weights: Normalized per-dataset weights (must already be normalized via
+          :func:`_normalize_weights`; this function does **not** re-normalize).
       margin: Over-provisioning margin percentage.
 
   Returns:
@@ -597,7 +625,7 @@ def convert_blend(
   Returns:
       List of dicts, one per dataset, each containing:
           - ``"paths"``: dict of {name: path} from :func:`convert`
-          - ``"weight"``: the dataset's weight
+          - ``"weight"``: the dataset's normalized blend weight (numpy float64)
           - ``"buffer_samples"``: number of samples allocated to this dataset
   """
   from concurrent.futures import ThreadPoolExecutor, as_completed  # pylint: disable=import-outside-toplevel
@@ -609,7 +637,11 @@ def convert_blend(
   total_weight = sum(weights)
   if total_weight <= 0:
     raise ValueError(f"Total weight must be positive, got {total_weight}")
-  norm_weights = [w / total_weight for w in weights]
+
+  # Normalize once, matching Megatron's BlendedMegatronDatasetBuilder.
+  # Downstream _normalize_and_filter_weights does the second normalize
+  # to match BlendedDataset.__init__.
+  norm_weights = _normalize_weights(weights)
 
   buffer_per_ds = compute_blend_buffers(total_samples, norm_weights, margin)
 
@@ -654,7 +686,7 @@ def convert_blend(
       paths = fut.result()  # propagates exceptions
       results[idx] = {
           "paths": paths,
-          "weight": weights[idx],
+          "weight": norm_weights[idx],
           "buffer_samples": buffer_per_ds[idx],
       }
       log.info("Dataset %d done: %s", idx, list(paths.values()))

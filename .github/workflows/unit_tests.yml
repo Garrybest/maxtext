@@ -348,7 +348,20 @@ jobs:
                 --ci \
                 2>&1 || MOE_EXIT=$?
 
-            [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ]
+            # Megatron dataloader alignment tests (CPU-only torch + megatron-core)
+            MEG_EXIT=0
+            echo ""
+            echo "========================================================"
+            echo "Running Megatron dataloader alignment tests"
+            echo "========================================================"
+            /opt/tools/uv pip install torch --extra-index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -3
+            /opt/tools/uv pip install megatron-core 2>&1 | tail -3
+            python3 -m pytest tests/unit/megatron_dataloader_alignment_test.py \
+                tests/unit/megatron_npy_datasource_test.py \
+                -v --timeout=300 \
+                2>&1 || MEG_EXIT=$?
+
+            [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ] && [ "$MEG_EXIT" -eq 0 ]
           '
 
       - name: Release TPU pod

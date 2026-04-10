@@ -89,10 +89,8 @@ def _normalize_and_filter_weights(
   if np.sum(raw_weights) <= 0:
     raise ValueError(f"weights must sum to a positive value, got {list(weights)}")
 
-  # Megatron normalizes twice: once in the builder (blended_megatron_dataset_builder.py)
-  # and again in BlendedDataset.__init__ before calling build_blending_indices.
-  # We must replicate this double-normalize so that the least-significant bits
-  # of float64 weights match Megatron exactly, preserving tie-breaking order.
+  # Filter out zero-weight datasets, then normalize once to match
+  # Megatron BlendedDataset.__init__ before build_blending_indices.
   keep = raw_weights > 0
   filtered_datasets = [dataset for dataset, keep_i in zip(datasets, keep) if keep_i]
   filtered_weights = raw_weights[keep]

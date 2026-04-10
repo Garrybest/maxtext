@@ -909,14 +909,15 @@ class GenerateDocSegmentIds(grain.MapTransform):
     reset_attention_mask: Controls how document boundaries affect attention.
 
       * ``True`` (default) -- attention resets at every document boundary.
-        Segment IDs increment per document and positions restart from 0
-        after each EOD token.
+        EOD belongs to the preceding document (same segment ID), and a new
+        segment starts after EOD.  Positions continue through EOD and reset
+        after EOD.
 
         ::
 
             tokens:        [tok tok tok EOD tok tok EOD tok tok tok tok tok]
-            segmentation:  [ 1   1   1   0   2   2   0   3   3   3   3   3]
-            positions:     [ 0   1   2   0   0   1   0   0   1   2   3   4]
+            segmentation:  [ 1   1   1   1   2   2   2   3   3   3   3   3]
+            positions:     [ 0   1   2   3   0   1   2   0   1   2   3   4]
 
       * ``False`` -- cross-document attention is allowed.  All non-EOD
         tokens share the same segment ID (``1``), and positions are a
@@ -946,16 +947,21 @@ class GenerateDocSegmentIds(grain.MapTransform):
       is_eod = tokens == self.eod_id
 
       if self.reset_attention_mask:
+        # EOD belongs to the preceding document: keep current seg_id and
+        # continue position counter.  New segment starts AFTER EOD.
         segmentation = np.zeros(seq_len, dtype=np.int32)
         position = np.zeros(seq_len, dtype=np.int32)
         seg_id = 1
         pos_in_doc = 0
         for i in range(seq_len):
           if is_eod[i]:
-            segmentation[i] = 0
-            position[i] = 0
-            pos_in_doc = 0
+            # EOD keeps the preceding document's seg_id and position
+            segmentation[i] = seg_id
+            position[i] = pos_in_doc
+            pos_in_doc += 1
+            # New segment starts after EOD
             seg_id += 1
+            pos_in_doc = 0
           else:
             segmentation[i] = seg_id
             position[i] = pos_in_doc
