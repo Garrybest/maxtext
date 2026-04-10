@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437 """
+"""JAX implementation of the Multi Token Prediction https://arxiv.org/pdf/2412.19437"""
 
 from typing import Optional, Type, Union
 
@@ -21,7 +21,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.common.common_types import Config, MODEL_MODE_TRAIN
+from maxtext.common.common_types import Config, DecoderBlockType, MODEL_MODE_TRAIN
 from maxtext.utils.globals import EPS
 from maxtext.layers.decoders import DecoderLayer
 from maxtext.layers.nnx_decoders import NNXDecoderLayer
@@ -171,6 +171,13 @@ class MultiTokenPredictionLayer(nnx.Module):
         rngs=rngs,
     )
     # Use MODEL_MODE_TRAIN for initialization; runtime model_mode is passed dynamically.
+    # Some decoder types (e.g., Ling2) require layer_idx to determine layer
+    # structure (MLA vs GLA). MTP layers get unique indices starting from
+    # num_decoder_layers so they don't collide with main model layers.
+    layer_idx_kwargs = {}
+    if cfg.decoder_block == DecoderBlockType.LING2:
+      layer_idx_kwargs["layer_idx"] = cfg.num_decoder_layers + k - 1
+
     is_nnx_layer = issubclass(transformer_layer_module, nnx.Module)
     if is_nnx_layer:
       # Native NNX layer: instantiate directly (original upstream behavior).
@@ -180,6 +187,7 @@ class MultiTokenPredictionLayer(nnx.Module):
           model_mode=MODEL_MODE_TRAIN,
           name=f"mtp_{k}_transformer_layer",
           rngs=rngs,
+          **layer_idx_kwargs,
       )
     else:
       # Linen layer: wrap with ToNNX and lazy_init for parameter setup.
@@ -189,6 +197,7 @@ class MultiTokenPredictionLayer(nnx.Module):
           model_mode=MODEL_MODE_TRAIN,
           name=f"mtp_{k}_transformer_layer",
           quant=quant,
+          **layer_idx_kwargs,
       )
       self.transformer_layer = nnx_wrappers.ToNNX(mtp_transformer_layer, rngs=rngs)
       batch_size, seq_len = max_utils.get_batch_seq_len_for_mode(cfg, MODEL_MODE_TRAIN)

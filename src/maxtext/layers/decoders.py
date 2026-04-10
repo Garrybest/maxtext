@@ -47,6 +47,7 @@ from maxtext.models import (
     gemma3,
     gpt3,
     gpt_oss,
+    ling2,
     llama2,
     llama4,
     mistral,
@@ -484,7 +485,12 @@ class Decoder(nn.Module):
         return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case DecoderBlockType.OLMO3:
         return [olmo3.Olmo3ScannableBlockToLinen] if self.config.scan_layers else [olmo3.Olmo3DecoderLayerToLinen]
-
+      case DecoderBlockType.LING2:
+        if self.config.scan_layers:
+          raise NotImplementedError(
+              "Ling2 decoder does not support scan_layers=True yet. " "Please set scan_layers=False."
+          )
+        return [ling2.Ling2DecoderLayerToLinen]
       case _:
         # Default case to handle any unknown decoder block types.
         raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
@@ -536,6 +542,7 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
+        DecoderBlockType.LING2,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -1053,8 +1060,10 @@ class Decoder(nn.Module):
                   "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
-            if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
+            if cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.LING2):
               layer_kwargs = {"layer_idx": lyr}
+            if cfg.decoder_block == DecoderBlockType.LING2:
+              layer_call_kwargs = {"global_layer_idx": lyr}
             kv_cache = None
             if kv_caches is not None and cfg.decoder_block != DecoderBlockType.QWEN3_NEXT:
               kv_cache = kv_caches[lyr]
