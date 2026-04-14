@@ -1149,41 +1149,6 @@ class GrainDataset(BaseModel):
       description="Max workers for ThreadPoolExecutor when mixing multiple Grain data sources.",
   )
   grain_shuffle_buffer_size: int = Field(100, description="Shuffle buffer size when using Parquet or TFRecord.")
-  blend_cache_dir: PathStr = Field(
-      "",
-      description=(
-          "Cache directory for auto-generated Megatron blend indices. "
-          "When non-empty, generated index files are cached here for reuse across runs."
-      ),
-  )
-  blend_index_dir: PathStr = Field(
-      "",
-      description=(
-          "Directory containing pre-generated Megatron dataset_index.npy files. "
-          "When set, skips index generation and loads from this directory directly."
-      ),
-  )
-  reset_attention_mask: bool = Field(
-      True,
-      description=(
-          "Controls segment ID generation when converting Megatron mmap packed data "
-          "to MaxText format. When True, different documents within a packed sample "
-          "receive separate segment IDs, preventing cross-document attention via "
-          "MaxText's existing segment ID mechanism. When False, all tokens in a packed "
-          "sample share the same segment ID, allowing cross-document attention."
-      ),
-  )
-  eod_mask_loss: bool = Field(
-      False,
-      description=(
-          "When True, end-of-document (EOD) tokens are excluded from loss calculation. "
-          "Matches Megatron-LM's default behavior for mmap datasets."
-      ),
-  )
-  mmap_split_sentences: bool = Field(
-      False,
-      description="Enable sentence-level splitting when loading mmap format data.",
-  )
 
 
 class MMapDataset(BaseModel):
