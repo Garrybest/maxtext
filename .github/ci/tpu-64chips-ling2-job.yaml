@@ -1,0 +1,145 @@
+# TPU 64chips 1K Steps - K8s Manifests
+# Global batch size = 5120
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER
+---
+# Headless Service for TPU pod DNS resolution (required for JAX coordinator)
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}-headless-svc
+  namespace: default
+  labels:
+    app: tpu-64chips-ling2-job
+    repo-branch: "${BRANCH_LABEL}"
+    owner: "${USER}"
+spec:
+  clusterIP: None
+  selector:
+    job-name: ${JOB_NAME}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  labels:
+    app: tpu-64chips-ling2-job
+    repo-branch: "${BRANCH_LABEL}"
+    owner: "${USER}"
+    job-name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 16
+  parallelism: 16
+  podReplacementPolicy: TerminatingOrFailed
+  activeDeadlineSeconds: 86400
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+      labels:
+        app: tpu-64chips-ling2-job
+        repo-branch: "${BRANCH_LABEL}"
+        owner: "${USER}"
+        job-name: ${JOB_NAME}
+    spec:
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # 1. Clone branch
+          git clone --depth=1 --branch="${BRANCH}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git" \
+            /root/maxtext
+          cd /root/maxtext
+
+          # 2. Setup Python environment
+          pip install uv
+          uv venv --python 3.12 --seed maxtext_venv
+          source maxtext_venv/bin/activate
+          uv pip install -e '.[tpu]' --resolution=lowest
+          install_maxtext_tpu_github_deps
+
+          # 3. Install optax from source
+          pip uninstall optax -y 2>/dev/null || true
+          pip install git+https://github.com/google-deepmind/optax
+
+          # 4. Run 1000-step training (STEPS/WARMUP_ITERS/EVAL_INTERVAL set via env)
+          bash scripts/pretrain_ling2.sh
+        env:
+        # --- CI overrides (picked up by pretrain_ling2.sh) ---
+        - name: STEPS
+          value: "1000"
+        - name: EVAL_INTERVAL
+          value: "2000"
+        - name: GRADIENT_ACCUMULATION_STEPS
+          value: "20"
+        - name: GCS_BUCKET
+          value: "gs://data_ant/pretrain/ling2"
+        - name: RUN_NAME
+          value: "${JOB_NAME}"
+        # --- Parallelism: EP=8, DP=16 for 128 devices (64 chips x 2) ---
+        - name: ICI_EXPERT_PARALLELISM
+          value: "8"
+        - name: ICI_DATA_PARALLELISM
+          value: "16"
+        # --- GitHub token for cloning private repo ---
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: perf-64chips-token
+              key: token
+        # --- Runtime env (matching job_single.yaml) ---
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        - name: PATH
+          value: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: TPU_PROCESS_ADDRESSES
+          value: ${JOB_NAME}-0.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-1.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-2.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-3.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-4.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-5.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-6.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-7.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-8.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-9.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-10.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-11.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-12.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-13.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-14.${JOB_NAME}-headless-svc:8476,${JOB_NAME}-15.${JOB_NAME}-headless-svc:8476
+        - name: TPU_PROCESS_PORT
+          value: "8476"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            ephemeral-storage: 20Gi
+            google.com/tpu: "4"
+        securityContext:
+          privileged: true  # Required for TPU device access on GKE (matches job_single.yaml)
+        volumeMounts:
+        - mountPath: /models
+          name: gcs-fuse-csi-ephemeral
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 4x4x4
+      restartPolicy: Never
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      subdomain: ${JOB_NAME}-headless-svc
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 200Gi
+        name: tmpfs
+      - emptyDir:
+          medium: Memory
+        name: gke-gcsfuse-cache
+      - name: gcs-fuse-csi-ephemeral
+        persistentVolumeClaim:
+          claimName: ant-data-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory

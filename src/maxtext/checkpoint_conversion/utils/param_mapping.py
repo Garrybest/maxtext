@@ -2432,17 +2432,20 @@ def LING2_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False)
       ]
 
   # Optional MTP (Multi-Token Prediction) layer — stored at model.layers.{num_layers} in HF.
+  # Note: MultiTokenPredictionLayer uses property setters that store attributes with
+  # "mtp_{k}_" prefixes (e.g., self.embedding_norm → self.mtp_1_embedding_norm), so the
+  # MaxText param tree keys include this prefix.
   if has_mtp and maxtext_config.mtp_num_layers > 0:
     mtp_hf = f"model.layers.{num_layers}"
     mtp_mt = "params-mtp_block-mtp_layer_1"
-    mtp_tf = f"{mtp_mt}-transformer_layer"
+    mtp_tf = f"{mtp_mt}-mtp_1_transformer_layer"
     mapping.update(
         {
             # MTP-specific norms and projection
-            f"{mtp_mt}-embedding_norm-scale": f"{mtp_hf}.enorm.weight",
-            f"{mtp_mt}-hidden_state_norm-scale": f"{mtp_hf}.hnorm.weight",
-            f"{mtp_mt}-final_layernorm-scale": f"{mtp_hf}.final_layernorm.weight",
-            f"{mtp_mt}-projection_layer-kernel": f"{mtp_hf}.eh_proj.weight",
+            f"{mtp_mt}-mtp_1_embedding_norm-scale": f"{mtp_hf}.enorm.weight",
+            f"{mtp_mt}-mtp_1_hidden_state_norm-scale": f"{mtp_hf}.hnorm.weight",
+            f"{mtp_mt}-mtp_1_final_layernorm-scale": f"{mtp_hf}.final_layernorm.weight",
+            f"{mtp_mt}-mtp_1_projection-kernel": f"{mtp_hf}.eh_proj.weight",
             # MTP embedded transformer — norms
             f"{mtp_tf}-input_layernorm-scale": f"{mtp_hf}.input_layernorm.weight",
             f"{mtp_tf}-post_attention_layernorm-scale": f"{mtp_hf}.post_attention_layernorm.weight",
@@ -2551,9 +2554,9 @@ def LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   # MTP kernel hooks
   if has_mtp and maxtext_config.mtp_num_layers > 0:
     mtp_mt = "params-mtp_block-mtp_layer_1"
-    mtp_tf = f"{mtp_mt}-transformer_layer"
+    mtp_tf = f"{mtp_mt}-mtp_1_transformer_layer"
     mtp_kernel_keys = [
-        f"{mtp_mt}-projection_layer-kernel",
+        f"{mtp_mt}-mtp_1_projection-kernel",
         f"{mtp_tf}-attention-wq_a-kernel",
         f"{mtp_tf}-attention-wq_b-kernel",
         f"{mtp_tf}-attention-wkv_a-kernel",

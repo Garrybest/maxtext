@@ -17,7 +17,7 @@
 Validates:
 - MLA/GLA dispatch logic based on layer_idx and inhomogeneous_layer_cycle_interval
 - Dense/MoE MLP selection based on layer_idx and first_num_dense_layers
-- Ling2DecoderLayer construction and forward pass
+- Ling2DenseDecoderLayer / Ling2MoEDecoderLayer construction and forward pass
 - scan_layers=True raises NotImplementedError
 - Linen Decoder integration for Ling2
 """
@@ -122,16 +122,26 @@ class TestLing2MlaDispatchLogic(unittest.TestCase):
 
 
 class TestLing2DecoderLayerConstruction(unittest.TestCase):
-  """Tests Ling2DecoderLayer construction with different layer indices."""
+  """Tests Ling2DenseDecoderLayer / Ling2MoEDecoderLayer construction with different layer indices."""
 
   @classmethod
   def setUpClass(cls):
     cls.cfg = _make_config()
     cls.mesh = _make_mesh(cls.cfg)
 
-  def _make_layer(self, layer_idx):
-    """Construct a Ling2DecoderLayer with the given layer_idx."""
-    return ling2.Ling2DecoderLayer(
+  def _make_dense_layer(self, layer_idx):
+    """Construct a Ling2DenseDecoderLayer with the given layer_idx."""
+    return ling2.Ling2DenseDecoderLayer(
+        config=self.cfg,
+        mesh=self.mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        layer_idx=layer_idx,
+        rngs=nnx.Rngs(params=0, dropout=1),
+    )
+
+  def _make_moe_layer(self, layer_idx):
+    """Construct a Ling2MoEDecoderLayer with the given layer_idx."""
+    return ling2.Ling2MoEDecoderLayer(
         config=self.cfg,
         mesh=self.mesh,
         model_mode=MODEL_MODE_TRAIN,
@@ -142,38 +152,38 @@ class TestLing2DecoderLayerConstruction(unittest.TestCase):
   def test_layer0_uses_dense_mlp(self):
     """layer_idx=0 (< first_num_dense_layers=1) should use Dense MLP."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=0)
+      layer = self._make_dense_layer(layer_idx=0)
     self.assertIsInstance(layer.mlp, linears.MlpBlock)
 
   def test_layer1_uses_moe_mlp(self):
     """layer_idx=1 (>= first_num_dense_layers=1) should use MoE MLP."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=1)
+      layer = self._make_moe_layer(layer_idx=1)
     self.assertIsInstance(layer.mlp, moe.RoutedAndSharedMoE)
 
   def test_layer4_uses_mla_attention(self):
     """layer_idx=4 ((4+1)%5==0) should use MLA attention."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=4)
+      layer = self._make_moe_layer(layer_idx=4)
     self.assertIsInstance(layer.attention, attention_mla.MLA)
 
   def test_layer1_uses_gla_attention(self):
     """layer_idx=1 ((1+1)%5!=0) should use GLA attention."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=1)
+      layer = self._make_moe_layer(layer_idx=1)
     self.assertIsInstance(layer.attention, attention_gla.BailingMoeV2LinearAttention)
 
   def test_layer0_gla_and_dense(self):
     """layer_idx=0: GLA attention + Dense MLP."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=0)
+      layer = self._make_dense_layer(layer_idx=0)
     self.assertIsInstance(layer.attention, attention_gla.BailingMoeV2LinearAttention)
     self.assertIsInstance(layer.mlp, linears.MlpBlock)
 
   def test_layer4_mla_and_moe(self):
     """layer_idx=4: MLA attention + MoE MLP."""
     with self.mesh:
-      layer = self._make_layer(layer_idx=4)
+      layer = self._make_moe_layer(layer_idx=4)
     self.assertIsInstance(layer.attention, attention_mla.MLA)
     self.assertIsInstance(layer.mlp, moe.RoutedAndSharedMoE)
 
@@ -182,7 +192,7 @@ class TestLing2DecoderLayerConstruction(unittest.TestCase):
     # num_decoder_layers=10, so MTP layers start at layer_idx=10.
     # (10+1)%5 = 1 != 0, but it should still be MLA as an MTP layer.
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -193,7 +203,7 @@ class TestLing2DecoderLayerConstruction(unittest.TestCase):
 
 
 class TestLing2DecoderLayerForward(unittest.TestCase):
-  """Tests Ling2DecoderLayer forward pass shape correctness."""
+  """Tests Ling2 decoder layer forward pass shape correctness."""
 
   @classmethod
   def setUpClass(cls):
@@ -201,9 +211,11 @@ class TestLing2DecoderLayerForward(unittest.TestCase):
     cls.mesh = _make_mesh(cls.cfg)
 
   def _forward_layer(self, layer_idx):
-    """Run a single forward pass through a Ling2DecoderLayer."""
+    """Run a single forward pass through a Ling2 decoder layer."""
+    is_dense = layer_idx < self.cfg.first_num_dense_layers
+    layer_cls = ling2.Ling2DenseDecoderLayer if is_dense else ling2.Ling2MoEDecoderLayer
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = layer_cls(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -274,15 +286,16 @@ class TestLing2DecoderIntegration(unittest.TestCase):
     cls.mesh = _make_mesh(cls.cfg)
 
   def test_get_decoder_layers_returns_ling2(self):
-    """get_decoder_layers should return [Ling2DecoderLayerToLinen]."""
+    """get_decoder_layers should return [Ling2DenseDecoderLayerToLinen, Ling2MoEDecoderLayerToLinen]."""
     decoder = Decoder(
         config=self.cfg,
         mesh=self.mesh,
         model_mode=MODEL_MODE_TRAIN,
     )
     layers = decoder.get_decoder_layers()
-    self.assertEqual(len(layers), 1)
-    self.assertIs(layers[0], ling2.Ling2DecoderLayerToLinen)
+    self.assertEqual(len(layers), 2)
+    self.assertIs(layers[0], ling2.Ling2DenseDecoderLayerToLinen)
+    self.assertIs(layers[1], ling2.Ling2MoEDecoderLayerToLinen)
 
   def test_get_norm_layer_returns_rms_norm(self):
     """Ling2 should use RMSNorm as its normalization layer."""

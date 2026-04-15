@@ -36,13 +36,13 @@ from maxtext.utils import max_utils
 from maxtext.utils.sharding import create_sharding, maybe_shard_with_logical
 
 
-class Ling2DecoderLayer(nnx.Module):
-  """Ling2 decoder layer with MLA/GLA attention and dense/MoE MLP.
+class Ling2GenericLayer(nnx.Module):
+  """Base Ling2 decoder layer with MLA/GLA attention. Subclasses provide MLP.
 
   Attributes:
     layer_idx: The layer index used at construction time to determine the layer's
-      structure (MLA vs GLA attention, dense vs MoE MLP). When used inside a
-      scannable block, this reflects only the first block's indices.
+      structure (MLA vs GLA attention). When used inside a scannable block, this
+      reflects only the first block's indices.
 
   Note on `global_layer_idx` in __call__:
     For computations that need the true global layer index (e.g., GLA slope
@@ -132,32 +132,6 @@ class Ling2DecoderLayer(nnx.Module):
           config=cfg,
           layer_idx=self.layer_idx,
           mesh=mesh,
-          rngs=rngs,
-      )
-
-    if self.layer_idx < cfg.first_num_dense_layers:
-      self.mlp = linears.MlpBlock(
-          config=cfg,
-          mesh=mesh,
-          in_features=cfg.emb_dim,
-          intermediate_dim=cfg.mlp_dim,
-          activations=cfg.mlp_activations,
-          intermediate_dropout_rate=cfg.dropout_rate,
-          dtype=cfg.dtype,
-          weight_dtype=cfg.weight_dtype,
-          quant=quant,
-          model_mode=model_mode,
-          rngs=rngs,
-      )
-    else:
-      self.mlp = moe.RoutedAndSharedMoE(
-          config=cfg,
-          mesh=mesh,
-          kernel_init=initializers.nd_dense_init(1.0, "fan_in", "truncated_normal"),
-          kernel_axes=("embed", None),
-          dtype=cfg.dtype,
-          weight_dtype=cfg.weight_dtype,
-          quant=quant,
           rngs=rngs,
       )
 
@@ -261,6 +235,7 @@ class Ling2DecoderLayer(nnx.Module):
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
       global_layer_idx: None | jnp.ndarray = None,
+      decoder_input_tokens=None,
   ) -> tuple[jnp.ndarray, Any]:
     if isinstance(inputs, tuple):
       inputs = inputs[0]
@@ -325,7 +300,70 @@ class Ling2DecoderLayer(nnx.Module):
     return self.post_process(layer_output, load_balance_loss, moe_z_loss, moe_expert_counts, router_stats, kv_cache)
 
 
-Ling2DecoderLayerToLinen = nnx_wrappers.to_linen_class(
-    Ling2DecoderLayer,
+class Ling2DenseDecoderLayer(Ling2GenericLayer):
+  """Ling2 decoder layer with dense MLP."""
+
+  def __init__(
+      self,
+      config: Config,
+      mesh: Mesh,
+      model_mode: str,
+      layer_idx: int,
+      quant: None | quantizations.AqtQuantization = None,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    super().__init__(config, mesh, model_mode, layer_idx, quant, rngs=rngs)
+    cfg = self.config
+    self.mlp = linears.MlpBlock(
+        config=cfg,
+        mesh=mesh,
+        in_features=cfg.emb_dim,
+        intermediate_dim=cfg.mlp_dim,
+        activations=cfg.mlp_activations,
+        intermediate_dropout_rate=cfg.dropout_rate,
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        quant=quant,
+        model_mode=model_mode,
+        rngs=rngs,
+    )
+
+
+class Ling2MoEDecoderLayer(Ling2GenericLayer):
+  """Ling2 decoder layer with MoE MLP."""
+
+  def __init__(
+      self,
+      config: Config,
+      mesh: Mesh,
+      model_mode: str,
+      layer_idx: int,
+      quant: None | quantizations.AqtQuantization = None,
+      *,
+      rngs: nnx.Rngs,
+  ):
+    super().__init__(config, mesh, model_mode, layer_idx, quant, rngs=rngs)
+    cfg = self.config
+    self.mlp = moe.RoutedAndSharedMoE(
+        config=cfg,
+        mesh=mesh,
+        kernel_init=initializers.nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", None),
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        quant=quant,
+        layer_idx=layer_idx,
+        rngs=rngs,
+    )
+
+
+Ling2DenseDecoderLayerToLinen = nnx_wrappers.to_linen_class(
+    Ling2DenseDecoderLayer,
+    base_metadata_fn=initializers.variable_to_logically_partitioned,
+)
+
+Ling2MoEDecoderLayerToLinen = nnx_wrappers.to_linen_class(
+    Ling2MoEDecoderLayer,
     base_metadata_fn=initializers.variable_to_logically_partitioned,
 )

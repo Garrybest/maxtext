@@ -16,7 +16,7 @@ python src/MaxText/checkpoint_conversion/to_maxtext.py \
 For models with custom HF code (e.g. Ling2), add `--trust_remote_code=True`.
 For large models, add `--lazy_load_tensors=True` to reduce RAM usage.
 
-Output: Orbax checkpoint at `{base_output_directory}/{model_name}/hf-to-maxtext/0/items/`.
+Output: Orbax checkpoint at `{base_output_directory}/0/items/`.
 
 ### Ling2 Example
 
@@ -25,12 +25,17 @@ python src/MaxText/checkpoint_conversion/to_maxtext.py \
     src/maxtext/configs/base.yml \
     model_name=ling2 \
     base_output_directory=/path/to/output/ \
+    attention=dot_product \
     --hf_model_path /path/to/ling2-hf/ \
     --trust_remote_code=True \
+    --lazy_load_tensors=True \
     hardware=cpu \
     skip_jax_distributed_system=True \
     scan_layers=False
 ```
+
+Note: `attention=dot_product` is required because MLA has different Q/K vs V head
+dimensions, which the autoselected kernel does not support during abstract model init.
 
 ## 2. Structure Validation (keys + shapes)
 

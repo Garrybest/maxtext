@@ -490,7 +490,7 @@ class Decoder(nn.Module):
           raise NotImplementedError(
               "Ling2 decoder does not support scan_layers=True yet. " "Please set scan_layers=False."
           )
-        return [ling2.Ling2DecoderLayerToLinen]
+        return [ling2.Ling2DenseDecoderLayerToLinen, ling2.Ling2MoEDecoderLayerToLinen]
       case _:
         # Default case to handle any unknown decoder block types.
         raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
@@ -1007,8 +1007,8 @@ class Decoder(nn.Module):
               **layer_kwargs,
           )(y, *broadcast_args)
       else:
-        if cfg.decoder_block == DecoderBlockType.DEEPSEEK:
-          assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek."
+        if cfg.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
+          assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek/ling2."
           dense_layer = RemattedBlockLayers[0]
           moe_layer = RemattedBlockLayers[1]
 
@@ -1023,6 +1023,9 @@ class Decoder(nn.Module):
               global_layer_idx = global_layer_idx_offset + index
               kv_cache = kv_caches[index] if kv_caches is not None else None
               input_tokens = decoder_input_tokens if cfg.engram_layers else None
+              layer_call_kwargs = {}
+              if cfg.decoder_block == DecoderBlockType.LING2:
+                layer_call_kwargs["global_layer_idx"] = global_layer_idx
               y, kv_cache = layer(
                   config=cfg,
                   mesh=mesh,
@@ -1042,6 +1045,7 @@ class Decoder(nn.Module):
                   kv_cache=kv_cache,
                   attention_metadata=attention_metadata,
                   decoder_input_tokens=input_tokens,
+                  **layer_call_kwargs,
               )
               if kv_caches is not None and kv_cache is not None:
                 kv_caches[index] = kv_cache
@@ -1060,10 +1064,8 @@ class Decoder(nn.Module):
                   "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
-            if cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.LING2):
+            if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
               layer_kwargs = {"layer_idx": lyr}
-            if cfg.decoder_block == DecoderBlockType.LING2:
-              layer_call_kwargs = {"global_layer_idx": lyr}
             kv_cache = None
             if kv_caches is not None and cfg.decoder_block != DecoderBlockType.QWEN3_NEXT:
               kv_cache = kv_caches[lyr]

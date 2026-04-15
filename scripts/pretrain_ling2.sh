@@ -9,10 +9,7 @@ set -e
 # 1. Tokenizer Config
 # ============================================================================
 # Vocabulary size must match the tokenizer used to create the mmap data
-VOCAB_SIZE=157184
-# Token IDs matching the tokenizer (used directly, no tokenizer loading needed for mmap)
-PAD_ID=156892   # <|endoftext|>
-BOS_ID=156891   # <|startoftext|>
+# (vocab_size, mmap_eod_id, bos_id are set in configs/models/ling2.yml)
 
 # ============================================================================
 # 2. Basic Environment Config (GCS Bucket & Run Name)
@@ -51,8 +48,8 @@ NEMO_MHQ_T2E_WEIGHT="0.402800"
 NEMO_HQ_T2E_BIN_PREFIX="/models/datasets/nemotron-cc-v2.1_megatron_indexed/High-Quality-Translated-To-English_text_document"
 NEMO_MHQ_T2E_BIN_PREFIX="/models/datasets/nemotron-cc-v2.1_megatron_indexed/Medium-High-Quality-Translated-To-English_text_document"
 # Replace these with the actual per-component npy index directories.
-NEMO_HQ_T2E_NPY_DIR="/models/datasets/hqt-npy"
-NEMO_MHQ_T2E_NPY_DIR="/models/datasets/mqt-npy"
+NEMO_HQ_T2E_NPY_DIR="/models/datasets/hqt-npy-next-ci"
+NEMO_MHQ_T2E_NPY_DIR="/models/datasets/mqt-npy-next-ci"
 
 GRAIN_TRAIN_FILES="${NEMO_HQ_T2E_NPY_DIR}|${NEMO_HQ_T2E_BIN_PREFIX}"
 GRAIN_EVAL_FILES=${GRAIN_EVAL_FILES:-$GRAIN_TRAIN_FILES}
@@ -67,6 +64,7 @@ GRAIN_PER_WORKER_BUFFER_SIZE=${GRAIN_PER_WORKER_BUFFER_SIZE:-32}
 GRAIN_NUM_THREADS=${GRAIN_NUM_THREADS:-16}
 GRAIN_PREFETCH_BUFFER_SIZE=${GRAIN_PREFETCH_BUFFER_SIZE:-500}
 MMAP_SPLIT_SENTENCES="true"  # Data was generated with --split-sentences
+MMAP_NPY_SPLIT=${MMAP_NPY_SPLIT:-"999,1,0"}  # Megatron-style split: 99.9% train, 0.1% eval, 0% test
 # MTP Plan C: Allow cross-document attention with packing for efficiency
 PACKING="true"  # Enable sequence packing for better GPU/TPU utilization
 RESET_ATTENTION_MASK="false"  # Allow cross-document attention (Megatron default mode)
@@ -102,7 +100,7 @@ MIN_LEARNING_RATE=0.000336  # Constant LR: min_lr = lr
 WARMUP_ITERS=${WARMUP_ITERS:-250}
 WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${STEPS})")
 # Constant learning rate schedule (matching Megatron --lr-decay-style constant)
-COSINE_LEARNING_RATE_FINAL_FRACTION=1.0  # Keep at 1.0 for constant LR
+LEARNING_RATE_FINAL_FRACTION=1.0  # Keep at 1.0 for constant LR
 LEARNING_RATE_SCHEDULE_STEPS=$STEPS
 DATA_SHUFFLE_SEED=42
 INIT_WEIGHTS_SEED=42
@@ -163,15 +161,11 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     grain_num_threads_eval=$GRAIN_NUM_THREADS \
     grain_prefetch_buffer_size_eval=$GRAIN_PREFETCH_BUFFER_SIZE \
     mmap_split_sentences=$MMAP_SPLIT_SENTENCES \
+    mmap_npy_split=$MMAP_NPY_SPLIT \
     blend_index_dir=$BLEND_INDEX_DIR \
     packing=$PACKING \
     reset_attention_mask=$RESET_ATTENTION_MASK \
     eod_mask_loss=$EOD_MASK_LOSS \
-    \
-    `# --- Tokenizer IDs (no tokenizer loading needed for mmap) ---` \
-    vocab_size=$VOCAB_SIZE \
-    pad_id=$PAD_ID \
-    bos_id=$BOS_ID \
     \
     `# --- Training Parameters ---` \
     steps=$STEPS \
@@ -193,7 +187,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     gradient_clipping_threshold=$GRADIENT_CLIPPING_THRESHOLD \
     learning_rate=$LEARNING_RATE \
     warmup_steps_fraction=$WARMUP_STEPS_FRACTION \
-    cosine_learning_rate_final_fraction=$COSINE_LEARNING_RATE_FINAL_FRACTION \
+    learning_rate_final_fraction=$LEARNING_RATE_FINAL_FRACTION \
     learning_rate_schedule_steps=$LEARNING_RATE_SCHEDULE_STEPS \
     \
     `# --- Parallelism Strategy (configurable via ENV) ---` \
@@ -215,7 +209,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     async_checkpointing=false \
     gcs_metrics=false \
     save_config_to_gcs=false \
-    load_parameters_path=/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/ \
+    load_parameters_path=/models/gpu-ckpt-ling2.5/ling2.5-maxtext/0/items/ \
     log_period=10 \
     \
     `# --- Profiler (optional, controlled by ENV) ---` \

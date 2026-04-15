@@ -13,6 +13,11 @@ base_num_decoder_layers: 20
 mtp_num_layers: 1
 vocab_size: 157184
 first_num_dense_layers: 1
+
+# Tokenizer IDs (tied to vocab, used by mmap data pipeline)
+mmap_eod_id: 156892                    # <|endoftext|>
+bos_id: 156891                        # <|startoftext|>
+
 mlp_activations: ["silu", "linear"]
 normalization_layer_epsilon: 1.0e-6
 
@@ -50,6 +55,7 @@ shared_experts: 1
 routed_scaling_factor: 2.5
 n_routing_groups: 8
 topk_routing_group: 4
+moe_z_loss_weight: 3.5e-06            # matching Megatron --moe-router-z-loss-coeff
 
 # Routing
 routed_score_func: "sigmoid"
@@ -84,3 +90,4 @@ calculate_per_token_loss: false        # [NEW] micro-batch independent averaging
 # MTP (Multi-Token Prediction)
 mtp_final_layernorm: true
 mtp_per_layer_loss_norm: true
+mtp_loss_scaling_factor: 0.1

@@ -1,7 +1,7 @@
 """End-to-end verification for Ling2 decoder.
 
 Runs on TPU with random weights to verify:
-1. Ling2DecoderLayer construction for all layer types (GLA/MLA, Dense/MoE)
+1. Ling2DenseDecoderLayer / Ling2MoEDecoderLayer construction for all layer types (GLA/MLA, Dense/MoE)
 2. Single-layer forward pass for both GLA and MLA layers
 3. Full Decoder init + forward pass with ling2 config
 4. scan_layers=True raises NotImplementedError
@@ -114,7 +114,7 @@ class TestLing2E2E(unittest.TestCase):
   def test_layer_construction_gla_dense(self):
     """layer_idx=0: GLA attention + Dense MLP."""
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2DenseDecoderLayer(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -127,7 +127,7 @@ class TestLing2E2E(unittest.TestCase):
   def test_layer_construction_gla_moe(self):
     """layer_idx=1: GLA attention + MoE MLP."""
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -140,7 +140,7 @@ class TestLing2E2E(unittest.TestCase):
   def test_layer_construction_mla_moe(self):
     """layer_idx=4: MLA attention + MoE MLP ((4+1)%5==0)."""
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -153,7 +153,7 @@ class TestLing2E2E(unittest.TestCase):
   def test_layer_construction_mla_layer9(self):
     """layer_idx=9: MLA attention + MoE MLP ((9+1)%5==0)."""
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=self.cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -174,7 +174,7 @@ class TestLing2E2E(unittest.TestCase):
     positions = jnp.broadcast_to(jnp.arange(seq_len), (batch, seq_len))
 
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -205,7 +205,7 @@ class TestLing2E2E(unittest.TestCase):
     segment_ids = jnp.ones((batch, seq_len), dtype=jnp.int32)
 
     with self.mesh:
-      layer = ling2.Ling2DecoderLayer(
+      layer = ling2.Ling2MoEDecoderLayer(
           config=cfg,
           mesh=self.mesh,
           model_mode=MODEL_MODE_TRAIN,
@@ -234,11 +234,12 @@ class TestLing2E2E(unittest.TestCase):
     self.assertIn("scan_layers", str(ctx.exception))
 
   def test_decoder_get_layers(self):
-    """Decoder.get_decoder_layers returns Ling2DecoderLayerToLinen."""
+    """Decoder.get_decoder_layers returns two Ling2 layer classes."""
     decoder = Decoder(config=self.cfg, mesh=self.mesh, model_mode=MODEL_MODE_TRAIN)
     layers = decoder.get_decoder_layers()
-    self.assertEqual(len(layers), 1)
-    self.assertIs(layers[0], ling2.Ling2DecoderLayerToLinen)
+    self.assertEqual(len(layers), 2)
+    self.assertIs(layers[0], ling2.Ling2DenseDecoderLayerToLinen)
+    self.assertIs(layers[1], ling2.Ling2MoEDecoderLayerToLinen)
 
   def test_full_decoder_forward(self):
     """Full Decoder init + forward pass with correct output shapes."""
@@ -268,10 +269,14 @@ class TestLing2E2E(unittest.TestCase):
           model_mode=MODEL_MODE_TRAIN,
       )
 
-    # Verify all layer params exist
+    # Verify all layer params exist (dense_layers_ / moe_layers_ naming)
+    # Note: each group uses local indexing (dense_layers_0, moe_layers_0..N-1)
     params = variables.get("params", {})
-    for lyr in range(cfg.num_decoder_layers):
-      self.assertIn(f"layers_{lyr}", params)
+    for lyr in range(cfg.first_num_dense_layers):
+      self.assertIn(f"dense_layers_{lyr}", params)
+    num_moe_layers = cfg.num_decoder_layers - cfg.first_num_dense_layers
+    for lyr in range(num_moe_layers):
+      self.assertIn(f"moe_layers_{lyr}", params)
 
     # Forward pass
     with self.mesh:

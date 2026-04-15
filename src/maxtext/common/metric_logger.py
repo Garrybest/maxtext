@@ -171,13 +171,13 @@ class MetricLogger:
     log_parts.extend(
         [
             f"total_weights: {scalars['learning/total_weights']}",
-            f"loss: {loss:.3f}",
+            f"loss: {loss:.6f}",
         ]
     )
 
     # LM loss (cross-entropy before MoE/MTP additions)
     lm_loss = scalars.get("learning/lm_loss", 0.0)
-    log_parts.append(f"lm_loss: {float(lm_loss):.3f}")
+    log_parts.append(f"lm_loss: {float(lm_loss):.6f}")
 
     # Learning rate and global batch size (always printed)
     lr = scalars.get("learning/current_learning_rate", 0.0)
@@ -188,8 +188,8 @@ class MetricLogger:
     if self.config.mtp_num_layers > 0:
       mtp_loss = scalars.get("learning/mtp_loss", 0.0)
       raw_mtp_loss = scalars.get("learning/raw_mtp_loss", 0.0)
-      log_parts.append(f"mtp_loss: {mtp_loss:.3f}")
-      log_parts.append(f"raw_mtp_loss: {raw_mtp_loss:.3f}")
+      log_parts.append(f"mtp_loss: {mtp_loss:.6f}")
+      log_parts.append(f"raw_mtp_loss: {raw_mtp_loss:.6f}")
 
     if self.config.num_experts > 1:
       moe_lb_loss = float(scalars.get("learning/moe_lb_loss", 0.0))
@@ -225,14 +225,14 @@ class MetricLogger:
     scalars = metrics["scalar"]
     log_parts = [
         f"eval metrics after step: {step}",
-        f"loss={scalars['eval/avg_loss']:.3f}",
+        f"loss={scalars['eval/avg_loss']:.6f}",
         f"total_weights={scalars['eval/total_weights']}",
     ]
 
     if self.config.mtp_num_layers > 0:
       log_parts.extend(
           [
-              f"avg_mtp_loss={scalars['eval/avg_mtp_loss']:.3f}",
+              f"avg_mtp_loss={scalars['eval/avg_mtp_loss']:.6f}",
               f"avg_mtp_acceptance_rate={scalars['eval/avg_mtp_acceptance_rate_percent']:.2f}%",
           ]
       )
