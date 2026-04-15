@@ -86,6 +86,13 @@ spec:
           value: "gs://data_ant/pretrain/ling2"
         - name: RUN_NAME
           value: "${JOB_NAME}"
+        # --- Vertex AI TensorBoard ---
+        - name: USE_VERTEX_TENSORBOARD
+          value: "true"
+        - name: VERTEX_TB_PROJECT
+          value: "tpu-for-training"
+        - name: VERTEX_TB_REGION
+          value: "us-central1"
         # --- Parallelism: EP=8, DP=16 for 128 devices (64 chips x 2) ---
         - name: ICI_EXPERT_PARALLELISM
           value: "8"

@@ -84,6 +84,13 @@ spec:
           value: "gs://data_ant/pretrain/ling2"
         - name: RUN_NAME
           value: "${JOB_NAME}"
+        # --- Vertex AI TensorBoard ---
+        - name: USE_VERTEX_TENSORBOARD
+          value: "true"
+        - name: VERTEX_TB_PROJECT
+          value: "tpu-for-training"
+        - name: VERTEX_TB_REGION
+          value: "us-central1"
         # --- GitHub token for cloning private repo ---
         - name: GITHUB_TOKEN
           valueFrom:

@@ -15,7 +15,7 @@ set -e
 # 2. Basic Environment Config (GCS Bucket & Run Name)
 # ============================================================================
 BASE_OUTPUT_DIR=${GCS_BUCKET:-"gs://ant-pretrain/pretrain/dev"}
-RUN_NAME=${RUN_NAME:-"ling2-pretrain-$(date +%Y%m%d_%H%M)"}
+RUN_NAME=${RUN_NAME:-"ling2-pretrain-$(date +%Y%m%d-%H%M)"}
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${RUN_NAME}"
 
 # ============================================================================
@@ -107,6 +107,15 @@ INIT_WEIGHTS_SEED=42
 REMAT_POLICY=${REMAT_POLICY:-"save_out_proj"}
 
 CHECKPOINT_PERIOD=${CHECKPOINT_PERIOD:-100}
+
+# ============================================================================
+# 5b. Vertex AI TensorBoard (optional, off by default)
+# ============================================================================
+# Set USE_VERTEX_TENSORBOARD=true to enable uploading metrics to Vertex AI TensorBoard.
+# Requires: VERTEX_TB_PROJECT and VERTEX_TB_REGION.
+USE_VERTEX_TENSORBOARD=${USE_VERTEX_TENSORBOARD:-false}
+VERTEX_TB_PROJECT=${VERTEX_TB_PROJECT:-""}
+VERTEX_TB_REGION=${VERTEX_TB_REGION:-""}
 
 # ============================================================================
 # 6. Start Training Command
@@ -211,6 +220,11 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     save_config_to_gcs=false \
     load_parameters_path=/models/gpu-ckpt-ling2.5/ling2.5-maxtext/0/items/ \
     log_period=10 \
+    \
+    `# --- Vertex AI TensorBoard (optional, controlled by ENV) ---` \
+    use_vertex_tensorboard=$USE_VERTEX_TENSORBOARD \
+    ${VERTEX_TB_PROJECT:+vertex_tensorboard_project=$VERTEX_TB_PROJECT} \
+    ${VERTEX_TB_REGION:+vertex_tensorboard_region=$VERTEX_TB_REGION} \
     \
     `# --- Profiler (optional, controlled by ENV) ---` \
     ${PROFILER:+profiler=$PROFILER} \

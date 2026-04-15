@@ -74,6 +74,7 @@ from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss
 _diag_modules = _cloud_diag()
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _diag_modules
 VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
+vertex_tensorboard_manager = None
 
 
 def get_first_step(state):
@@ -930,6 +931,7 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   if config.shard_mode == ShardMode.EXPLICIT:
     jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path or ""
+  global vertex_tensorboard_manager  # pylint: disable=global-statement
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
     vertex_tensorboard_manager.configure_vertex_tensorboard(config)
