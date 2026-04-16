@@ -20,10 +20,9 @@ import os
 import tempfile
 import time
 import json
+import resource
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from tqdm import tqdm
-import resource
 
 import jax
 from jax.experimental import multihost_utils
@@ -32,22 +31,61 @@ from jaxtyping import Array
 
 import numpy as np
 
-from google.cloud.storage import Client, transfer_manager
-
-from safetensors.numpy import save_file as numpy_save_file
-from safetensors.numpy import save as numpy_save
-from safetensors.flax import save as save_flax_to_bytes
-
-from huggingface_hub import HfApi, repo_exists
-
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-from transformers import AutoModelForCausalLM
-
 from maxtext.utils import max_logging
-import psutil
 
-from etils import epath
-import orbax.checkpoint as ocp
+
+# Heavy dependencies used only by file-I/O and cloud-storage functions.
+# Imported lazily inside the functions that need them so that lightweight
+# callers (e.g., process_maxtext_param) do not pay the import cost.
+def _import_tqdm():
+  from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+  return tqdm
+
+
+def _import_gcs():
+  from google.cloud.storage import Client, transfer_manager  # pylint: disable=import-outside-toplevel
+
+  return Client, transfer_manager
+
+
+def _import_safetensors():
+  from safetensors.numpy import save_file as numpy_save_file  # pylint: disable=import-outside-toplevel
+  from safetensors.numpy import save as numpy_save  # pylint: disable=import-outside-toplevel
+  from safetensors.flax import save as save_flax_to_bytes  # pylint: disable=import-outside-toplevel
+
+  return numpy_save_file, numpy_save, save_flax_to_bytes
+
+
+def _import_huggingface():
+  from huggingface_hub import HfApi, repo_exists  # pylint: disable=import-outside-toplevel
+
+  return HfApi, repo_exists
+
+
+def _import_transformers():
+  from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES  # pylint: disable=import-outside-toplevel
+  from transformers import AutoModelForCausalLM  # pylint: disable=import-outside-toplevel
+
+  return MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, AutoModelForCausalLM
+
+
+def _import_psutil():
+  import psutil  # pylint: disable=import-outside-toplevel
+
+  return psutil
+
+
+def _import_orbax():
+  import orbax.checkpoint as ocp  # pylint: disable=import-outside-toplevel
+
+  return ocp
+
+
+def _import_epath():
+  from etils import epath  # pylint: disable=import-outside-toplevel
+
+  return epath
 
 
 SAFE_TENSORS_CONFIG_FILE = "config.json"
@@ -298,6 +336,8 @@ def process_maxtext_param(
 
 
 def create_huggingface_hub_repo_if_not_exist(repo_id, repo_type):
+  """Create a HuggingFace Hub repo if it doesn't exist yet."""
+  HfApi, repo_exists = _import_huggingface()
   if not repo_exists(repo_id, repo_type=repo_type):
     api = HfApi()
     api.create_repo(
@@ -318,7 +358,14 @@ def save_config_file(
 ):
   """Saves the model configuration file(config.json)."""
   if jax.process_index() == 0:
-    config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
+    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, _ = _import_transformers()
+    HfApi, _ = _import_huggingface()
+    # For built-in HF architectures, derive the architectures field from the
+    # transformers AutoModel mapping. For custom architectures (trust_remote_code),
+    # the loaded config already has `architectures` set from the source repo;
+    # preserve it.
+    if config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+      config.architectures = [MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]]
     if output_dir_final.startswith("hf://"):
       max_logging.log(f"  Serializing {file_name} to memory for Hugging Face Hub upload...")
       json_string = config.to_json_string()
@@ -414,6 +461,8 @@ def save_safetensor_file(
 ):
   """Saves a single safetensor file, from memory to remote when uploading"""
   if jax.process_index() == 0:
+    numpy_save_file, _, save_flax_to_bytes = _import_safetensors()
+    HfApi, _ = _import_huggingface()
     state_dict = {k: v for k, v in state_dict.items() if v is not None}
     if "model.safetensors" in state_dict and isinstance(state_dict["model.safetensors"], dict):
       state_dict = state_dict["model.safetensors"]
@@ -451,6 +500,7 @@ def save_index_file(
 ):
   """Saves the model index json file (model.safetensors.index.json)."""
   if jax.process_index() == 0:
+    HfApi, _ = _import_huggingface()
     local_path = os.path.join(local_dir_to_save_to, file_name)
 
     if output_dir_final.startswith("hf://"):
@@ -586,6 +636,7 @@ def save_model_files(
               remove_local_file_after_upload=remove_local_copy,
           )
       elif output_dir.startswith("hf://") and repo_id:
+        HfApi, _ = _import_huggingface()
         api = HfApi()
         for local_file_path in files_to_upload:
           if not os.path.exists(local_file_path):
@@ -629,6 +680,8 @@ def upload_state_dict_to_gcs(state_dict: dict, gs_bucket_path: str):
   blob_name = "/".join(blob_path_parts)
 
   # 1. Serialize the state_dict to an in-memory byte buffer
+  _, numpy_save, _ = _import_safetensors()
+  Client, _ = _import_gcs()
   data = numpy_save(state_dict, metadata={"format": "pt"})
   buffer = io.BytesIO(data)
   buffer.seek(0)  # Rewind the buffer to the beginning
@@ -657,6 +710,7 @@ def upload_file_to_gcs(local_file: str, gs_bucket_path: str, remove_local_file_a
 
   max_logging.log(f"-> Uploading {local_file} to {gs_bucket_path}...")
   # Upload file
+  Client, _ = _import_gcs()
   storage_client = Client()
   bucket = storage_client.bucket(bucket_name)
   blob = bucket.blob(blob_name)
@@ -693,6 +747,7 @@ def upload_folder_to_gcs(local_folder: str, gs_bucket_path: str, num_workers: in
   # Get files to upload
   files_in_local_folder = os.listdir(local_folder)
   # Set up GCS client
+  Client, transfer_manager = _import_gcs()
   storage_client = Client()
   bucket = storage_client.bucket(bucket_name)
 
@@ -718,6 +773,7 @@ def upload_folder_to_gcs(local_folder: str, gs_bucket_path: str, num_workers: in
 
 
 def print_ram_usage(stage=""):
+  psutil = _import_psutil()
   memory = psutil.virtual_memory()
   max_logging.log(
       f"[{stage}] RAM Usage: {memory.used / (1024**3):.2f}/{memory.total / (1024**3):.2f} GB ({memory.percent:.1f}%)"
@@ -730,37 +786,63 @@ def print_peak_memory():
   max_logging.log(f"Peak Memory: {peak_memory_kb / 1024**2:.2f} GB")
 
 
-class MemoryMonitorTqdm(tqdm):
-  """Custom tqdm class that displays memory usage in the progress bar."""
+def _make_memory_monitor_tqdm():
+  """Factory that builds MemoryMonitorTqdm on first call (defers tqdm/psutil import)."""
+  tqdm = _import_tqdm()
+  psutil = _import_psutil()
 
-  def format_meter(
-      self,
-      n,
-      total,
-      elapsed,
-      postfix=None,
-      **extra_kwargs,
-  ):
-    """Override to add memory usage info to the postfix."""
-    # Get memory info
-    memory = psutil.virtual_memory()
-    used_gb = memory.used / (1024**3)
-    total_gb = memory.total / (1024**3)
-    memory_percent = memory.percent
+  class _MemoryMonitorTqdm(tqdm):
+    """Custom tqdm class that displays memory usage in the progress bar."""
 
-    # Create memory postfix
-    memory_info = f"RAM: {used_gb:.1f}/{total_gb:.1f}GB ({memory_percent:.1f}%)"
+    def format_meter(
+        self,
+        n,
+        total,
+        elapsed,
+        postfix=None,
+        **extra_kwargs,
+    ):
+      """Override to add memory usage info to the postfix."""
+      # Get memory info
+      memory = psutil.virtual_memory()
+      used_gb = memory.used / (1024**3)
+      total_gb = memory.total / (1024**3)
+      memory_percent = memory.percent
 
-    # Add memory info to postfix
-    if postfix:
-      if isinstance(postfix, dict):
-        postfix["memory"] = memory_info
+      # Create memory postfix
+      memory_info = f"RAM: {used_gb:.1f}/{total_gb:.1f}GB ({memory_percent:.1f}%)"
+
+      # Add memory info to postfix
+      if postfix:
+        if isinstance(postfix, dict):
+          postfix["memory"] = memory_info
+        else:
+          postfix = f"{postfix}, {memory_info}"
       else:
-        postfix = f"{postfix}, {memory_info}"
-    else:
-      postfix = memory_info
+        postfix = memory_info
 
-    return super().format_meter(n=n, total=total, elapsed=elapsed, postfix=postfix, **extra_kwargs)
+      return super().format_meter(n=n, total=total, elapsed=elapsed, postfix=postfix, **extra_kwargs)
+
+  return _MemoryMonitorTqdm
+
+
+class _LazyMemoryMonitorTqdm:
+  """Proxy that creates the real MemoryMonitorTqdm (a tqdm subclass) on first
+  instantiation. __new__ returns a real tqdm instance, so calling code that
+  iterates over `MemoryMonitorTqdm(seq, ...)` gets a true tqdm iterator; the
+  __iter__ stub below is only here to satisfy static-analysis tools that can't
+  see through __new__'s type substitution.
+  """
+
+  def __new__(cls, *args, **kwargs):
+    real_cls = _make_memory_monitor_tqdm()
+    return real_cls(*args, **kwargs)
+
+  def __iter__(self):  # pragma: no cover — see class docstring
+    raise NotImplementedError("unreachable: __new__ returns a real tqdm instance")
+
+
+MemoryMonitorTqdm = _LazyMemoryMonitorTqdm
 
 
 def load_orbax_checkpoint(config) -> dict:
@@ -773,6 +855,8 @@ def load_orbax_checkpoint(config) -> dict:
     Dictionary containing the full checkpoint structure
   """
   # Create Orbax checkpointer
+  ocp = _import_orbax()
+  epath = _import_epath()
   ckptr = ocp.Checkpointer(
       ocp.PyTreeCheckpointHandler(
           restore_concurrent_gb=config.checkpoint_storage_concurrent_gb,
@@ -910,6 +994,7 @@ def get_hf_model(model_id: str, token: str, revision: str = None, trust_remote_c
 
     model_class = Qwen3OmniMoeForConditionalGeneration
   else:
+    _, AutoModelForCausalLM = _import_transformers()
     model_class = AutoModelForCausalLM
 
   hf_model = model_class.from_pretrained(model_id, token=token, revision=revision, trust_remote_code=trust_remote_code)

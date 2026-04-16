@@ -758,6 +758,127 @@ def MIXTRAL_HF_WEIGHTS_TO_SHAPE(config):
   return shapes
 
 
+def LING2_HF_WEIGHTS_TO_SHAPE(config):
+  """Returns mapping between HuggingFace Ling2 weights path and their shape.
+
+  Ling2 is a custom HF architecture (BailingMoeV2) with:
+  - Heterogeneous MLP: first `first_k_dense_replace` layers use dense MLP, rest MoE
+  - Mixed attention: last layer of each `layer_group_size`-sized group uses MLA,
+    others use GLA (Gated Linear Attention)
+  - Optional MTP layer at model.layers.{num_hidden_layers}
+  """
+  hidden_size = config["hidden_size"]
+  num_hidden_layers = config["num_hidden_layers"]
+  vocab_size = config["vocab_size"]
+  first_k_dense = int(config.get("first_k_dense_replace", 0))
+  layer_group_size = int(config["layer_group_size"])
+  q_lora_rank = int(config.get("q_lora_rank", 0) or 0)
+  kv_lora_rank = int(config["kv_lora_rank"])
+  qk_nope_head_dim = int(config["qk_nope_head_dim"])
+  qk_rope_head_dim = int(config["qk_rope_head_dim"])
+  v_head_dim = int(config["v_head_dim"])
+  num_attention_heads = int(config["num_attention_heads"])
+  head_dim = int(config.get("head_dim", qk_nope_head_dim))
+  moe_intermediate_size = int(config["moe_intermediate_size"])
+  intermediate_size = int(config.get("intermediate_size", moe_intermediate_size))
+  num_experts = int(config.get("num_experts", config.get("n_routed_experts")))
+  n_shared_experts = int(config.get("num_shared_experts", config.get("n_shared_experts", 1)) or 1)
+  # Ling2's HF config exposes the shared expert FFN width as an explicit field,
+  # which need not equal n_shared_experts * moe_intermediate_size.
+  shared_intermediate = int(
+      config.get(
+          "moe_shared_expert_intermediate_size",
+          n_shared_experts * moe_intermediate_size,
+      )
+  )
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+
+  # MLA derived
+  q_dim = num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)
+  kv_b_dim = num_attention_heads * (qk_nope_head_dim + v_head_dim)
+  o_proj_in_dim = num_attention_heads * v_head_dim
+  kv_a_proj_out_dim = kv_lora_rank + qk_rope_head_dim
+
+  # GLA derived (fused QKV: [Q, K, V] each num_heads * head_dim)
+  gla_qkv_out = 3 * num_attention_heads * head_dim
+  gla_gate_out = num_attention_heads * head_dim
+
+  def _is_mla(i):
+    return (i + 1) % layer_group_size == 0 or i == num_hidden_layers - 1
+
+  mapping = {
+      "model.word_embeddings.weight": [vocab_size, hidden_size],
+      "model.norm.weight": [hidden_size],
+      "lm_head.weight": [vocab_size, hidden_size],
+  }
+
+  def _add_mla(prefix):
+    if q_lora_rank > 0:
+      mapping[f"{prefix}.q_a_proj.weight"] = [q_lora_rank, hidden_size]
+      mapping[f"{prefix}.q_a_layernorm.weight"] = [q_lora_rank]
+      mapping[f"{prefix}.q_b_proj.weight"] = [q_dim, q_lora_rank]
+    else:
+      mapping[f"{prefix}.query.weight"] = [q_dim, hidden_size]
+    mapping[f"{prefix}.kv_a_proj_with_mqa.weight"] = [kv_a_proj_out_dim, hidden_size]
+    mapping[f"{prefix}.kv_a_layernorm.weight"] = [kv_lora_rank]
+    mapping[f"{prefix}.kv_b_proj.weight"] = [kv_b_dim, kv_lora_rank]
+    mapping[f"{prefix}.dense.weight"] = [hidden_size, o_proj_in_dim]
+
+  def _add_gla(prefix):
+    mapping[f"{prefix}.query_key_value.weight"] = [gla_qkv_out, hidden_size]
+    mapping[f"{prefix}.dense.weight"] = [hidden_size, num_attention_heads * head_dim]
+    mapping[f"{prefix}.g_proj.weight"] = [gla_gate_out, hidden_size]
+    # query/key_layernorm are per-head RMSNorm with shared weight across heads,
+    # so the weight is shape [head_dim] (not flattened across heads).
+    mapping[f"{prefix}.query_layernorm.weight"] = [head_dim]
+    mapping[f"{prefix}.key_layernorm.weight"] = [head_dim]
+    mapping[f"{prefix}.g_norm.weight"] = [gla_gate_out]
+
+  def _add_dense_mlp(prefix):
+    mapping[f"{prefix}.gate_proj.weight"] = [intermediate_size, hidden_size]
+    mapping[f"{prefix}.up_proj.weight"] = [intermediate_size, hidden_size]
+    mapping[f"{prefix}.down_proj.weight"] = [hidden_size, intermediate_size]
+
+  def _add_moe_mlp(prefix):
+    mapping[f"{prefix}.gate.weight"] = [num_experts, hidden_size]
+    mapping[f"{prefix}.gate.expert_bias"] = [num_experts]
+    mapping[f"{prefix}.shared_experts.gate_proj.weight"] = [shared_intermediate, hidden_size]
+    mapping[f"{prefix}.shared_experts.up_proj.weight"] = [shared_intermediate, hidden_size]
+    mapping[f"{prefix}.shared_experts.down_proj.weight"] = [hidden_size, shared_intermediate]
+    for e in range(num_experts):
+      ep = f"{prefix}.experts.{e}"
+      mapping[f"{ep}.gate_proj.weight"] = [moe_intermediate_size, hidden_size]
+      mapping[f"{ep}.up_proj.weight"] = [moe_intermediate_size, hidden_size]
+      mapping[f"{ep}.down_proj.weight"] = [hidden_size, moe_intermediate_size]
+
+  for i in range(num_hidden_layers):
+    lp = f"model.layers.{i}"
+    mapping[f"{lp}.input_layernorm.weight"] = [hidden_size]
+    mapping[f"{lp}.post_attention_layernorm.weight"] = [hidden_size]
+    if _is_mla(i):
+      _add_mla(f"{lp}.attention")
+    else:
+      _add_gla(f"{lp}.attention")
+    if i < first_k_dense:
+      _add_dense_mlp(f"{lp}.mlp")
+    else:
+      _add_moe_mlp(f"{lp}.mlp")
+
+  # Optional MTP layer at model.layers.{num_hidden_layers}
+  if has_mtp:
+    mp = f"model.layers.{num_hidden_layers}"
+    mapping[f"{mp}.enorm.weight"] = [hidden_size]
+    mapping[f"{mp}.hnorm.weight"] = [hidden_size]
+    mapping[f"{mp}.final_layernorm.weight"] = [hidden_size]
+    mapping[f"{mp}.eh_proj.weight"] = [hidden_size, 2 * hidden_size]
+    mapping[f"{mp}.input_layernorm.weight"] = [hidden_size]
+    mapping[f"{mp}.post_attention_layernorm.weight"] = [hidden_size]
+    _add_mla(f"{mp}.attention")
+    _add_moe_mlp(f"{mp}.mlp")
+
+  return mapping
+
+
 # {maxtext model name: {hf weight name: hf shape}}
 HF_SHAPE = {
     "gemma2-2b": GEMMA2_HF_WEIGHTS_TO_SHAPE,
@@ -785,4 +906,5 @@ HF_SHAPE = {
     "gpt-oss-120b": GPT_OSS_HF_WEIGHTS_TO_SHAPE,
     "mixtral-8x7b": MIXTRAL_HF_WEIGHTS_TO_SHAPE,
     "mixtral-8x22b": MIXTRAL_HF_WEIGHTS_TO_SHAPE,
+    "ling2": LING2_HF_WEIGHTS_TO_SHAPE,
 }

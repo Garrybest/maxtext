@@ -33,6 +33,14 @@ Optional Flags:
   --override_model_architecture: If set, overrides the HF model configuration
                                  with values from the MaxText configuration
                                  (e.g., num_heads, hidden_size) instead of failing.
+  --hf_reference_path: (Optional) Local HuggingFace repo path. When set, HF
+                       config and tokenizer are loaded from this path instead
+                       of HF_MODEL_CONFIGS / HF_IDS. Required for custom
+                       architectures not registered in HF_MODEL_CONFIGS
+                       (e.g., Ling2).
+  --trust_remote_code: (Optional) Passed through to AutoConfig / AutoTokenizer
+                       when loading from --hf_reference_path. Required for
+                       repos with custom modeling code.
 
 Environment Variables:
   HF_AUTH_TOKEN: (Required) A HuggingFace authentication token. This is needed
@@ -61,7 +69,7 @@ import os
 from typing import Sequence
 import time
 
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoTokenizer, AutoProcessor, AutoConfig
 
 from absl import app
 from absl import flags
@@ -92,6 +100,19 @@ flags.DEFINE_bool(
     False,
     "If True, overrides Hugging Face config architecture parameters (heads, layers, dims) "
     "with values from the MaxText config. If False, raises a ValueError on mismatch.",
+)
+flags.DEFINE_string(
+    "hf_reference_path",
+    "",
+    "Optional local HF repo path. When set, load HF config and tokenizer from "
+    "this path instead of HF_MODEL_CONFIGS / HF_IDS. Required for custom "
+    "architectures like Ling2 (trust_remote_code models).",
+)
+flags.DEFINE_bool(
+    "trust_remote_code",
+    False,
+    "Pass trust_remote_code=True to AutoConfig/AutoTokenizer. Required when "
+    "--hf_reference_path points to a repo with custom modeling code.",
 )
 
 FLAGS = flags.FLAGS
@@ -222,22 +243,36 @@ def main(argv: Sequence[str]) -> None:
 
   # 1. Get HuggingFace Model Configuration
   model_key = config.model_name
-  if model_key not in HF_IDS:
-    raise ValueError(f"Unsupported model name: {config.model_name}. Supported models are: {list(HF_IDS.keys())}")
-  hf_config_obj = HF_MODEL_CONFIGS[model_key]
+  if FLAGS.hf_reference_path:
+    max_logging.log(f"Loading HF config from reference path: {FLAGS.hf_reference_path}")
+    hf_config_obj = AutoConfig.from_pretrained(FLAGS.hf_reference_path, trust_remote_code=FLAGS.trust_remote_code)
+  else:
+    if model_key not in HF_IDS:
+      raise ValueError(
+          f"Unsupported model name: {config.model_name}. "
+          f"Either pass --hf_reference_path=<local_hf_repo> or use one of: {list(HF_IDS.keys())}"
+      )
+    hf_config_obj = HF_MODEL_CONFIGS[model_key]
 
   # Validate architecture consistency (raising ValueError on mismatch) or override HF config if specified.
   _validate_or_update_architecture(hf_config_obj, config, override=FLAGS.override_model_architecture)
 
   # 2. Load Tokenizer
-  if model_key not in HF_IDS:
-    raise ValueError(f"HF Tokenizer ID not found for model key: {model_key}")
   hf_token = config.hf_access_token
-  hf_tokenizer_id = HF_IDS[model_key]
-  tokenizer = AutoTokenizer.from_pretrained(hf_tokenizer_id, token=hf_token)
-
-  # For multi-modal case:
-  processor = AutoProcessor.from_pretrained(hf_tokenizer_id, token=hf_token) if config.use_multimodal else None
+  if FLAGS.hf_reference_path:
+    max_logging.log(f"Loading tokenizer from reference path: {FLAGS.hf_reference_path}")
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.hf_reference_path, trust_remote_code=FLAGS.trust_remote_code)
+    processor = (
+        AutoProcessor.from_pretrained(FLAGS.hf_reference_path, trust_remote_code=FLAGS.trust_remote_code)
+        if config.use_multimodal
+        else None
+    )
+  else:
+    if model_key not in HF_IDS:
+      raise ValueError(f"HF Tokenizer ID not found for model key: {model_key}")
+    hf_tokenizer_id = HF_IDS[model_key]
+    tokenizer = AutoTokenizer.from_pretrained(hf_tokenizer_id, token=hf_token)
+    processor = AutoProcessor.from_pretrained(hf_tokenizer_id, token=hf_token) if config.use_multimodal else None
 
   # 3. Get parameter mappings
   mappings = _get_model_mappings(model_key, config.scan_layers, hf_config_obj.to_dict(), config)
