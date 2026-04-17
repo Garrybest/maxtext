@@ -466,6 +466,9 @@ def build_maxtext_moe(args: argparse.Namespace):
       load_balance_loss_weight=0.0,
       decoder_block="ling2" if args.ling2_profile else "default",
       activations_in_float32=args.activations_in_float32,
+      quantization=getattr(args, "quantization", ""),
+      use_qwix_quantization=getattr(args, "use_qwix_quantization", False),
+      use_tokamax_gmm=getattr(args, "use_tokamax_gmm", False),
       ici_fsdp_parallelism=1,
       ici_tensor_parallelism=1,
       ici_expert_parallelism=1,
@@ -506,6 +509,18 @@ def build_maxtext_moe(args: argparse.Namespace):
         dtype=compute_dtype,
         weight_dtype=compute_dtype,
     )
+
+  # Quantize NNX model if FP8 blockwise is configured.
+  # Cannot use maybe_quantize_model() because qwix.quantize_model() requires
+  # dummy model inputs to trace NNX models.
+  if getattr(cfg, "use_qwix_quantization", False) and not getattr(cfg, "use_batch_split_schedule", False):
+    import qwix
+    from maxtext.layers.quantizations import get_qt_provider
+
+    quantization_provider = get_qt_provider(cfg, mesh)
+    if quantization_provider:
+      dummy_input = jnp.zeros((args.batch_size, args.seq_len, args.hidden_size), dtype=compute_dtype)
+      model = qwix.quantize_model(model, quantization_provider, dummy_input)
 
   return model, cfg, mesh
 

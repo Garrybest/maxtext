@@ -140,6 +140,8 @@ use_qwix_quantization: false # whether to use qwix for quantization. if set to t
 weight_quantization_calibration_method: "absmax"
 act_quantization_calibration_method: "absmax"
 bwd_quantization_calibration_method: "absmax"
+# fp8 format for backward pass quantization. 'e4m3' uses float8_e4m3fn, 'e5m2' uses float8_e5m2.
+fp8_format: "e4m3"
 # shard the range finding operation for quantization. by default this is set to number of slices.
 quantization_local_shard_count: -1
 

@@ -30,7 +30,7 @@ spec:
   completionMode: Indexed
   completions: 1
   parallelism: 1
-  activeDeadlineSeconds: 3600
+  activeDeadlineSeconds: 7200
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -240,6 +240,9 @@ spec:
             --ignore=tests/unit/gla_compare_test.py \
             --ignore=tests/unit/mla_compare_test.py \
             --ignore=tests/unit/moe_cross_compare.py \
+            --ignore=tests/unit/blockwise_fp8_compare_test.py \
+            --ignore=tests/unit/blockwise_fp8_test.py \
+            --ignore=tests/unit/gmm_compare_test.py \
             --ignore=tests/unit/sharding_compare_test.py \
             -k "not scheduled_only" \
             2>&1 || UNIT_TEST_EXIT=$?
@@ -286,7 +289,22 @@ spec:
             --ci \
             2>&1 || MOE_EXIT=$?
 
-          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ]
+          # Blockwise FP8 tests (compare + unit tests)
+          BLOCKWISE_FP8_COMPARE_EXIT=0
+          BLOCKWISE_FP8_TEST_EXIT=0
+          GMM_COMPARE_EXIT=0
+          echo ""
+          echo "========================================================"
+          echo "Running Blockwise FP8 tests"
+          echo "  dump-dir: ${RESOLVED_DUMP_DIR}/step_1"
+          echo "  ckpt-path: ${ACTIVE_CKPT}"
+          echo "========================================================"
+          python3 tests/unit/blockwise_fp8_compare_test.py -v 2>&1 || BLOCKWISE_FP8_COMPARE_EXIT=$?
+          python3 tests/unit/blockwise_fp8_test.py -v 2>&1 || BLOCKWISE_FP8_TEST_EXIT=$?
+          python3 tests/unit/gmm_compare_test.py -v 2>&1 || GMM_COMPARE_EXIT=$?
+          BLOCKWISE_FP8_EXIT=$((BLOCKWISE_FP8_COMPARE_EXIT | BLOCKWISE_FP8_TEST_EXIT | GMM_COMPARE_EXIT))
+
+          [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ] && [ "$BLOCKWISE_FP8_EXIT" -eq 0 ]
         env:
         # --- Unit test config (from workflow dispatch inputs) ---
         - name: DUMP_DIR

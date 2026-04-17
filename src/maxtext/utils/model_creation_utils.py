@@ -108,7 +108,7 @@ def create_model(config, mesh, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rng
   # Model definition
   quant = quantizations.configure_quantization(config)
   model = get_transformer_model(config, mesh, quant, model_mode=model_mode, rngs=rngs)
-  model = quantizations.maybe_quantize_model(model, config)
+  model = quantizations.maybe_quantize_model(model, config, mesh)
   return model
 
 

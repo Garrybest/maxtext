@@ -104,6 +104,7 @@ jobs:
           kubectl exec "$POD" -- timeout 3600 bash -c '
             . /opt/ci-env/bin/activate
             cd /workspace/maxtext
+            export USE_FP8_BLOCKWISE=true
             bash scripts/ci_smoke_test.sh
           '
 

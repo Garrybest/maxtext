@@ -675,6 +675,7 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          input_activation_axes=(BATCH, LENGTH_NO_EXP, None),
           rngs=self.rngs,
       )
     else:
@@ -690,6 +691,7 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          input_activation_axes=(BATCH, LENGTH_NO_EXP, None),
           rngs=self.rngs,
       )
       self.q_norm = RMSNorm(
@@ -711,6 +713,7 @@ class MLA(Attention):
           quant=self.quant,
           matmul_precision=self.config.matmul_precision,
           shard_mode=self.config.shard_mode,
+          input_activation_axes=(BATCH, LENGTH_NO_EXP, Q_LORA_UP_PROJ),
           rngs=self.rngs,
       )
 
@@ -726,6 +729,7 @@ class MLA(Attention):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
+        input_activation_axes=(BATCH, LENGTH_NO_EXP, None),
         rngs=self.rngs,
     )
     self.kv_norm = RMSNorm(
@@ -750,6 +754,7 @@ class MLA(Attention):
         quant=self.quant,
         matmul_precision=self.config.matmul_precision,
         shard_mode=self.config.shard_mode,
+        input_activation_axes=(BATCH, LENGTH_NO_EXP, KV_LORA_UP_PROJ),
         rngs=self.rngs,
     )
 
@@ -759,7 +764,10 @@ class MLA(Attention):
       mscale = 0.1 * self.mscale * math.log(self.rope_factor) + 1.0
       self.softmax_scale = self.softmax_scale * mscale * mscale
 
-    self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
+    self.out = self.init_out_w(
+        output_dim=inputs_q_shape[-1],
+        input_activation_axes=(BATCH, LENGTH_NO_EXP, HEAD, None),
+    )
 
     # Setup paged attention op
     if self.config.attention == "paged":

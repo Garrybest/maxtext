@@ -96,6 +96,7 @@ class QuantizationType(str, Enum):
   TE_MXFP8 = "te_mxfp8"
   TE_NVFP4 = "te_nvfp4"
   TE_NVFP4_NO_RHT = "te_nvfp4_no_rht"
+  FP8_BLOCKWISE = "fp8_blockwise"
 
 
 class KvQuantAxis(str, Enum):
@@ -421,6 +422,10 @@ class Quantization(BaseModel):
   bwd_quantization_calibration_method: str = Field(
       "absmax",
       description="Quantization calibration method used for gradients.",
+  )
+  fp8_format: str = Field(
+      "e4m3",
+      description="FP8 format for backward pass quantization: 'e4m3' (float8_e4m3fn) or 'e5m2' (float8_e5m2).",
   )
 
 

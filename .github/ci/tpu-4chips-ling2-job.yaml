@@ -1,6 +1,6 @@
 # TPU 4chips 1K Steps - K8s Manifests (JobSet)
 # Global batch size = 16
-# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER $USE_FP8_BLOCKWISE
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -81,10 +81,14 @@ spec:
                 fi
 
                 # 5. Run 1000-step training (STEPS/WARMUP_ITERS/EVAL_INTERVAL set via env)
+                FP8_ARGS=""
+                if [ "${USE_FP8_BLOCKWISE:-}" = "true" ]; then
+                  FP8_ARGS="quantization=fp8_blockwise use_qwix_quantization=true fp8_format=e4m3 use_tokamax_gmm=true"
+                fi
                 if [ -n "$LOG_FILE" ]; then
-                  bash scripts/pretrain_ling2.sh 2>&1 | tee -a "$LOG_FILE"
+                  bash scripts/pretrain_ling2.sh $FP8_ARGS 2>&1 | tee -a "$LOG_FILE"
                 else
-                  bash scripts/pretrain_ling2.sh
+                  bash scripts/pretrain_ling2.sh $FP8_ARGS
                 fi
               env:
               # --- CI overrides (picked up by pretrain_ling2.sh) ---
@@ -96,6 +100,9 @@ spec:
                 value: "gs://data_ant/pretrain/ling2"
               - name: RUN_NAME
                 value: "${JOB_NAME}"
+              # --- FP8 blockwise quantization (set to "true" to enable) ---
+              - name: USE_FP8_BLOCKWISE
+                value: "${USE_FP8_BLOCKWISE}"
               # --- Vertex AI TensorBoard ---
               - name: USE_VERTEX_TENSORBOARD
                 value: "true"

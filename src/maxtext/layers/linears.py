@@ -118,6 +118,7 @@ class DenseGeneral(nnx.Module):
       shard_mode: ShardMode = ShardMode.AUTO,
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
+      input_activation_axes: tuple[None | str, ...] | None = None,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -151,6 +152,7 @@ class DenseGeneral(nnx.Module):
     self.shard_mode = shard_mode
     self.matmul_precision = matmul_precision
     self.parameter_memory_host_offload = parameter_memory_host_offload
+    self.input_activation_axes = input_activation_axes
 
     # Parameter initialization
     kernel_shape = self.in_features_shape + self.out_features_shape
@@ -264,6 +266,7 @@ def dense_general(
     shard_mode: ShardMode = ShardMode.AUTO,
     matmul_precision: str = "default",
     parameter_memory_host_offload: bool = False,
+    input_activation_axes: tuple[None | str, ...] | None = None,
     name: None | str = None,
 ):
   """Creates a DenseGeneral Linen module using nnx.bridge.to_linen.
@@ -307,6 +310,7 @@ def dense_general(
       shard_mode=shard_mode,
       matmul_precision=matmul_precision,
       parameter_memory_host_offload=parameter_memory_host_offload,
+      input_activation_axes=input_activation_axes,
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,
@@ -421,6 +425,7 @@ class MlpBlock(nnx.Module):
           use_bias=self.use_bias,
           shard_mode=self.config.shard_mode,
           matmul_precision=self.config.matmul_precision,
+          input_activation_axes=("activation_batch", "activation_norm_length", None),
           rngs=rngs,
       )
     else:
@@ -437,6 +442,7 @@ class MlpBlock(nnx.Module):
             use_bias=self.use_bias,
             shard_mode=self.config.shard_mode,
             matmul_precision=self.config.matmul_precision,
+            input_activation_axes=("activation_batch", "activation_norm_length", None),
             rngs=rngs,
         )
         setattr(self, dense_name, module)
@@ -452,6 +458,7 @@ class MlpBlock(nnx.Module):
         use_bias=self.use_bias,
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
+        input_activation_axes=self.intermediate_logical,
         rngs=rngs,
     )
 

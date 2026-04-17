@@ -58,6 +58,7 @@ class BailingMoeV2LinearAttention(nnx.Module):
         use_bias=cfg.attention_bias,
         shard_mode=cfg.shard_mode,
         matmul_precision=cfg.matmul_precision,
+        input_activation_axes=("activation_batch", "activation_norm_length", None),
         rngs=rngs,
     )
     self.dense = linears.DenseGeneral(
@@ -70,6 +71,7 @@ class BailingMoeV2LinearAttention(nnx.Module):
         use_bias=cfg.attention_bias,
         shard_mode=cfg.shard_mode,
         matmul_precision=cfg.matmul_precision,
+        input_activation_axes=("activation_batch", "activation_norm_length", "activation_heads", None),
         rngs=rngs,
     )
     self.g_proj = linears.DenseGeneral(
@@ -82,6 +84,7 @@ class BailingMoeV2LinearAttention(nnx.Module):
         use_bias=False,
         shard_mode=cfg.shard_mode,
         matmul_precision=cfg.matmul_precision,
+        input_activation_axes=("activation_batch", "activation_norm_length", None),
         rngs=rngs,
     )
 

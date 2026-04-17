@@ -107,17 +107,52 @@ def _gmm_fwd(
         jnp.ndarray | qpl.QArray,
         jnp.ndarray,
         jnp.ndarray | None,
+        jnp.ndarray | qpl.QArray | None,
     ],
 ]:
   """Forward function for GMM VJP."""
+  lhs_t = None  # Pre-computed transposed FP8 activation for backward tgmm.
+  tile_size = getattr(quantization_rule, "tile_size", None) if quantization_rule else None
+  if tile_size:
+    # Cap kernel tiling to quantization block size. tokamax quant_block_spec
+    # requires eps % kernel_tile == 0 on non-reduction axes, so kernel tiles
+    # must not exceed the quantization block size.
+    tiling = tuple(min(t, tile_size) for t in tiling)
   if quantization_rule:
     if quantization_rule.act_qtype and not isinstance(lhs, qpl.QArray):
-      lhs = qpl.quantize(
-          lhs,
-          quantization_rule.act_qtype,
-          channelwise_axes=[] if quantization_rule.disable_channelwise_axes else [0],
-          calibration_method=quantization_rule.act_calibration_method,
-      )
+      if tile_size and use_tokamax_backend:
+        # TE-style: quantize both orientations from BF16 source (avoids double
+        # quantization error). lhs [M, K] with (1, tile_size) blocks for
+        # forward gmm; lhs_t [K, M] with (1, tile_size) blocks for backward
+        # tgmm, ensuring tile_size-element blocks on the tgmm reduction axis.
+        lhs_bf16 = lhs
+        act_cw = [] if quantization_rule.disable_channelwise_axes else [0]
+        act_tiled = {1: tile_size}
+        lhs = qpl.quantize(
+            lhs_bf16,
+            quantization_rule.act_qtype,
+            channelwise_axes=act_cw,
+            tiled_axes=act_tiled,
+            calibration_method=quantization_rule.act_calibration_method,
+            scale_dtype=jnp.float32,
+        )
+        lhs_t = qpl.quantize(
+            lhs_bf16.swapaxes(0, 1),
+            quantization_rule.act_qtype,
+            channelwise_axes=act_cw,
+            tiled_axes=act_tiled,
+            calibration_method=quantization_rule.act_calibration_method,
+            scale_dtype=jnp.float32,
+        )
+      else:
+        lhs = qpl.quantize(
+            lhs,
+            quantization_rule.act_qtype,
+            channelwise_axes=[] if quantization_rule.disable_channelwise_axes else ([] if tile_size else [0]),
+            tiled_axes={0: tile_size, 1: tile_size} if tile_size else None,
+            calibration_method=quantization_rule.act_calibration_method,
+            scale_dtype=jnp.float32,
+        )
     if quantization_rule.weight_qtype and not isinstance(rhs, qpl.QArray):
       rhs = qpl.quantize(
           rhs,
@@ -125,17 +160,29 @@ def _gmm_fwd(
           # If only considering the fwd pass, we could also enable channelwise
           # axes for the group axis, i.e., [0, 1 or 2]. However, this makes the
           # bwd pass unable to reuse the scale easily.
-          channelwise_axes=[] if quantization_rule.disable_channelwise_axes else ([1] if transpose_rhs else [2]),
+          channelwise_axes=[]
+          if quantization_rule.disable_channelwise_axes
+          else ([0] if tile_size else ([1] if transpose_rhs else [2])),
+          tiled_axes={1: tile_size, 2: tile_size} if tile_size else None,
           calibration_method=quantization_rule.weight_calibration_method,
+          scale_dtype=jnp.float32,
       )
       # QAG is only supported for following conditions
   if use_tokamax_backend:
-    if quantization_rule and quantization_rule.bwd_qtype:
-      if quantization_rule.weight_calibration_method.startswith("fixed") and isinstance(rhs, qpl.QArray):
-        if weight_gather_axes:
-          for axis_name, axis_idx in weight_gather_axes:
-            rhs_qvalue = jax.lax.all_gather(rhs.qvalue, axis_name, axis=axis_idx, tiled=True)
-            rhs = dataclasses.replace(rhs, qvalue=rhs_qvalue)
+    if (
+        quantization_rule
+        and quantization_rule.bwd_qtype
+        and quantization_rule.weight_calibration_method.startswith("fixed")
+        and isinstance(rhs, qpl.QArray)
+        and weight_gather_axes
+    ):
+      for axis_name, axis_idx in weight_gather_axes:
+        rhs_qvalue = jax.lax.all_gather(rhs.qvalue, axis_name, axis=axis_idx, tiled=True)
+        if _is_blockwise_qarray(rhs):
+          rhs_scale = jax.lax.all_gather(rhs.scale, axis_name, axis=axis_idx, tiled=True)
+          rhs = dataclasses.replace(rhs, qvalue=rhs_qvalue, scale=rhs_scale)
+        else:
+          rhs = dataclasses.replace(rhs, qvalue=rhs_qvalue)
     out = tokamax_backend.gmm(
         lhs=lhs,
         rhs=rhs,
@@ -160,7 +207,12 @@ def _gmm_fwd(
         transpose_rhs=transpose_rhs,
         interpret=interpret,
     )
-  return out, (lhs, rhs, group_sizes, group_offset)
+  return out, (lhs, rhs, group_sizes, group_offset, lhs_t)
+
+
+def _is_blockwise_qarray(q: qpl.QArray) -> bool:
+  """Check if a QArray has block-wise (not per-channel) scales."""
+  return any(sd not in (1, qd) for sd, qd in zip(q.scale.shape, q.qvalue.shape))
 
 
 def _gmm_bwd(
@@ -180,13 +232,19 @@ def _gmm_bwd(
         jnp.ndarray | qpl.QArray,
         jnp.ndarray,
         jnp.ndarray | None,
+        jnp.ndarray | qpl.QArray | None,
     ],
     grad: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, None, None, jnp.ndarray]:
   """Backward function for throughput GMM VJP."""
   del preferred_element_type
-  lhs, rhs, group_sizes, group_offset = residual
+  lhs, rhs, group_sizes, group_offset, lhs_t = residual
   num_actual_groups = rhs.shape[0]
+
+  tile_size = getattr(quantization_rule, "tile_size", None) if quantization_rule else None
+  if tile_size:
+    # Cap kernel tiling to quantization block size (see _gmm_fwd).
+    tiling = tuple(min(t, tile_size) for t in tiling)
 
   # Jargon used here:
   #  - lhs: input activation in forward pass, possibly quantized.
@@ -200,29 +258,65 @@ def _gmm_bwd(
   # dlhs_dout and drhs_dout can be different when quantization is enabled.
   dlhs_dout = grad
   drhs_dout = grad
-  if isinstance(rhs, qpl.QArray):  # qvalue: [g, k, n] scale: [1, 1, n]
-    # Apply rhs.scale to dlhs_dout to avoid dequantizing or requantizing rhs.
-    # We cannot apply the scale to dlhs because axis n will disappear there.
-    dlhs_dout *= rhs.scale.astype(grad.dtype).reshape(1, -1)  # [1, n]
-    rhs = rhs.qvalue
-  if isinstance(lhs, qpl.QArray):  # qvalue: [m, k] scale: [m, 1]
-    # Apply lhs.scale to drhs_dout, as axis m will disappear in drhs.
-    drhs_dout *= lhs.scale.astype(grad.dtype)
-    lhs = lhs.qvalue
+  if isinstance(rhs, qpl.QArray):
+    if _is_blockwise_qarray(rhs):
+      # Block-wise: keep QArray as-is, kernel handles scale internally.
+      pass
+    else:
+      # Per-channel: apply rhs.scale to dlhs_dout (dual quantization trick).
+      # qvalue: [g, k, n] scale: [1, 1, n]
+      dlhs_dout *= rhs.scale.astype(grad.dtype).reshape(1, -1)  # [1, n]
+      rhs = rhs.qvalue
+  if isinstance(lhs, qpl.QArray):
+    if _is_blockwise_qarray(lhs):
+      # Block-wise: keep QArray as-is, kernel handles scale internally.
+      pass
+    else:
+      # Per-channel: apply lhs.scale to drhs_dout (dual quantization trick).
+      # qvalue: [m, k] scale: [m, 1]
+      drhs_dout *= lhs.scale.astype(grad.dtype)
+      lhs = lhs.qvalue
   if quantization_rule and quantization_rule.bwd_qtype:
     # Enable backward pass quantization
-    dlhs_dout = qpl.quantize(
-        dlhs_dout,
-        quantization_rule.bwd_qtype,
-        channelwise_axes=[] if quantization_rule.disable_channelwise_axes else [0],
-        calibration_method=quantization_rule.bwd_calibration_method,
-    )
-    drhs_dout = qpl.quantize(
-        drhs_dout,
-        quantization_rule.bwd_qtype,
-        channelwise_axes=[] if quantization_rule.disable_channelwise_axes else [1],
-        calibration_method=quantization_rule.bwd_calibration_method,
-    )
+    if lhs_t is not None:
+      # TE-style dual quantization for dout [M, N]:
+      #   dlhs_dout: tiled_axes={1: tile_size}, channelwise on M
+      #     → scale [M, N//tile_size], 1×128 blocks (gmm, M is non-reduction)
+      #   drhs_dout: tiled_axes={0: tile_size}, channelwise on N
+      #     → scale [M//tile_size, N], 1×128 blocks on reduction axis
+      dlhs_dout = qpl.quantize(
+          dlhs_dout,
+          quantization_rule.bwd_qtype,
+          channelwise_axes=[] if quantization_rule.disable_channelwise_axes else [0],
+          tiled_axes={1: tile_size},
+          calibration_method=quantization_rule.bwd_calibration_method,
+          scale_dtype=jnp.float32,
+      )
+      drhs_dout = qpl.quantize(
+          drhs_dout,
+          quantization_rule.bwd_qtype,
+          channelwise_axes=[1],
+          tiled_axes={0: tile_size},
+          calibration_method=quantization_rule.bwd_calibration_method,
+          scale_dtype=jnp.float32,
+      )
+    else:
+      dlhs_dout = qpl.quantize(
+          dlhs_dout,
+          quantization_rule.bwd_qtype,
+          channelwise_axes=[] if quantization_rule.disable_channelwise_axes else ([] if tile_size else [0]),
+          tiled_axes={0: tile_size, 1: tile_size} if tile_size else None,
+          calibration_method=quantization_rule.bwd_calibration_method,
+          scale_dtype=jnp.float32,
+      )
+      drhs_dout = qpl.quantize(
+          drhs_dout,
+          quantization_rule.bwd_qtype,
+          channelwise_axes=[] if quantization_rule.disable_channelwise_axes else ([] if tile_size else [1]),
+          tiled_axes={0: tile_size, 1: tile_size} if tile_size else None,
+          calibration_method=quantization_rule.bwd_calibration_method,
+          scale_dtype=jnp.float32,
+      )
   if use_tokamax_backend:
     dlhs = tokamax_backend.gmm(
         lhs=dlhs_dout,
@@ -237,7 +331,7 @@ def _gmm_bwd(
         input_buffer_count=input_buffer_count[1],
     )
     drhs = tokamax_backend.tgmm(
-        lhs=lhs.swapaxes(0, 1),
+        lhs=lhs_t if lhs_t is not None else lhs.swapaxes(0, 1),
         rhs=drhs_dout,
         group_sizes=group_sizes,
         precision=jax.lax.Precision.DEFAULT,

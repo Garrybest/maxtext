@@ -15,6 +15,7 @@
 """Quantization library."""
 
 import functools
+import inspect
 import json
 import re
 from typing import Tuple, Sequence, Callable
@@ -36,9 +37,13 @@ from jax.tree_util import tree_flatten_with_path, tree_unflatten
 from flax.linen import fp8_ops
 from flax.linen import initializers as flax_initializers
 import flax.linen as nn
+from flax import nnx
 
 from maxtext.common.common_types import DType, Config
 from maxtext.inference.kvcache import KVQuant
+from maxtext.kernels import megablox as mblx
+from jax.sharding import PartitionSpec as P, NamedSharding
+from maxtext.utils.sharding import logical_to_mesh_axes
 
 # Params used to define mixed precision quantization configs
 DEFAULT = "__default__"  # default config
@@ -602,6 +607,8 @@ def _get_quant_config(config):
     return _get_aqt_fp8_default_config(config)
   if config.quantization.startswith("te_"):
     return config.quantization
+  if config.quantization == "fp8_blockwise":
+    return "fp8_blockwise"
 
   raise ValueError(f"Invalid value configured for quantization {config.quantization}.")
 
@@ -730,6 +737,193 @@ class NANOOFp8Provider(qwix.QtProvider):
     return nn.NANOOFp8DotGeneralOp(name=op_id)(*args, **kwargs)
 
 
+def _derive_specs_from_out_sharding(out_pspec, dn, lhs_ndim, rhs_ndim):
+  """Derive lhs/rhs PartitionSpecs from output PartitionSpec and dimension_numbers.
+
+  Output dim order for dot_general: [batch_dims, lhs_free_dims, rhs_free_dims].
+  Maps each output dim back to the corresponding lhs/rhs dim.
+  Contracted dims get None (not present in output).
+  """
+  (lhs_con, rhs_con), (lhs_batch, rhs_batch) = dn
+  lhs_con_set, lhs_batch_set = set(lhs_con), set(lhs_batch)
+  rhs_con_set, rhs_batch_set = set(rhs_con), set(rhs_batch)
+  lhs_free = [i for i in range(lhs_ndim) if i not in lhs_con_set and i not in lhs_batch_set]
+  rhs_free = [i for i in range(rhs_ndim) if i not in rhs_con_set and i not in rhs_batch_set]
+
+  out_parts = list(out_pspec)
+  lhs_spec = [None] * lhs_ndim
+  rhs_spec = [None] * rhs_ndim
+
+  idx = 0
+  for ld, rd in zip(lhs_batch, rhs_batch):
+    lhs_spec[ld] = out_parts[idx]
+    rhs_spec[rd] = out_parts[idx]
+    idx += 1
+  for d in lhs_free:
+    lhs_spec[d] = out_parts[idx]
+    idx += 1
+  for d in rhs_free:
+    rhs_spec[d] = out_parts[idx]
+    idx += 1
+
+  return P(*lhs_spec), P(*rhs_spec)
+
+
+class BlockwiseFp8Provider(qwix.QtProvider):
+  """Wraps BlockwiseFp8DotGeneralOp with qwix provider interface."""
+
+  def __init__(self, rules, mesh=None, logical_axis_rules=None):
+    super().__init__(rules)
+    self.mesh = mesh
+    self.logical_axis_rules = logical_axis_rules
+
+  def dot_general(self, *args, **kwargs):
+    """Blockwise FP8 dot_general with optional shard_map wrapping."""
+    rule, op_id = self._get_current_rule_and_op_id("dot_general")
+    if rule is None or rule.weight_qtype is None:
+      return jax.lax.dot_general(*args, **kwargs)
+
+    out_sharding = kwargs.pop("out_sharding", None)
+
+    lhs, rhs = args[0], args[1]
+    dn = args[2] if len(args) > 2 else kwargs.get("dimension_numbers")
+    precision = kwargs.get("precision")
+
+    can_shard = False
+    lhs_spec = rhs_spec = out_spec = None
+    mesh = None
+    reduce_axes = ()
+
+    # Path A: derive specs from out_sharding (EXPLICIT shard mode).
+    # When DenseGeneral passes a NamedSharding, we can derive all partition
+    # specs directly from it without needing module metadata.
+    if isinstance(out_sharding, NamedSharding):
+      mesh = out_sharding.mesh
+      out_pspec = out_sharding.spec
+      lhs_spec, rhs_spec = _derive_specs_from_out_sharding(out_pspec, dn, lhs.ndim, rhs.ndim)
+      out_spec = out_pspec
+      # Safety: if any mesh axis with size > 1 is absent from the output
+      # spec, a contracted dim may be sharded on it (would need psum).
+      out_axes = set()
+      for p in out_pspec:
+        if p is not None:
+          if isinstance(p, tuple):
+            out_axes.update(p)
+          else:
+            out_axes.add(p)
+      active_axes = {name for name in mesh.axis_names if mesh.shape[name] > 1}
+      can_shard = active_axes.issubset(out_axes)
+
+    # Path B: stack-walk to find NNX module (AUTO shard mode).
+    # get_current_module() returns the Linen parent (DecoderLayer) instead
+    # of the NNX DenseGeneral that carries kernel_axes / input_activation_axes.
+    # Walk the Python stack directly to find the right NNX module.
+    if not can_shard and self.mesh is not None:
+      module = None
+      frame = inspect.currentframe()
+      try:
+        while frame is not None:
+          obj = frame.f_locals.get("self")
+          if (
+              obj is not None
+              and isinstance(obj, nnx.Module)
+              and hasattr(obj, "kernel_axes")
+              and getattr(obj, "kernel_axes", None)
+          ):
+            module = obj
+            break
+          frame = frame.f_back
+      finally:
+        del frame
+
+      kernel_axes = getattr(module, "kernel_axes", None)
+      input_axes = getattr(module, "input_activation_axes", None)
+      module_axis = getattr(module, "axis", None)
+
+      can_shard = bool(kernel_axes and input_axes)
+
+      if can_shard:
+        mesh = self.mesh
+        n_contracted = len(module_axis) if module_axis else 1
+
+        # Map logical -> mesh axes
+        lhs_raw = list(logical_to_mesh_axes(input_axes, mesh, rules=self.logical_axis_rules))
+        rhs_raw = list(logical_to_mesh_axes(kernel_axes, mesh, rules=self.logical_axis_rules))
+
+        # Collect reduce_axes from LHS contracted dims (last n_contracted)
+        _reduce = set()
+        for s in lhs_raw[-n_contracted:]:
+          if s is not None:
+            if isinstance(s, tuple):
+              _reduce.update(s)
+            else:
+              _reduce.add(s)
+        reduce_axes = tuple(_reduce)
+
+        # Align RHS contracted dims (first n_contracted) with LHS contracted
+        for i in range(n_contracted):
+          rhs_raw[i] = lhs_raw[-(n_contracted - i)]
+
+        # Collect mesh axes used by lhs (activation)
+        lhs_axes = set()
+        for s in lhs_raw:
+          if s is None:
+            continue
+          elif isinstance(s, tuple):
+            lhs_axes.update(s)
+          else:
+            lhs_axes.add(s)
+
+        # Strip conflicting axes from non-contracted RHS dims only
+        for i in range(n_contracted, len(rhs_raw)):
+          s = rhs_raw[i]
+          if s is None:
+            continue
+          elif isinstance(s, tuple):
+            filtered = tuple(a for a in s if a not in lhs_axes)
+            rhs_raw[i] = filtered if filtered else None
+          else:
+            rhs_raw[i] = None if s in lhs_axes else s
+
+        lhs_spec = P(*lhs_raw)
+        rhs_spec = P(*rhs_raw)
+
+        # Build out_spec: lhs free dims + rhs free dims
+        lhs_out_spec = lhs_raw[:-n_contracted]
+        rhs_out_spec = rhs_raw[n_contracted:]
+        out_spec = P(*lhs_out_spec, *rhs_out_spec)
+
+    if can_shard:
+
+      @functools.partial(
+          jax.shard_map,
+          mesh=mesh,
+          in_specs=(lhs_spec, rhs_spec),
+          out_specs=out_spec,
+          check_vma=False,
+      )
+      def _sharded(l, r):
+        result = mblx.BlockwiseFp8DotGeneralOp(
+            name=op_id,
+            block_size=rule.tile_size or 128,
+            fp8_dtype=rule.weight_qtype,
+        )(l, r, dn, precision=precision)
+        if reduce_axes:
+          result = jax.lax.psum(result, reduce_axes)
+        return result
+
+      return _sharded(lhs, rhs)
+    else:
+      # Fallback: pure JAX (no Pallas) -- auto-partitionable by XLA
+      return mblx.BlockwiseFp8DotGeneralOp(
+          name=op_id,
+          block_size=rule.tile_size or 128,
+          fp8_dtype=rule.weight_qtype,
+          use_fused=False,
+          use_pallas=False,
+      )(*args, **kwargs)
+
+
 def get_fp8_full_qwix_rule(config: Config):
   return qwix.QtRule(
       module_path="decoder/.*layers.*",
@@ -792,11 +986,24 @@ def get_quantization_rule(config: Config):
           bwd_weight_grad_tile_size=1 / config.quantization_local_shard_count,
           op_names=("dot_general",),
       )
+    case "fp8_blockwise":
+      bwd_qtype = jnp.float8_e4m3fn if config.fp8_format == "e4m3" else jnp.float8_e5m2
+      return qwix.QtRule(
+          module_path=r"(?:decoder/.*layers.*|mtp_block/.*transformer_layer.*)",
+          weight_qtype=jnp.float8_e4m3fn,
+          act_qtype=jnp.float8_e4m3fn,
+          bwd_qtype=bwd_qtype,
+          tile_size=128,
+          weight_calibration_method=config.weight_quantization_calibration_method,
+          act_calibration_method=config.act_quantization_calibration_method,
+          bwd_calibration_method=config.bwd_quantization_calibration_method,
+          op_names=("dot_general", "gmm", "ragged_dot"),
+      )
     case "":
       return None
 
 
-def get_qt_provider(config):
+def get_qt_provider(config, mesh=None):
   """Get quantization rules based on the config."""
   match config.quantization:
     case "int8":
@@ -811,14 +1018,29 @@ def get_qt_provider(config):
       return NvidaFp8Provider([get_quantization_rule(config)])
     case "fp8_nanoo":
       return NANOOFp8Provider([get_quantization_rule(config)])
+    case "fp8_blockwise":
+      # Exclude MoE gate and attention internal ops (Q@K, attn@V) from FP8,
+      # aligned with Megatron scope (fp8_dpa=False, no fp8 for router gate).
+      # Only dot_general needs excluding here -- gmm/ragged_dot are MoE expert
+      # ops that don't appear under gate/attention_op modules.
+      exclude_rule = qwix.QtRule(
+          module_path=r".*/(?:gate|attention_op)(?:/.*)?",
+          weight_qtype=None,
+          op_names=("dot_general",),
+      )
+      return BlockwiseFp8Provider(
+          [exclude_rule, get_quantization_rule(config)],
+          mesh=mesh,
+          logical_axis_rules=config.logical_axis_rules,
+      )
   return None
 
 
-def maybe_quantize_model(model, config):
+def maybe_quantize_model(model, config, mesh=None):
   """Quantize the model if quantization is enabled."""
   # Batch split is not using Qwix's interception feature but manual plumbing
   if config.use_qwix_quantization and not config.use_batch_split_schedule:
-    quantization_provider = get_qt_provider(config)
+    quantization_provider = get_qt_provider(config, mesh)
     if quantization_provider:
       model = qwix.quantize_model(model, quantization_provider)
   return model

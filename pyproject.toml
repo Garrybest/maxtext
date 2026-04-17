@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "tops @ git+https://github.com/primatrix/pallas-kernel.git@release/v0.3",
+    "tokamax @ git+https://github.com/primatrix/tokamax.git@main",
 ]
 
 [tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]

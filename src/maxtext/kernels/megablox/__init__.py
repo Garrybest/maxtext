@@ -14,3 +14,4 @@
 """Megablox kernel"""
 
 from maxtext.kernels.megablox.ops import gmm
+from maxtext.kernels.megablox.blockwise_fp8 import BlockwiseFp8DotGeneralOp

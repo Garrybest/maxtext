@@ -566,7 +566,11 @@ class Attention(nnx.Module):
       self.key = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
       if not self.share_kv_projections:
         self.value = self.init_kv_w(inputs_kv_shape=inputs_kv_shape)
-    self.out = self.init_out_w(output_dim=inputs_q_shape[-1])
+    out_act_axes = ("activation_batch", "activation_norm_length", "activation_heads", None)
+    if self.is_qwen3_next:
+      # qwen3_next flattens heads into a single dim, so input is 3D not 4D
+      out_act_axes = ("activation_batch", "activation_norm_length", None)
+    self.out = self.init_out_w(output_dim=inputs_q_shape[-1], input_activation_axes=out_act_axes)
 
   def init_query_w(self, inputs_q_shape: Tuple) -> nnx.Module:
     """Query projection initialization."""
@@ -606,6 +610,7 @@ class Attention(nnx.Module):
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
         shard_mode=self.config.shard_mode,
+        input_activation_axes=("activation_batch", "activation_norm_length", None),
         rngs=self.rngs,
     )
 
@@ -647,6 +652,7 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        input_activation_axes=("activation_batch", "activation_norm_length", None),
         rngs=self.rngs,
     )
 
@@ -685,6 +691,7 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=self.use_bias_in_projections,
+        input_activation_axes=("activation_batch", "activation_norm_length", None),
         rngs=self.rngs,
     )
 
@@ -696,7 +703,7 @@ class Attention(nnx.Module):
     query, key, value = qkv_proj[:, :, 0, ...], qkv_proj[:, :, 1, ...], qkv_proj[:, :, 2, ...]
     return query, key, value
 
-  def init_out_w(self, output_dim: int) -> nnx.Module:
+  def init_out_w(self, output_dim: int, input_activation_axes=None) -> nnx.Module:
     """out projection"""
     in_features = (self.num_query_heads, self.head_dim)
     out_features = output_dim
@@ -722,6 +729,7 @@ class Attention(nnx.Module):
         shard_mode=self.config.shard_mode,
         matmul_precision=self.config.matmul_precision,
         use_bias=False if self.is_qwen2 else self.use_bias_in_projections,
+        input_activation_axes=input_activation_axes,
         rngs=self.rngs,
     )
 
