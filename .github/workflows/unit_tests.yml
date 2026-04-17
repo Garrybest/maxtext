@@ -116,7 +116,18 @@ jobs:
           '
 
           # 2. Fresh venv + full install (includes test deps + Argus + gcloud)
-          kubectl exec "$POD" -- bash -c '
+          # Token is piped via stdin so uv can fetch private primatrix/* git deps
+          # (e.g. pallas-kernel). GIT_CONFIG_GLOBAL scopes the rewrite to this
+          # shell and the trap deletes it on exit so the token does not persist
+          # in /root/.gitconfig across jobs on the shared pool pod.
+          echo "$CROSS_REPO_TOKEN" | kubectl exec -i "$POD" -- bash -c '
+            read -r CROSS_REPO_TOKEN
+            export GIT_CONFIG_GLOBAL=/tmp/git-config-install
+            trap "rm -f $GIT_CONFIG_GLOBAL" EXIT
+            git config --global \
+              url."https://x-access-token:${CROSS_REPO_TOKEN}@github.com/primatrix/".insteadOf \
+              "https://github.com/primatrix/"
+
             cd /workspace/maxtext
             /opt/tools/uv venv --python 3.12 --seed /opt/ci-env
             . /opt/ci-env/bin/activate
