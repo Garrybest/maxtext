@@ -366,7 +366,7 @@ jobs:
             echo "Running Megatron dataloader alignment tests"
             echo "========================================================"
             /opt/tools/uv pip install torch --extra-index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -3
-            /opt/tools/uv pip install megatron-core 2>&1 | tail -3
+            /opt/tools/uv pip install 'megatron-core>=0.16,<0.17' 2>&1 | tail -3
             python3 -m pytest tests/unit/megatron_dataloader_alignment_test.py \
                 tests/unit/megatron_npy_datasource_test.py \
                 -v --timeout=300 \
