@@ -59,12 +59,14 @@ def maybe_monitor_goodput(config):
     return
   goodput_monitor = None
   try:
-    if config.report_performance_metric_for_gcp_monitoring:
-      config.enable_gcp_step_deviation_metrics = False
-
+    # HyperParameters is read-only, so compute the effective step-deviation flag
+    # locally instead of mutating config (would raise ValueError).
+    enable_gcp_step_deviation_metrics = (
+        config.enable_gcp_step_deviation_metrics and not config.report_performance_metric_for_gcp_monitoring
+    )
     gcp_options = monitoring.GCPOptions(
         enable_gcp_goodput_metrics=config.enable_gcp_goodput_metrics,
-        enable_gcp_step_deviation_metrics=config.enable_gcp_step_deviation_metrics,
+        enable_gcp_step_deviation_metrics=enable_gcp_step_deviation_metrics,
     )
     goodput_monitor = monitoring.GoodputMonitor(
         job_name=config.run_name,
@@ -80,11 +82,18 @@ def maybe_monitor_goodput(config):
     )
     goodput_monitor.start_goodput_uploader()
     max_logging.log("Started Goodput upload to Tensorboard & GCM in the background!")
+    if config.monitor_step_time_deviation:
+      goodput_monitor.start_step_deviation_uploader()
+      max_logging.log("Started step deviation upload to Tensorboard & GCM in the background!")
     yield
   finally:
     if goodput_monitor:
-      goodput_monitor.stop_goodput_uploader()
-      max_logging.log("Flushed final metrics and safe exited from Goodput monitoring.")
+      try:
+        if config.monitor_step_time_deviation:
+          goodput_monitor.stop_step_deviation_uploader()
+      finally:
+        goodput_monitor.stop_goodput_uploader()
+        max_logging.log("Flushed final metrics and safe exited from Goodput monitoring.")
 
 
 @contextlib.contextmanager

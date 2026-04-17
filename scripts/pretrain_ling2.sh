@@ -118,6 +118,15 @@ VERTEX_TB_PROJECT=${VERTEX_TB_PROJECT:-""}
 VERTEX_TB_REGION=${VERTEX_TB_REGION:-""}
 
 # ============================================================================
+# 5c. Goodput Monitoring (on by default for Ling2 pretraining)
+# ============================================================================
+# Goodput recording/monitoring uploads job health metrics to Cloud Logging and
+# Tensorboard on the lead host. The CI stub (DECOUPLE_GCLOUD=TRUE) no-ops this.
+# Set ENABLE_GOODPUT=false to disable entirely (e.g. local debugging).
+ENABLE_GOODPUT=${ENABLE_GOODPUT:-true}
+MONITOR_STEP_TIME_DEVIATION=${MONITOR_STEP_TIME_DEVIATION:-true}
+
+# ============================================================================
 # 6. Start Training Command
 # ============================================================================
 echo "========================================================"
@@ -225,6 +234,11 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     use_vertex_tensorboard=$USE_VERTEX_TENSORBOARD \
     ${VERTEX_TB_PROJECT:+vertex_tensorboard_project=$VERTEX_TB_PROJECT} \
     ${VERTEX_TB_REGION:+vertex_tensorboard_region=$VERTEX_TB_REGION} \
+    \
+    `# --- Goodput Monitoring (controlled by ENV, defaults on) ---` \
+    enable_goodput_recording=$ENABLE_GOODPUT \
+    monitor_goodput=$ENABLE_GOODPUT \
+    monitor_step_time_deviation=$MONITOR_STEP_TIME_DEVIATION \
     \
     `# --- Profiler (optional, controlled by ENV) ---` \
     ${PROFILER:+profiler=$PROFILER} \
