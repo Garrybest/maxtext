@@ -324,6 +324,9 @@ def _get_module_method(module, method: tp.Callable[..., Any] | str | None):
   return method
 
 
+_qwix_scope_prefix_stack: list[tuple] = []
+
+
 def _fix_for_qwix_quantization(module: Module):
   """Process the nnx module to make it compatible with QWIX quantization.
 
@@ -334,24 +337,41 @@ def _fix_for_qwix_quantization(module: Module):
 
   This function will fix those issues.
 
+  When a ToNNX module calls .apply(), the Linen scope path resets to ().
+  This breaks QWIX module_path matching for nested modules (e.g. MTP
+  transformer layers). We solve this by propagating the outer scope path
+  through a module-level stack so that inner _fix_for_qwix_quantization
+  calls can restore the full path prefix.
+
   Args:
     module: The NNX module to be processed.
   """
+  prefix = _qwix_scope_prefix_stack[-1] if _qwix_scope_prefix_stack else ()
 
   # Wrap the __call__ function of the nnx modules to make sure the linen module
   # path is updated correctly.
-  def wrap(call_fn, name: str):
+  def wrap(call_fn, name: str, is_tonnx: bool = False, is_root: bool = False):
     def wrapped(*args, **kwargs):
       if not linen.module._context.module_stack:  # pylint: disable=W0212
         return call_fn(*args, **kwargs)
       nn_module = linen.module._context.module_stack[-1]  # pylint: disable=W0212
-      old_path = nn_module.path
-      # We modify the path of the current nn module in place. This is a little
-      # bit hacky but should be good as a temporary solution.
-      nn_module.scope.path += (name,)
+      old_path = nn_module.scope.path
+      # For root-level children inside a ToNNX boundary, restore the full
+      # outer prefix so that QWIX sees the complete module path.
+      if is_root and prefix:
+        nn_module.scope.path = prefix + (name,)
+      else:
+        nn_module.scope.path += (name,)
+      # For ToNNX nodes, push the current scope path so that the inner
+      # _fix_for_qwix_quantization (triggered by .apply() → ToLinen) can
+      # read it as the prefix.
+      if is_tonnx:
+        _qwix_scope_prefix_stack.append(nn_module.scope.path)
       try:
         return call_fn(*args, **kwargs)
       finally:
+        if is_tonnx:
+          _qwix_scope_prefix_stack.pop()
         nn_module.scope.path = old_path
 
     return wrapped
@@ -359,11 +379,18 @@ def _fix_for_qwix_quantization(module: Module):
   for path, node in nnx.iter_graph(module):
     # Only enable it on non-root nnx modules.
     if path and isinstance(node, nnx.Module):
+      is_tonnx = isinstance(node, ToNNX)
+      is_root = bool(prefix) and len(path) == 1
       node.__class__ = type(
           node.__class__.__name__,
           (node.__class__,),
           {
-              "__call__": wrap(node.__class__.__call__, str(path[-1])),
+              "__call__": wrap(
+                  node.__class__.__call__,
+                  str(path[-1]),
+                  is_tonnx=is_tonnx,
+                  is_root=is_root,
+              ),
           },
       )
 
