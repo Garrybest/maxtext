@@ -103,6 +103,7 @@ class DecoderBlockType(enum.Enum):
   LLAMA4 = "llama4"
   OLMO3 = "olmo3"
   LING2 = "ling2"
+  LING3 = "ling3"
 
 
 class AttentionType(enum.Enum):

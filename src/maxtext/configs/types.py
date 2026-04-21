@@ -265,6 +265,7 @@ ModelName = Literal[
     "olmo3-7b-pt",
     "olmo3-32b",
     "ling2",
+    "ling3-tiny",
 ]
 
 
@@ -560,6 +561,62 @@ class MlaAttention(BaseModel):
           "Whether to de-interleave RoPE dimensions before applying rotary embedding "
           "in MLA. When True, reorders [d0, d1, d2, d3, ...] -> [d0, d2, ..., d1, d3, ...] "
           "to match the non-interleaved RoPE convention."
+      ),
+  )
+  enable_gated_attention: bool = Field(
+      False,
+      description=(
+          "Whether to enable gated attention output for MLA layers in Ling3. "
+          "When True, applies a learnable gating mechanism (sigmoid-activated projection) "
+          "to the MLA attention output with per-head granularity (head_wise) using "
+          "linear_qkv_input as the gate input. "
+          "This is a Ling3-specific feature that adds a gate to MLA layer output, different from "
+          "the 'Gated' in GLA (which gates the attention computation itself). "
+          "Ling3 uses True for improved training stability and model quality. "
+          "Note: When enabled, the granularity is fixed to 'head_wise' and input tensor "
+          "is fixed to 'linear_qkv_input' as per Ling3 design."
+      ),
+  )
+
+
+class KdaAttention(BaseModel):
+  """KDA (Kimi Delta Attention) configuration.
+
+  KDA is a linear attention mechanism used by Ling3, distinct from GLA (used by Ling2).
+  These fields are placed in a separate class from MlaAttention for clear responsibility separation.
+  """
+
+  linear_conv_kernel_dim: int = Field(
+      4,
+      description=(
+          "Convolution kernel dimension for linear attention layers (KDA). "
+          "This specifies the size of the 1D convolution applied to keys for local dependency modeling. "
+          "Ling3 uses 4 to match Megatron reference implementation."
+      ),
+  )
+  use_kda_lora: bool = Field(
+      False,
+      description=(
+          "Whether to use LoRA (Low-Rank Adaptation) style decomposition in KDA layers. "
+          "When True, uses low-rank factorization for KDA computation. "
+          "When False, uses full-rank projections. "
+          "Ling3 uses this default to match Megatron reference implementation."
+      ),
+  )
+  use_kda_safe_gate: bool = Field(
+      False,
+      description=(
+          "Whether to use numerically safe gate computation in KDA layers. "
+          "When True, applies value clamping and safe operations to prevent gate value explosion "
+          "during training. Ling3 uses True for improved training stability."
+      ),
+  )
+  kda_lower_bound: float = Field(
+      0.0,
+      description=(
+          "Lower bound for gate values in KDA layers. Prevents gate values from "
+          "becoming too small (highly negative) during training, which can cause numerical instability. "
+          "Ling3 uses -5.0 as the lower bound."
       ),
   )
 
@@ -2021,6 +2078,7 @@ class MaxTextConfig(
     # Attention Mechanisms
     Attention,
     MlaAttention,
+    KdaAttention,
     MoBa,
     AttentionIndexer,
     Llama4Attention,
@@ -2588,9 +2646,9 @@ class MaxTextConfig(
       if (
           self.routed_bias
           and self.routed_bias_update_rate > 0.0
-          and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2)
+          and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3)
       ):
-        raise ValueError("Loss-free load balancing is only supported for the DeepSeek and Ling2 decoder blocks.")
+        raise ValueError("Loss-free load balancing is only supported for the DeepSeek, Ling2 and Ling3 decoder blocks.")
     if self.use_multimodal:
       valid_mm_models = (
           "gemma3-4b",
@@ -2658,7 +2716,7 @@ class MaxTextConfig(
             f"The number of decoder layers ({self.base_num_decoder_layers}) must be divisible by interleave moe layer step "
             f"({self.interleave_moe_layer_step})"
         )
-    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.LING2):
+    if self.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.LING2, DecoderBlockType.LING3):
       if self.decoder_block == DecoderBlockType.QWEN3_NEXT:
         if int(self.gdn_num_value_heads) % int(self.gdn_num_key_heads) != 0:
           raise ValueError("gdn_num_value_heads must be divisible by gdn_num_key_heads")
@@ -2668,7 +2726,7 @@ class MaxTextConfig(
     else:
       if self.partial_rotary_factor is not None and self.partial_rotary_factor != 1.0:
         raise ValueError(
-            "`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next' or 'ling2'."
+            "`partial_rotary_factor` is only effective when `decoder_block` is set to 'qwen3_next', 'ling2' or 'ling3'."
         )
 
     tokenizer_path = getattr(self, "tokenizer_path", None)

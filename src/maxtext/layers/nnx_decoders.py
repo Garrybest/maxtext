@@ -515,6 +515,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.LLAMA4: get_scannable(llama4.Llama4DecoderLayer, llama4.Llama4ScannableBlock),
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
         DecoderBlockType.LING2: NotImplemented,  # TODO(PR2): replace with actual Ling2 decoder layers
+        DecoderBlockType.LING3: NotImplemented,  # TODO: replace with actual Ling3 decoder layers
     }
 
     if cfg.decoder_block not in layer_map:
