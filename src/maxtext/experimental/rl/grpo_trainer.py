@@ -85,9 +85,6 @@ from maxtext.experimental.rl import grpo_input_pipeline
 from maxtext.experimental.rl import grpo_utils
 from maxtext.common.metric_logger import MetricLogger
 from maxtext.common.vertex_tensorboard import VertexTensorboardManager
-
-vertex_tensorboard_manager = None
-
 from maxtext.inference import offline_engine
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
@@ -949,7 +946,7 @@ def main(argv: Sequence[str]) -> None:
   max_utils.print_system_information()
   train_utils.validate_train_config(config)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path
-  global vertex_tensorboard_manager  # pylint: disable=global-statement
+  # Hold the manager so its uploader thread is stopped on scope exit.
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
     vertex_tensorboard_manager.configure_vertex_tensorboard(config)

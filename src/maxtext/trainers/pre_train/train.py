@@ -74,7 +74,6 @@ from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss
 _diag_modules = _cloud_diag()
 diagnostic, debug_configuration, diagnostic_configuration, stack_trace_configuration = _diag_modules
 VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
-vertex_tensorboard_manager = None
 
 
 def get_first_step(state):
@@ -910,8 +909,12 @@ def train_loop(config, recorder, state=None):
   return state
 
 
-def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]:
-  """Initialization of hyperparameters and utilities"""
+def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any, Any]:
+  """Initialization of hyperparameters and utilities.
+
+  Returns ``vertex_tensorboard_manager`` so the caller can keep it alive for
+  the full training lifetime (its uploader thread is stopped on GC).
+  """
   pathwaysutils.initialize()
   jax.config.update("jax_default_prng_impl", "unsafe_rbg")
   # TF allocates extraneous GPU memory when using TFDS data
@@ -931,7 +934,6 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
   if config.shard_mode == ShardMode.EXPLICIT:
     jax.config.update("jax_remove_size_one_mesh_axis_from_type", True)
   os.environ["TFDS_DATA_DIR"] = config.dataset_path or ""
-  global vertex_tensorboard_manager  # pylint: disable=global-statement
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
     vertex_tensorboard_manager.configure_vertex_tensorboard(config)
@@ -948,7 +950,7 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any, Any]
       )
   )
   diagnostic_config = diagnostic_configuration.DiagnosticConfig(debug_config)
-  return config, recorder, diagnostic_config
+  return config, recorder, diagnostic_config, vertex_tensorboard_manager
 
 
 def run(config, recorder, diagnostic_config):
@@ -974,7 +976,8 @@ def run(config, recorder, diagnostic_config):
 
 
 def main(argv: Sequence[str]) -> None:
-  config, recorder, diagnostic_config = initialize(argv)
+  # Hold the manager so its uploader thread is stopped on scope exit.
+  config, recorder, diagnostic_config, unused_vertex_tensorboard_manager = initialize(argv)
   record_goodput(recorder, RECORD_JOB_START_TIME)
   with maybe_monitor_goodput(config):
     run(config, recorder, diagnostic_config)
