@@ -160,21 +160,21 @@ class GmmMoEForwardTest(unittest.TestCase):
     print(f"  Running MaxText MoE forward (input={cls.mg_input.shape})...")
     cls.mx_data = run_maxtext_forward(cls.model, cls.mg_input, cls.args)
 
-  def test_moe_output(self):
-    """MoE output cosine similarity and relative L2 within thresholds."""
+  def test_moe_output_cosine(self):
+    """MoE output cosine similarity exceeds threshold."""
     metrics = self._compare_pair(self.mx_data["moe_output"], self.mg_output)
     print(
         f"\n  moe_output: cosine={metrics['cosine']:.6f} "
         f"rel_l2={metrics['rel_l2']:.3e} max_abs={metrics['max_abs']:.3e}"
     )
     self.assertGreater(
-        metrics["cosine"], MOE_FWD_MIN_COSINE,
-        f"Cosine similarity {metrics['cosine']:.6f} < {MOE_FWD_MIN_COSINE}"
+        metrics["cosine"], MOE_FWD_MIN_COSINE, f"Cosine similarity {metrics['cosine']:.6f} < {MOE_FWD_MIN_COSINE}"
     )
-    self.assertLess(
-        metrics["rel_l2"], MOE_FWD_MAX_REL_L2,
-        f"Relative L2 {metrics['rel_l2']:.3e} >= {MOE_FWD_MAX_REL_L2}"
-    )
+
+  def test_moe_output_rel_l2(self):
+    """MoE output relative L2 norm within threshold."""
+    metrics = self._compare_pair(self.mx_data["moe_output"], self.mg_output)
+    self.assertLess(metrics["rel_l2"], MOE_FWD_MAX_REL_L2, f"Relative L2 {metrics['rel_l2']:.3e} >= {MOE_FWD_MAX_REL_L2}")
 
   def test_shared_expert_output(self):
     """Shared expert output matches if present in both frameworks."""
