@@ -24,9 +24,9 @@ jobs:
           cluster_name: ${{ secrets.GKE_CLUSTER }}
           location: ${{ secrets.GKE_LOCATION }}
 
-      - name: Delete CI resources older than 2 hours
+      - name: Delete CI resources older than 4 hours
         run: |
-          THRESHOLD=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          THRESHOLD=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           FOUND=0
 
           for APP_LABEL in ci-smoke-test ci-unit-tests; do
@@ -69,7 +69,7 @@ jobs:
 
       - name: Check and reset stuck pods
         run: |
-          TIMEOUT_SECONDS=4200  # 70 min (gives workflow timeout-minutes:60 time to fire first)
+          TIMEOUT_SECONDS=9900  # 165 min (> unit_tests.yml timeout-minutes:120, leaves 45 min for workflow to self-cleanup)
           NOW=$(date -u +%s)
 
           reset_pod() {
