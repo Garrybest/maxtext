@@ -241,7 +241,7 @@ def create_orbax_checkpoint_manager(
       )
   }
 
-  if dataset_type == "grain":
+  if dataset_type in ("grain", "lazy"):
     item_names += ("iter",)
     item_handlers["iter"] = GrainCheckpointHandler()
 
@@ -610,7 +610,7 @@ def load_state_if_possible(
             dataset_type,
             data_iterator,
         ) if (
-            dataset_type == "grain"
+            dataset_type in ("grain", "lazy")
             and data_iterator
             and not isinstance(data_iterator, PlaceHolderDataIterator)
             and not _is_remote_iterator(data_iterator)
@@ -777,7 +777,7 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
 
   if (
       config
-      and config.dataset_type == "grain"
+      and config.dataset_type in ("grain", "lazy")
       and not isinstance(data_iterator, PlaceHolderDataIterator)
       and not _is_remote_iterator(data_iterator)
   ):

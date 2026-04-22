@@ -1013,10 +1013,18 @@ class MegatronSplitInputsTargets(grain.MapTransform):
       all positions participate in loss.
   """
 
-  def __init__(self, eod_id: int, reset_attention_mask: bool = True, eod_mask_loss: bool = False):
+  def __init__(
+      self,
+      eod_id: int,
+      reset_attention_mask: bool = True,
+      eod_mask_loss: bool = False,
+      no_attnmask_dataset_ids: set[int] | None = None,
+  ):
     self.eod_id = eod_id
     self.reset_attention_mask = reset_attention_mask
     self.eod_mask_loss = eod_mask_loss
+    self.no_attnmask_dataset_ids = no_attnmask_dataset_ids or set()
+    self._has_no_attnmask = bool(self.no_attnmask_dataset_ids)
 
   def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Split tokens into input/target pairs with EOD-based segmentation."""
@@ -1027,8 +1035,16 @@ class MegatronSplitInputsTargets(grain.MapTransform):
     seq_len = inputs.shape[0]
     is_eod = inputs == self.eod_id
 
+    # Per-sample override: datasets in no_attnmask_dataset_ids bypass
+    # attention mask reset (antllm no_attnmask_data behavior).
+    effective_reset = self.reset_attention_mask
+    if self._has_no_attnmask:
+      dataset_id = element.get("dataset_id", None)
+      if dataset_id is not None and int(dataset_id) in self.no_attnmask_dataset_ids:
+        effective_reset = False
+
     # --- inputs_segmentation (attention mask) ---
-    if self.reset_attention_mask:
+    if effective_reset:
       input_segmentation = np.zeros(seq_len, dtype=np.int32)
       position = np.zeros(seq_len, dtype=np.int32)
       seg_id = 1

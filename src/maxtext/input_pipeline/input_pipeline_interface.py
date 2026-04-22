@@ -27,6 +27,8 @@ from maxtext.input_pipeline.tfds_data_processing import make_tfds_train_iterator
 from maxtext.input_pipeline.tfds_data_processing import make_tfds_eval_iterator
 from maxtext.input_pipeline.tfds_data_processing_c4_mlperf import make_c4_mlperf_train_iterator
 from maxtext.input_pipeline.tfds_data_processing_c4_mlperf import make_c4_mlperf_eval_iterator
+from maxtext.input_pipeline.lazy_data_processing import make_lazy_train_iterator
+from maxtext.input_pipeline.lazy_data_processing import make_lazy_eval_iterator
 from maxtext.input_pipeline.synthetic_data_processing import SyntheticDataIterator
 from maxtext.input_pipeline.synthetic_data_processing import PlaceHolderDataIterator
 from maxtext.utils import max_logging
@@ -70,10 +72,11 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
       "grain": (make_grain_train_iterator, make_grain_eval_iterator),
       "hf": (make_hf_train_iterator, make_hf_eval_iterator),
       "c4_mlperf": (make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator),
+      "lazy": (make_lazy_train_iterator, make_lazy_eval_iterator),
   }
 
   # Collect train and eval iterators
-  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf"]:
+  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "lazy"]:
     if config.dataset_type == "c4_mlperf":
       assert config.packing, "c4_mlperf dataloader only works with packing. For padded version, use tfds dataloader"
     train_iterator, eval_iterator = dataset_type_to_train_eval_iterator[config.dataset_type]

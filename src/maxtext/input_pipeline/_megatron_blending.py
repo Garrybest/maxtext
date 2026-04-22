@@ -54,10 +54,13 @@ def build_blending_indices(
     raise ValueError(f"weights must have shape ({num_datasets},), got {weights.shape}")
   if np.any(weights <= 0):
     raise ValueError(f"weights must all be positive, got {weights.tolist()}")
-  if not np.isclose(np.sum(weights), 1.0, rtol=1e-6, atol=1e-8):
-    raise ValueError(f"weights must sum to 1.0, got sum={float(np.sum(weights))} for {weights.tolist()}")
+  # antllm normalizes by int(sum), so weights may not sum to exactly 1.0.
+  # Use a relaxed tolerance to avoid false rejections.
+  if not np.isclose(np.sum(weights), 1.0, rtol=1e-4, atol=1e-6):
+    raise ValueError(f"weights must sum to ~1.0, got sum={float(np.sum(weights))} for {weights.tolist()}")
 
   current_samples = np.zeros(num_datasets, dtype=np.int64)
+  log_interval = max(size // 20, 1)  # log every 5%
   for sample_idx in range(size):
     sample_idx_double = max(float(sample_idx), 1.0)
     errors = weights * sample_idx_double - current_samples
@@ -65,6 +68,8 @@ def build_blending_indices(
     dataset_index[sample_idx] = max_error_index
     dataset_sample_index[sample_idx] = current_samples[max_error_index]
     current_samples[max_error_index] += 1
+    if sample_idx % log_interval == 0 and sample_idx > 0:
+      logger.info("  build_blending_indices: %d/%d (%.0f%%)", sample_idx, size, 100.0 * sample_idx / size)
 
 
 _T = TypeVar("_T")
@@ -192,19 +197,23 @@ def _validate_indices(
   if num_datasets <= 0:
     raise ValueError(f"num_datasets must be positive, got {num_datasets}")
 
-  dataset_index_i64 = np.asarray(dataset_index, dtype=np.int64)
-  dataset_sample_index_i64 = np.asarray(dataset_sample_index, dtype=np.int64)
+  dataset_index_int = dataset_index
+  dataset_sample_index_int = dataset_sample_index
+  if dataset_index.dtype != np.int64:
+    dataset_index_int = dataset_index.astype(np.int64, copy=False)
+  if dataset_sample_index.dtype != np.int64:
+    dataset_sample_index_int = dataset_sample_index.astype(np.int64, copy=False)
 
-  if np.any(dataset_index_i64 < 0) or np.any(dataset_index_i64 >= num_datasets):
-    min_value = int(np.min(dataset_index_i64))
-    max_value = int(np.max(dataset_index_i64))
+  if np.any(dataset_index_int < 0) or np.any(dataset_index_int >= num_datasets):
+    min_value = int(np.min(dataset_index_int))
+    max_value = int(np.max(dataset_index_int))
     raise ValueError("dataset_index out of range: " f"min={min_value}, max={max_value}, num_datasets={num_datasets}")
-  if np.any(dataset_sample_index_i64 < 0):
-    min_value = int(np.min(dataset_sample_index_i64))
+  if np.any(dataset_sample_index_int < 0):
+    min_value = int(np.min(dataset_sample_index_int))
     raise ValueError(f"dataset_sample_index contains negative values (min={min_value})")
 
   for dataset_id in range(num_datasets):
-    used_sample_ids = dataset_sample_index_i64[dataset_index_i64 == dataset_id]
+    used_sample_ids = dataset_sample_index_int[dataset_index_int == dataset_id]
     if used_sample_ids.size == 0:
       continue
     expected = np.arange(used_sample_ids.size, dtype=np.int64)
@@ -220,7 +229,7 @@ def _validate_indices(
 
   if len(dataset_lengths) != num_datasets:
     raise ValueError(f"dataset_lengths length mismatch: expected {num_datasets}, got {len(dataset_lengths)}")
-  required_samples = np.bincount(dataset_index_i64, minlength=num_datasets)
+  required_samples = np.bincount(dataset_index_int, minlength=num_datasets)
   for dataset_id, required in enumerate(required_samples.tolist()):
     available = int(dataset_lengths[dataset_id])
     if required > available:

@@ -1246,6 +1246,74 @@ class MMapDataset(BaseModel):
   )
 
 
+class LazyDataset(BaseModel):
+  """Configuration for antllm .scatter/.lazy data format (dataset_type='lazy')."""
+
+  lazy_train_files: str = Field("", description="Scatter paths: 'w1 path1 w2 path2' or single 'path'.")
+  lazy_valid_files: str = Field("", description="Separate validation scatter path (optional).")
+  lazy_test_files: str = Field("", description="Separate test scatter path (optional).")
+  lazy_data_root: PathStr = Field("", description="Root dir; paths resolved as {root}/{name}.scatter.")
+  lazy_split: str = Field("", description="Split-from-train ratio, e.g. '0.98,0.01,0.01'.")
+  lazy_data_type: str = Field("text", description="Field name inside .lazy directory.")
+  lazy_loader_mode: Literal["sliding_window", "map", "pack"] = Field(
+      "sliding_window", description="Loader mode: sliding_window, map, or pack."
+  )
+  lazy_eos_token_id: int = Field(2, description="EOS token ID for document boundary injection.")
+  lazy_cls_token_id: int = Field(-1, description="CLS token ID (-1 = disabled).")
+  lazy_add_cls: bool = Field(False, description="Prepend CLS at each document segment.")
+  lazy_drop_last: bool = Field(True, description="Drop last incomplete sample.")
+  lazy_index_mapping_path: PathStr = Field("", description="Map mode: directory with index_mapping.npy.")
+  lazy_bin_index_path: PathStr = Field("", description="Pack mode: directory with index_offset.bin + lens.npy.")
+  lazy_loader_online_shuffle: bool = Field(False, description="Per-epoch online shuffle of sample indices.")
+  lazy_loader_seed: int = Field(1234, description="Seed for online shuffle.")
+  lazy_blend_shuffle_seed: int = Field(-1, description="Blend index shuffle seed (-1 = no shuffle).")
+  lazy_blend_shuffle_only_dataset: bool = Field(
+      False, description="Only shuffle dataset_index; regenerate dataset_sample_index per dataset."
+  )
+  lazy_dataset_weight_mode: Literal["ratio", "epoch"] = Field("ratio", description="Weight mode: 'ratio' or 'epoch'.")
+  lazy_data_size_B_tokens: float = Field(0, description="Total tokens in billions (ratio mode).")
+  lazy_loader_scatter: int = Field(
+      -1,
+      description=(
+          "Scatter shard grouping. -1=all shards on every host (default). "
+          "Positive N: each host reads 1 shard (scatter_id=rank%%N), requires N shards. "
+          "Negative -N: merge mode, each host reads total_shards/N shards. "
+          "abs(value) must divide jax.process_count()."
+      ),
+  )
+  lazy_blend_cache_dir: PathStr = Field(
+      "",
+      description=(
+          "Cache directory for lazy blending indices (dataset_index / dataset_sample_index). "
+          "When set, indices are saved after first computation and reloaded on subsequent runs."
+      ),
+  )
+  lazy_bfd_pack: str = Field(
+      "",
+      description=(
+          "Per-dataset BFD pack control. 'ALL' = all datasets use pack mode. "
+          "Comma-separated dataset names (e.g. 'ds1,ds2') = only those datasets use pack, "
+          "rest use sliding_window. Empty = use lazy_loader_mode globally (backward compatible)."
+      ),
+  )
+  lazy_no_attnmask_data: str = Field(
+      "",
+      description=(
+          "Comma-separated dataset names that should NOT use attention mask reset, "
+          "even when reset_attention_mask=True. Samples from these datasets get "
+          "all-ones segmentation (cross-document attention). Matches antllm no_attnmask_data."
+      ),
+  )
+  lazy_bfd_pack_sort_by_lens: bool = Field(
+      False,
+      description="Sort documents by length (descending remainder) before BFD packing.",
+  )
+  lazy_pack_divisible_by: int = Field(
+      -1,
+      description="Round up packing lengths to multiples of this value (-1 = disabled).",
+  )
+
+
 class FineTuning(BaseModel):
   """Configuration for fine-tuning methods like DPO, SFT, and GRPO."""
 
@@ -2123,6 +2191,7 @@ class MaxTextConfig(
     HfDataset,
     GrainDataset,
     MMapDataset,
+    LazyDataset,
     Tokenizer,
     # Inference
     InferenceGeneral,
