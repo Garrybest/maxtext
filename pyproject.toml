@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "tops @ git+https://github.com/primatrix/pallas-kernel.git@release/v0.3",
+    "tops @ git+https://github.com/primatrix/pallas-kernel.git@release/v0.5",
     "tokamax @ git+https://github.com/primatrix/tokamax.git@main",
 ]
 
