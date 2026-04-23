@@ -18,6 +18,9 @@ BASE_OUTPUT_DIR=${GCS_BUCKET:-"gs://ant-pretrain/pretrain/dev"}
 RUN_NAME=${RUN_NAME:-"ling2-pretrain-$(date +%Y%m%d-%H%M)"}
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${RUN_NAME}"
 
+# JAX compilation cache: GCS path for multi-host sharing (one host compiles, all reuse).
+JAX_CACHE_DIR=${JAX_CACHE_DIR:-"${BASE_OUTPUT_DIR}/jax_cache"}
+
 # ============================================================================
 # 3. JAX Multi-node Config (Auto-detect)
 # ============================================================================
@@ -227,6 +230,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     async_checkpointing=false \
     gcs_metrics=false \
     save_config_to_gcs=false \
+    jax_cache_dir=$JAX_CACHE_DIR \
     load_parameters_path=/models/gpu-ckpt-ling2.5/ling2.5-maxtext/0/items/ \
     log_period=10 \
     \
