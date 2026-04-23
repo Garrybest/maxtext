@@ -3,8 +3,18 @@ name: Unit Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'tests/**'
+      - 'docs/**'
+      - '.github/**'
+      - '**/*.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'tests/**'
+      - 'docs/**'
+      - '.github/**'
+      - '**/*.md'
   workflow_dispatch:
     inputs:
       branch:
@@ -36,9 +46,32 @@ jobs:
       id-token: write
     timeout-minutes: 120
     steps:
+      - name: Resolve test target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_BRANCH: ${{ github.event.inputs.branch || '' }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$DISPATCH_BRANCH" ]; then
+            echo "checkout_ref=$DISPATCH_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$DISPATCH_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+          ref: ${{ steps.target.outputs.checkout_ref }}
 
       - name: Resolve dump directory
         id: dump
@@ -87,7 +120,8 @@ jobs:
         if: env.USE_TPU_POOL == 'true'
         env:
           POD: ${{ steps.acquire.outputs.pod }}
-          BRANCH: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+          TARGET_REF: ${{ steps.target.outputs.pod_ref }}
+          EXPECTED_SHA: ${{ steps.target.outputs.expected_sha }}
           TOKEN: ${{ github.token }}
           CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           JOB_NAME: ${{ steps.job.outputs.name }}
@@ -99,12 +133,22 @@ jobs:
           # Clean previous workspace, venv, and ramdisk data
           kubectl exec "$POD" -- find /workspace /opt/ci-env /tmp/ramdisk -mindepth 1 -delete
 
-          # 1. Clone code using per-run ephemeral token via stdin
+          # 1. Fetch the exact workflow target using an immutable ref when available.
           echo "$TOKEN" | kubectl exec -i "$POD" -- bash -c '
             read -r GITHUB_TOKEN
-            git clone --depth=1 --branch="'"$BRANCH"'" \
-              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git" \
-              /workspace/maxtext
+            git init /workspace/maxtext
+            cd /workspace/maxtext
+            git remote add origin \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git"
+            git fetch --depth=1 origin "'"$TARGET_REF"'"
+            git checkout --detach FETCH_HEAD
+
+            ACTUAL_SHA=$(git rev-parse HEAD)
+            EXPECTED_SHA="'"$EXPECTED_SHA"'"
+            if [ -n "${EXPECTED_SHA}" ] && [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+              echo "ERROR: checked out ${ACTUAL_SHA}, expected ${EXPECTED_SHA}" >&2
+              exit 1
+            fi
           '
 
           # Clone Argus using cross-repo token
@@ -435,7 +479,7 @@ jobs:
         if: env.USE_TPU_POOL != 'true'
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
-          BRANCH: ${{ github.event.inputs.branch || github.head_ref || github.ref_name }}
+          BRANCH: ${{ steps.target.outputs.pod_ref }}
           DUMP_DIR: ${{ steps.dump.outputs.dir }}
           CKPT_PATH: ${{ github.event.inputs.ckpt_path || '/models/gpu-ckpt-ling2.5/AL_MODEL_HF20E256_ORBAX_MTP/0/items/' }}
           BRANCH_LABEL: ${{ steps.branch.outputs.label }}

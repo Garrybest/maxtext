@@ -5,10 +5,16 @@ on:
     branches: [main]
     paths-ignore:
       - 'tests/**'
+      - 'docs/**'
+      - '.github/**'
+      - '**/*.md'
   pull_request:
     branches: [main]
     paths-ignore:
       - 'tests/**'
+      - 'docs/**'
+      - '.github/**'
+      - '**/*.md'
   workflow_dispatch:
 
 concurrency:
@@ -27,7 +33,26 @@ jobs:
       id-token: write
     timeout-minutes: 60
     steps:
+      - name: Resolve test target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.checkout_ref }}
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -63,7 +88,8 @@ jobs:
         if: env.USE_TPU_POOL == 'true'
         env:
           POD: ${{ steps.acquire.outputs.pod }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
+          TARGET_REF: ${{ steps.target.outputs.pod_ref }}
+          EXPECTED_SHA: ${{ steps.target.outputs.expected_sha }}
           TOKEN: ${{ github.token }}
           CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           JOB_NAME: ${{ steps.job.outputs.name }}
@@ -73,12 +99,22 @@ jobs:
           # Clean previous workspace and venv
           kubectl exec "$POD" -- find /workspace /opt/ci-env -mindepth 1 -delete
 
-          # Clone code using per-run ephemeral token via stdin
+          # Fetch the exact workflow target using an immutable ref when available.
           echo "$TOKEN" | kubectl exec -i "$POD" -- bash -c '
             read -r GITHUB_TOKEN
-            git clone --depth=1 --branch="'"$BRANCH"'" \
-              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git" \
-              /workspace/maxtext
+            git init /workspace/maxtext
+            cd /workspace/maxtext
+            git remote add origin \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git"
+            git fetch --depth=1 origin "'"$TARGET_REF"'"
+            git checkout --detach FETCH_HEAD
+
+            ACTUAL_SHA=$(git rev-parse HEAD)
+            EXPECTED_SHA="'"$EXPECTED_SHA"'"
+            if [ -n "${EXPECTED_SHA}" ] && [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+              echo "ERROR: checked out ${ACTUAL_SHA}, expected ${EXPECTED_SHA}" >&2
+              exit 1
+            fi
           '
 
           # Fresh venv + full install
@@ -149,7 +185,7 @@ jobs:
         if: env.USE_TPU_POOL != 'true'
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BRANCH: ${{ steps.target.outputs.pod_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BRANCH_LABEL: ${{ steps.branch.outputs.label }}
         run: |

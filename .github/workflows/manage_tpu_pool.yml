@@ -1,0 +1,79 @@
+name: Manage TPU Pool
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Preview or apply the shared TPU pool manifest"
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - apply
+
+concurrency:
+  group: ci-tpu-pool-manage-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  manage_pool:
+    name: "${{ github.event.inputs.action == 'apply' && 'Apply' || 'Plan' }} TPU pool"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Show target revision
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "SHA: $GITHUB_SHA"
+          echo "Action: ${{ github.event.inputs.action }}"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Preview TPU pool changes
+        run: |
+          set +e
+          kubectl diff -f .github/ci/tpu-pool-deployment.yaml
+          DIFF_EXIT=$?
+          set -e
+
+          if [ "$DIFF_EXIT" -eq 0 ]; then
+            echo "TPU pool is already up to date."
+          elif [ "$DIFF_EXIT" -eq 1 ]; then
+            echo "TPU pool diff detected."
+          else
+            echo "kubectl diff failed with exit code $DIFF_EXIT" >&2
+            exit "$DIFF_EXIT"
+          fi
+
+      - name: Apply TPU pool manifest
+        if: github.event.inputs.action == 'apply'
+        run: kubectl apply -f .github/ci/tpu-pool-deployment.yaml
+
+      - name: Wait for TPU pool rollout
+        if: github.event.inputs.action == 'apply'
+        run: kubectl rollout status deployment/ci-tpu-pool --timeout=10m
+
+      - name: Show TPU pool status
+        if: always()
+        run: |
+          kubectl get deployment ci-tpu-pool -o wide || true
+          kubectl get pods -l "pool=ci-tpu" -o wide || true

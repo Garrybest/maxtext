@@ -27,11 +27,13 @@ if [[ -z "${TASK_TYPE:-}" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Ensure TPU pool deployment exists (auto-bootstrap)
+# 2. Ensure TPU pool infrastructure already exists
 # ---------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "Ensuring TPU pool infrastructure is up to date..."
-kubectl apply -f "${SCRIPT_DIR}/tpu-pool-deployment.yaml"
+if ! kubectl get deployment ci-tpu-pool >/dev/null 2>&1; then
+  echo "ERROR: TPU pool deployment 'ci-tpu-pool' was not found." >&2
+  echo "Run the Manage TPU Pool workflow with action=apply before starting TPU CI jobs." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Pool status summary
