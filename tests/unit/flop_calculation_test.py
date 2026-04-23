@@ -560,3 +560,267 @@ class FlopCalculation(unittest.TestCase):
     )
     calculated_tflops, _, _ = calculate_tflops_training_per_device(cfg)
     self.assertFlopsAlmostEqual(calculated_tflops, golden_tflops)
+
+  # ============================================================================
+  # Ling2 FLOPs tests
+  #
+  # Scope note (shared by all tests below): because the golden formulas in
+  # compute_ling2_attention_flops_per_device and compute_ling2_weight_flops_per_device
+  # are derived from the same per-component equations used internally by
+  # calculate_gla_flops_per_device / calculate_tflops_training_per_device,
+  # these tests are strong at catching *integration/wiring* regressions
+  # (layer counts, x3 factor, MTP accumulation, shared-expert fallback,
+  # MLA/GLA layer split) but weak at catching *formula-internal* bugs (a
+  # typo in e.g. the query_key_value FLOPs expression would be duplicated in
+  # both the production helper and the golden compute helper). This matches
+  # the convention used by other tests in this file (test_qwen3_next_flops,
+  # test_deepseek2_16b_flops, etc.) — there is no independent ground-truth
+  # FLOPs source short of running the actual kernel and running jax cost
+  # analysis, which is out of scope for unit tests.
+  # ============================================================================
+
+  def _ling2_default_kwargs(self) -> dict:
+    """Default kwargs for Ling2 FLOPs tests (mirrors ling2.yml; explicit for stability)."""
+    return {
+        "model_name": "ling2",
+        "override_model_config": True,
+        # Workload
+        "per_device_batch_size": 1,
+        "max_target_length": 4096,
+        "skip_jax_distributed_system": True,
+        # Architecture
+        "base_emb_dim": 2048,
+        "base_num_decoder_layers": 20,
+        "first_num_dense_layers": 1,
+        "vocab_size": 157184,
+        "base_mlp_dim": 5120,
+        "mlp_activations": ["silu", "linear"],
+        # Hybrid attention
+        "inhomogeneous_layer_cycle_interval": 5,
+        "base_num_query_heads": 16,
+        "base_num_kv_heads": 16,
+        "head_dim": 128,
+        # MLA
+        "attention_type": "mla",
+        "q_lora_rank": 256,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        # MoE
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "shared_experts": 1,
+        "base_moe_mlp_dim": 512,
+        "moe_shared_expert_dim": 2048,
+        # MTP
+        "mtp_num_layers": 1,
+    }
+
+  def compute_ling2_attention_flops_per_device(self, kwargs: dict) -> float:
+    """Computes attention TFLOPs per device for Ling2 (MLA + GLA + MTP MLA).
+
+    MLA layer count follows models/ling2.py:95-97 runtime rule: floor(N / cycle),
+    NO last-layer fallback. Returns TFLOPs (with x3 fwd+bwd applied).
+    """
+    B = kwargs["per_device_batch_size"]
+    S = kwargs["max_target_length"]
+    N = kwargs["base_num_decoder_layers"]
+    cycle = kwargs["inhomogeneous_layer_cycle_interval"]
+    num_mla = N // cycle
+    num_gla = N - num_mla
+    mtp = kwargs.get("mtp_num_layers", 0)
+
+    # MLA causal attention per layer (causal /2 already applied):
+    # 2 * B * S^2 * H * (qk_nope + qk_rope + v_head) / 2
+    H = kwargs["base_num_query_heads"]
+    qk_sum = kwargs["qk_nope_head_dim"] + kwargs["qk_rope_head_dim"]
+    v_head = kwargs["v_head_dim"]
+    mla_attn_per_layer = B * (S**2) * H * (qk_sum + v_head)
+
+    # GLA chunk kernel core per layer (intra + inter, chunk_size=64 from attention_gla.py:243):
+    D = kwargs["head_dim"]
+    chunk_size = 64
+    gla_intra = 2 * B * S * H * chunk_size * (D + D)
+    gla_inter = 4 * B * S * H * D * D
+    gla_attn_per_layer = gla_intra + gla_inter
+
+    # MTP layers are MLA (per models/ling2.py:95-97 layer_idx >= num_decoder_layers branch).
+    total_attn = mla_attn_per_layer * num_mla + gla_attn_per_layer * num_gla + mla_attn_per_layer * mtp
+    return 3 * total_attn / 1e12  # x3 fwd+bwd, return TFLOPs
+
+  def compute_ling2_weight_flops_per_device(self, kwargs: dict) -> float:
+    """Computes weight TFLOPs per device for Ling2.
+
+    Includes: output logits, dense FFN (first layer), MoE FFN (gate + shared + routed),
+    MLA projections, GLA projections, and MTP block (projection + MLA + MoE FFN + extra logits).
+    Returns TFLOPs (with x3 fwd+bwd applied).
+    """
+    B = kwargs["per_device_batch_size"]
+    S = kwargs["max_target_length"]
+    N = kwargs["base_num_decoder_layers"]
+    E = kwargs["base_emb_dim"]
+    V = kwargs["vocab_size"]
+    H = kwargs["base_num_query_heads"]
+    H_kv = kwargs["base_num_kv_heads"]
+    D = kwargs["head_dim"]
+    cycle = kwargs["inhomogeneous_layer_cycle_interval"]
+
+    num_dense = kwargs["first_num_dense_layers"]
+    num_moe = N - num_dense
+    num_mla = N // cycle
+    num_gla = N - num_mla
+    mtp = kwargs.get("mtp_num_layers", 0)
+
+    n_acts = len(kwargs["mlp_activations"])
+    mlp_dim = kwargs["base_mlp_dim"]
+    moe_mlp_dim = kwargs["base_moe_mlp_dim"]
+    shared_expert_dim = kwargs["moe_shared_expert_dim"] or moe_mlp_dim
+
+    q_lora = kwargs["q_lora_rank"]
+    kv_lora = kwargs["kv_lora_rank"]
+    qk_nope = kwargs["qk_nope_head_dim"]
+    qk_rope = kwargs["qk_rope_head_dim"]
+    v_head = kwargs["v_head_dim"]
+    qk_sum = qk_nope + qk_rope
+
+    BS = B * S
+
+    embedding_flops = 2 * BS * E * V
+
+    dense_ffn_per_layer = 2 * BS * E * mlp_dim * (n_acts + 1)
+    dense_ffn = dense_ffn_per_layer * num_dense
+
+    moe_gate = 2 * BS * E * kwargs["num_experts"]
+    moe_shared = 2 * BS * E * shared_expert_dim * (n_acts + 1) * kwargs["shared_experts"]
+    moe_routed = 2 * BS * E * moe_mlp_dim * (n_acts + 1) * kwargs["num_experts_per_tok"]
+    moe_ffn_per_layer = moe_gate + moe_shared + moe_routed
+    moe_ffn = moe_ffn_per_layer * num_moe
+
+    if q_lora > 0:
+      mla_q = 2 * BS * (E * q_lora + q_lora * H * qk_sum)
+    else:
+      mla_q = 2 * BS * E * H * qk_sum
+    mla_kv = 2 * BS * (E * (kv_lora + qk_rope) + kv_lora * H * (qk_nope + v_head))
+    mla_out = 2 * BS * E * H * v_head
+    mla_weight_per_layer = mla_q + mla_kv + mla_out
+    mla_weight = mla_weight_per_layer * num_mla
+
+    gla_qkv = 2 * BS * E * (H + 2 * H_kv) * D
+    gla_out = 2 * BS * H * D * E
+    gla_gate = 2 * BS * E * H * D
+    gla_weight_per_layer = gla_qkv + gla_out + gla_gate
+    gla_weight = gla_weight_per_layer * num_gla
+
+    # MTP per layer = MLA + MoE FFN + projection(2E->E) + extra logits matmul
+    mtp_proj = 2 * BS * (2 * E) * E
+    mtp_per_layer = mla_weight_per_layer + moe_ffn_per_layer + mtp_proj + embedding_flops
+    mtp_weight = mtp_per_layer * mtp
+
+    total_weight = embedding_flops + dense_ffn + moe_ffn + mla_weight + gla_weight + mtp_weight
+    return 3 * total_weight / 1e12  # x3 fwd+bwd, return TFLOPs
+
+  @pytest.mark.cpu_only
+  def test_ling2_flops(self):
+    """Ling2 FLOPs: hybrid MLA(4) + GLA(16) + 1 dense + 19 MoE (gate + shared_2048 + top_k routed_512) + MTP(1)."""
+    kwargs = self._ling2_default_kwargs()
+
+    # Sanity: MLA layer count follows models/ling2.py:95-97 (no last-layer fallback)
+    expected_num_mla = kwargs["base_num_decoder_layers"] // kwargs["inhomogeneous_layer_cycle_interval"]
+    self.assertEqual(expected_num_mla, 4, "Ling2 default should have 4 MLA layers (20 // 5).")
+
+    weight_tflops = self.compute_ling2_weight_flops_per_device(kwargs)
+    attention_tflops = self.compute_ling2_attention_flops_per_device(kwargs)
+    golden_tflops = weight_tflops + attention_tflops
+
+    cfg = pyconfig.initialize([None, get_test_config_path()], **kwargs)
+    calculated_tflops, _, _ = calculate_tflops_training_per_device(cfg)
+    self.assertFlopsAlmostEqual(calculated_tflops, golden_tflops)
+
+  @pytest.mark.cpu_only
+  def test_ling2_mla_layer_count_non_divisible(self):
+    """When num_decoder_layers does NOT evenly divide cycle_interval, MLA count must follow
+    models/ling2.py:95-97 runtime rule (floor division) — NOT param_mapping.py:2361 _is_mla
+    rule (which adds a last-layer fallback for checkpoint mapping compatibility).
+
+    Regression guard: any change adding "+1 if N % cycle != 0" to the LING2 branch will
+    cause this test to fail because num_mla becomes 5 instead of 4 (for N=22, cycle=5).
+    """
+    kwargs = self._ling2_default_kwargs()
+    kwargs["base_num_decoder_layers"] = 22
+
+    # MLA layers at indices {4, 9, 14, 19} = 4 layers (NOT 5, because (21+1)%5 = 2 != 0)
+    self.assertEqual(22 // 5, 4)
+
+    weight_tflops = self.compute_ling2_weight_flops_per_device(kwargs)
+    attention_tflops = self.compute_ling2_attention_flops_per_device(kwargs)
+    golden_tflops = weight_tflops + attention_tflops
+
+    cfg = pyconfig.initialize([None, get_test_config_path()], **kwargs)
+    calculated_tflops, _, _ = calculate_tflops_training_per_device(cfg)
+    self.assertFlopsAlmostEqual(calculated_tflops, golden_tflops)
+
+  @pytest.mark.cpu_only
+  def test_deepseek_shared_expert_dim_regression(self):
+    """Patch 1 regression guard: calculate_routed_and_shared_ffn_tflops_per_device
+    must use config.moe_shared_expert_dim when set != 0, falling back to moe_mlp_dim
+    only when it is 0. Before Patch 1, the helper hardcoded moe_mlp_dim, silently
+    ignoring moe_shared_expert_dim — this is a latent bug for any DeepSeek-family
+    config where these two fields differ.
+
+    Strategy: compute the TFLOPs delta when moe_shared_expert_dim is set to a value
+    != moe_mlp_dim, and verify it matches the analytical delta from changing only
+    the shared expert FFN width.
+    """
+    base_kwargs = {
+        "model_name": "deepseek2-16b",
+        "override_model_config": True,
+        "per_device_batch_size": 4,
+        "max_target_length": 8192,
+        "num_experts": 64,
+        "num_experts_per_tok": 6,
+        "shared_experts": 2,
+        "base_emb_dim": 2048,
+        "base_num_query_heads": 16,
+        "base_num_kv_heads": 16,
+        "base_mlp_dim": 10944,
+        "base_moe_mlp_dim": 1408,
+        "base_num_decoder_layers": 27,
+        "first_num_dense_layers": 1,
+        "mlp_activations": ["silu", "linear"],
+        "vocab_size": 102400,
+        "q_lora_rank": 0,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "skip_jax_distributed_system": True,
+    }
+
+    # Case 1: moe_shared_expert_dim = 0 (fallback to moe_mlp_dim, == old behavior)
+    cfg_fallback = pyconfig.initialize([None, get_test_config_path()], **{**base_kwargs, "moe_shared_expert_dim": 0})
+    tflops_fallback, _, _ = calculate_tflops_training_per_device(cfg_fallback)
+
+    # Case 2: moe_shared_expert_dim = 4096 (explicit, distinct from moe_mlp_dim=1408)
+    shared_dim_explicit = 4096
+    cfg_explicit = pyconfig.initialize(
+        [None, get_test_config_path()], **{**base_kwargs, "moe_shared_expert_dim": shared_dim_explicit}
+    )
+    tflops_explicit, _, _ = calculate_tflops_training_per_device(cfg_explicit)
+
+    # Expected delta = additional shared FFN FLOPs from widening shared expert dim
+    # Per-layer shared FFN FLOPs = 2 * B * S * E * width * (len(acts)+1) * shared_experts
+    # Total delta across all MoE layers, x3 fwd+bwd:
+    B = base_kwargs["per_device_batch_size"]
+    S = base_kwargs["max_target_length"]
+    E = base_kwargs["base_emb_dim"]
+    n_acts = len(base_kwargs["mlp_activations"])
+    shared_n = base_kwargs["shared_experts"]
+    num_moe = base_kwargs["base_num_decoder_layers"] - base_kwargs["first_num_dense_layers"]
+    delta_width = shared_dim_explicit - base_kwargs["base_moe_mlp_dim"]
+    expected_delta_flops = 2 * B * S * E * delta_width * (n_acts + 1) * shared_n * num_moe
+    expected_delta_tflops = 3 * expected_delta_flops / 1e12
+
+    actual_delta = tflops_explicit - tflops_fallback
+    # 1% tolerance: this is a focused arithmetic identity, not a magnitude estimate
+    self.assertAlmostEqual(actual_delta, expected_delta_tflops, delta=expected_delta_tflops * 0.01)

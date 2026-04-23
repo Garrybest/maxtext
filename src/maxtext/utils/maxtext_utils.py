@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # pylint: disable=line-too-long, disable=bare-except, consider-using-generator
-""" Utils that are only interesting to MaxText. """
+"""Utils that are only interesting to MaxText."""
 
 from collections.abc import Mapping
 import functools
@@ -478,7 +478,12 @@ def calculate_routed_and_shared_ffn_tflops_per_device(config):
   # Due to the mixed decoder layers, the flops is multiplied by num of layers for both dense and moe
   num_dense_layers, num_moe_layers = get_dense_moe_layers(config)
   dense_ffn_flops = calculate_ffn_mamtul_tflops_per_device(config, config.mlp_dim) * num_dense_layers
-  shared_experts_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.shared_experts
+  # Shared expert width follows moe.py:RoutedAndSharedMoE: intermediate_dim is
+  # `shared_experts * (moe_shared_expert_dim or moe_mlp_dim)`. When
+  # moe_shared_expert_dim is 0 (default), it falls back to moe_mlp_dim. Models
+  # like Ling2 set this to a value distinct from moe_mlp_dim (e.g. 2048 vs 512).
+  shared_expert_dim = config.moe_shared_expert_dim or config.moe_mlp_dim
+  shared_experts_flops = calculate_ffn_mamtul_tflops_per_device(config, shared_expert_dim) * config.shared_experts
   routed_experts_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
   moe_ffn_flops = (gate_flops + shared_experts_flops + routed_experts_flops) * num_moe_layers
   total_ffn_flops = dense_ffn_flops + moe_ffn_flops
@@ -487,7 +492,7 @@ def calculate_routed_and_shared_ffn_tflops_per_device(config):
 
 def get_dense_moe_layers(config):
   """Helper function to calculate number of dense and moe layers"""
-  if config.decoder_block == DecoderBlockType.DEEPSEEK:
+  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
     num_dense_layers = config.first_num_dense_layers
     num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
     return num_dense_layers, num_moe_layers
@@ -498,7 +503,7 @@ def get_dense_moe_layers(config):
     num_moe_layers = config.num_decoder_layers
     num_dense_layers = 0
   else:
-    raise ValueError("Currently we only support DeepSeek, Llama4, and Qwen3-Next calculation.")
+    raise ValueError("Currently we only support DeepSeek, Ling2, Llama4, and Qwen3-Next calculation.")
 
   return num_dense_layers, num_moe_layers
 
@@ -552,6 +557,77 @@ def calculate_gated_delta_net_flops_per_device(config):
   gdn_attn_flops = flops_core
 
   return gdn_weight_flops, gdn_attn_flops
+
+
+def calculate_gla_flops_per_device(config):
+  """Calculate Gated Linear Attention FLOPs (Ling2's GLA: Lightning-Attention-2 + chunk simple GLA).
+
+  Formula has two parts with different rigor:
+
+  1. **Projections (exact, code-derived).** Matches the 3 DenseGeneral in
+     `src/maxtext/layers/attention_gla.py` (lines 51-89):
+       - query_key_value: base_emb_dim -> (H + 2*H_kv) * head_dim
+       - dense (output):  H * head_dim -> base_emb_dim
+       - g_proj (gate):   base_emb_dim -> H * head_dim
+     Constraint: H_kv == H (asserted at attention_gla.py:40-46).
+
+  2. **Kernel core (algorithmic approximation).** The pallas kernel in
+     `src/maxtext/kernels/gla/pallas.py` delegates to `tops.ops.simple_gla`,
+     whose exact FLOPs are not exposed. We use the chunk-simple-GLA algorithm
+     (Yang et al., 2024 Gated Linear Attention; Lightning-Attention-2,
+     Qin et al., 2024) with `chunk_size=GLA_CHUNK_SIZE` (defined in attention_gla.py):
+       intra-chunk: 2 * B * T * H * C * (D_k + D_v)
+       inter-chunk: 4 * B * T * H * D_k * D_v
+     For Ling2 (D_k == D_v == head_dim): ~ 4 * B * T * H * (C*D + D^2).
+     This is algorithm-level, not a pallas kernel identity. If the kernel
+     impl changes (different chunk strategy, padding, double-buffering),
+     the approximation may drift.
+
+  **Alignment caveat (under-counts kernel wasted work on misaligned configs):**
+  The pallas kernel pads T to a multiple of `chunk_size=64` and pads K/V dims
+  to a multiple of `_KV_ALIGN=128` (see `pallas.py:_pad_axis` / `_pad_inputs*`).
+  For configs where `max_target_length % 64 != 0` or `head_dim % 128 != 0`, the
+  hardware actually executes more FLOPs than this helper reports (the extra
+  work is on zero-padded tensors and produces no useful results). We interpret
+  FLOPs as *useful algorithmic work* rather than *hardware-executed work*, so
+  padding overhead is deliberately excluded. Ling2 default (T=4096, head_dim=128)
+  is aligned, so this caveat is vacuous in practice; users who diverge from
+  these alignments should expect the reported MFU proxy to slightly over-
+  estimate utilization relative to true hardware throughput.
+
+  Uses `base_*` fields to match what attention_gla.py reads, not the derived
+  scaled versions. Returns raw FLOPs per layer (no x3, no layer count) to
+  match calculate_gated_delta_net_flops_per_device's convention.
+  """
+  batch_len = config.per_device_batch_size * config.max_target_length
+  H = config.base_num_query_heads
+  H_kv = config.base_num_kv_heads  # asserted == H by attention_gla.py:40-46
+  D = config.head_dim
+  E = config.base_emb_dim
+  # Local import: `attention_gla` transitively pulls in the Pallas GLA kernel
+  # (requires `tops`), which we don't want to force on every `maxtext_utils`
+  # consumer. Only Ling2 FLOPs accounting needs the constant.
+  from maxtext.layers.attention_gla import GLA_CHUNK_SIZE  # pylint: disable=import-outside-toplevel
+
+  chunk_size = GLA_CHUNK_SIZE
+
+  # 1. Projections (exact, code-derived from attention_gla.py:51-89)
+  # query_key_value: E -> (H + 2*H_kv) * D
+  qkv_proj_flops = 2 * batch_len * E * (H + 2 * H_kv) * D
+  # dense (output): (H, D) -> E
+  out_proj_flops = 2 * batch_len * H * D * E
+  # g_proj (gate): E -> (H, D)
+  gate_proj_flops = 2 * batch_len * E * H * D
+  gla_weight_flops_per_layer = qkv_proj_flops + out_proj_flops + gate_proj_flops
+
+  # 2. Kernel core (algorithmic approximation)
+  # intra-chunk: 2 * B * T * H * C * (D_k + D_v) (D_k == D_v == D for Ling2)
+  flops_intra = 2 * batch_len * H * chunk_size * (D + D)
+  # inter-chunk: 4 * B * T * H * D_k * D_v
+  flops_inter = 4 * batch_len * H * D * D
+  gla_attn_flops_per_layer = flops_intra + flops_inter
+
+  return gla_weight_flops_per_layer, gla_attn_flops_per_layer
 
 
 def calculate_gemma3_vision_layers_tflops_per_device(config):
@@ -726,7 +802,12 @@ def calculate_tflops_training_per_device(config, log=True):
   # MLP flops
   if config.num_experts > 1:
     # calculation based on dropless implementation
-    if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LLAMA4, DecoderBlockType.QWEN3_NEXT):
+    if config.decoder_block in (
+        DecoderBlockType.DEEPSEEK,
+        DecoderBlockType.LLAMA4,
+        DecoderBlockType.QWEN3_NEXT,
+        DecoderBlockType.LING2,
+    ):
       total_ffn_flops = calculate_routed_and_shared_ffn_tflops_per_device(config)
     else:
       gate_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.num_experts
@@ -812,6 +893,60 @@ def calculate_tflops_training_per_device(config, log=True):
     # Attention TFLOPs:
     total_attn = (causal_attention_flops * num_full_attn_layers) + (gdn_attn_flops_per_layer * num_linear_attn_layers)
     attention_tflops = total_attn * 3 / 10**12
+  elif config.decoder_block == DecoderBlockType.LING2:
+    # Ling2 has hybrid attention (MLA + GLA) and a Multi-Token Prediction (MTP) head.
+    #
+    # Attention split: MLA iff (layer_idx + 1) % cycle_interval == 0
+    # Strict match for `models/ling2.py:95-97` runtime rule:
+    #   is_full_attention_layer = (self.layer_idx + 1) % cfg.inhomogeneous_layer_cycle_interval == 0 \
+    #                             or self.layer_idx >= cfg.num_decoder_layers
+    # In the main stack, layer_idx < num_decoder_layers so the OR right side is
+    # always false; only `(i+1) % cycle == 0` applies, giving N // cycle MLA
+    # layers with NO last-layer fallback.
+    # Note: `param_mapping.py:2361` `_is_mla` has a last-layer fallback, but
+    # that is the checkpoint mapping rule (HF<->MaxText), not runtime behavior.
+    # MTP layers (layer_idx >= num_decoder_layers) are always MLA, accounted
+    # for separately in the MTP block below.
+    cycle_interval = config.inhomogeneous_layer_cycle_interval
+    num_mla_layers = config.num_decoder_layers // cycle_interval
+    num_gla_layers = config.num_decoder_layers - num_mla_layers
+
+    gla_weight_flops_per_layer, gla_attn_flops_per_layer = calculate_gla_flops_per_device(config)
+
+    learnable_weight_flops = (
+        total_ffn_flops
+        + embedding_flops  # main output logits matmul (2*B*T*E*V)
+        + (qkv_flops + projection_flops) * num_mla_layers
+        + gla_weight_flops_per_layer * num_gla_layers
+    )
+    attn_flops = causal_attention_flops * num_mla_layers + gla_attn_flops_per_layer * num_gla_layers
+
+    # MTP head: each mtp_num_layer adds:
+    #   1) projection (2E -> E) -- multi_token_prediction.py:164-165
+    #   2) full transformer_layer (Ling2 = MLA attn + MoE FFN) -- :286-293
+    #   3) logits matmul (E -> V) -- :343-350 apply_output_projection
+    # The MoE FFN must be computed independently (NOT total_ffn_flops /
+    # num_moe_layers, which would incorrectly amortize the dense first
+    # layer's FFN onto MTP).
+    if config.mtp_num_layers > 0:
+      batch_len = config.per_device_batch_size * config.max_target_length
+      mtp_projection_flops = 2 * batch_len * (2 * config.emb_dim) * config.emb_dim
+      shared_expert_dim = config.moe_shared_expert_dim or config.moe_mlp_dim
+      mtp_gate_flops = 2 * batch_len * config.emb_dim * config.num_experts
+      mtp_shared_flops = calculate_ffn_mamtul_tflops_per_device(config, shared_expert_dim) * config.shared_experts
+      mtp_routed_flops = calculate_ffn_mamtul_tflops_per_device(config, config.moe_mlp_dim) * config.num_experts_per_tok
+      mtp_moe_ffn = mtp_gate_flops + mtp_shared_flops + mtp_routed_flops
+      # MTP output side runs an additional logits matmul (same magnitude as
+      # the main embedding_flops, since shared embedding weights but separate
+      # computation per MTP layer)
+      mtp_logits_flops = embedding_flops
+      learnable_weight_flops += config.mtp_num_layers * (
+          qkv_flops + projection_flops + mtp_moe_ffn + mtp_projection_flops + mtp_logits_flops
+      )
+      attn_flops += config.mtp_num_layers * causal_attention_flops
+
+    learnable_weight_tflops = learnable_weight_flops * 3 / 10**12
+    attention_tflops = attn_flops * 3 / 10**12
   else:
     # multiply by 3 for both feed forward and back propagation flops
     learnable_weight_tflops = (

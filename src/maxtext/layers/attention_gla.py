@@ -19,6 +19,12 @@ from maxtext.layers.embeddings import PartialRotaryEmbedding
 from maxtext.utils.sharding import logical_to_mesh_axes
 
 
+# Chunk size used by the chunk-simple-GLA kernel. Shared with FLOPs accounting
+# in `maxtext.utils.maxtext_utils.calculate_gla_flops_per_device` so that both
+# paths stay consistent if the kernel's chunking strategy ever changes.
+GLA_CHUNK_SIZE = 64
+
+
 class BailingMoeV2LinearAttention(nnx.Module):
   """Lightning Attention-2 layer with chunk Simple GLA (NNX).
 
@@ -243,7 +249,7 @@ class BailingMoeV2LinearAttention(nnx.Module):
           scale=None,
           initial_state=None,
           output_final_state=False,
-          chunk_size=64,
+          chunk_size=GLA_CHUNK_SIZE,
       )
       return o
 
