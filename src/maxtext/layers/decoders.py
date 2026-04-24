@@ -48,6 +48,7 @@ from maxtext.models import (
     gpt3,
     gpt_oss,
     ling2,
+    ling3,
     llama2,
     llama4,
     mistral,
@@ -491,6 +492,18 @@ class Decoder(nn.Module):
               "Ling2 decoder does not support scan_layers=True yet. " "Please set scan_layers=False."
           )
         return [ling2.Ling2DenseDecoderLayerToLinen, ling2.Ling2MoEDecoderLayerToLinen]
+      case DecoderBlockType.LING3:
+        if self.config.scan_layers:
+          # Order matters: MoE must be last so that `layer_types[-1]` is
+          # `Ling3MoEDecoderLayerToLinen` (not the ScannableBlock). MTP relies
+          # on `[-1]` to get a single-layer MoE blueprint with MLA, rather
+          # than a heterogeneous block that mixes KDA + MLA. See RFC-0012 §4.5.
+          return [
+              ling3.Ling3DenseDecoderLayerToLinen,
+              ling3.Ling3ScannableBlockToLinen,
+              ling3.Ling3MoEDecoderLayerToLinen,
+          ]
+        return [ling3.Ling3DenseDecoderLayerToLinen, ling3.Ling3MoEDecoderLayerToLinen]
       case _:
         # Default case to handle any unknown decoder block types.
         raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
@@ -543,6 +556,7 @@ class Decoder(nn.Module):
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
         DecoderBlockType.LING2,
+        DecoderBlockType.LING3,
     ):
       return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
     elif self.config.decoder_block == DecoderBlockType.GPT3:
@@ -987,6 +1001,8 @@ class Decoder(nn.Module):
               page_state,
               slot,
           )
+        elif cfg.decoder_block == DecoderBlockType.LING3:
+          y = self._apply_ling3_scan_layers(RemattedBlockLayers, y, broadcast_args)
         else:
           RemattedBlockLayer = RemattedBlockLayers[0]
           scan_length = int(cfg.num_decoder_layers / cfg.inhomogeneous_layer_cycle_interval)
@@ -1007,8 +1023,8 @@ class Decoder(nn.Module):
               **layer_kwargs,
           )(y, *broadcast_args)
       else:
-        if cfg.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
-          assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek/ling2."
+        if cfg.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
+          assert len(RemattedBlockLayers) == 2, "Unscanned layers must have a length of 2 using deepseek/ling2/ling3."
           dense_layer = RemattedBlockLayers[0]
           moe_layer = RemattedBlockLayers[1]
 
@@ -1024,7 +1040,7 @@ class Decoder(nn.Module):
               kv_cache = kv_caches[index] if kv_caches is not None else None
               input_tokens = decoder_input_tokens if cfg.engram_layers else None
               layer_call_kwargs = {}
-              if cfg.decoder_block == DecoderBlockType.LING2:
+              if cfg.decoder_block in (DecoderBlockType.LING2, DecoderBlockType.LING3):
                 layer_call_kwargs["global_layer_idx"] = global_layer_idx
               y, kv_cache = layer(
                   config=cfg,
@@ -1206,6 +1222,95 @@ class Decoder(nn.Module):
           slot=slot,
           **layer_call_kwargs,
       )
+    return y
+
+  def _apply_ling3_scan_layers(self, remat_layers, y, broadcast_args):
+    """Applies the Ling3 two-phase scan path (RFC-0012 §4.3.3).
+
+    Phase 1 (unscan prefix): the dense prefix layers and any MoE transition
+    layers needed to round the unscan region up to a cycle boundary, so the
+    remaining MoE region divides evenly by `inhomogeneous_layer_cycle_interval`.
+    Phase 2 (scan): the MoE region as a `Ling3ScannableBlock` repeated
+    `scan_length` times under `nn.scan`.
+
+    Layer naming follows DeepSeek (`dense_layers_{i}` / `moe_layers_{i}` /
+    `moe_layers`) to keep checkpoint conversion straightforward.
+
+    Note: until the Ling3 KDA layer lands, only configurations where every
+    constructed layer is an MLA position are runnable. With the default
+    `ling3-tiny.yml` (`inhomogeneous_layer_cycle_interval=4`,
+    `first_num_dense_layers=1`), Phase 1b will instantiate KDA-position MoE
+    layers and trip `Ling3GenericLayer.__init__`'s NotImplementedError. Use
+    `inhomogeneous_layer_cycle_interval=1` for an MLA-only smoke test.
+
+    TODO(ling3-kda-pr): Phase 1's unscan loop duplicates the LING3 unscan
+    branch above (~lines 1037-1068). Once KDA lands and the scan path is
+    exercised end-to-end, factor out a shared `_build_unscan_layer` helper.
+    """
+    cfg = self.config
+    mesh = self.mesh
+    model_mode = self.model_mode
+    interval = cfg.inhomogeneous_layer_cycle_interval
+
+    # Round the unscan prefix up to a cycle boundary so that the MoE scan
+    # region is divisible by `interval`. With first_num_dense_layers=0 this
+    # collapses to 0 (the entire model goes through the scan).
+    if cfg.first_num_dense_layers > 0:
+      unscan_prefix = ((cfg.first_num_dense_layers + interval - 1) // interval) * interval
+    else:
+      unscan_prefix = 0
+    assert unscan_prefix < cfg.num_decoder_layers, (
+        f"Ling3 unscan_prefix ({unscan_prefix}) >= num_decoder_layers "
+        f"({cfg.num_decoder_layers}): first_num_dense_layers "
+        f"({cfg.first_num_dense_layers}) cannot cover all decoder layers."
+    )
+    num_moe_prefix = unscan_prefix - cfg.first_num_dense_layers
+
+    assert len(remat_layers) == 3, "Ling3 scan path expects 3 remat layer classes (Dense, ScannableBlock, MoE)."
+    dense_layer, scannable_block, moe_layer = remat_layers
+
+    # Phase 1a — unscan dense prefix
+    for idx in range(cfg.first_num_dense_layers):
+      y, _ = dense_layer(
+          config=cfg,
+          mesh=mesh,
+          name=f"dense_layers_{idx}",
+          quant=self.quant,
+          model_mode=model_mode,
+          layer_idx=idx,
+      )(y, *broadcast_args, global_layer_idx=idx)
+
+    # Phase 1b — unscan MoE transition layers (filling out to the cycle boundary)
+    for idx in range(num_moe_prefix):
+      global_idx = cfg.first_num_dense_layers + idx
+      y, _ = moe_layer(
+          config=cfg,
+          mesh=mesh,
+          name=f"moe_layers_{idx}",
+          quant=self.quant,
+          model_mode=model_mode,
+          layer_idx=global_idx,
+      )(y, *broadcast_args, global_layer_idx=global_idx)
+
+    # Phase 2 — scan MoE ScannableBlocks
+    scan_layers_count = cfg.num_decoder_layers - unscan_prefix
+    assert scan_layers_count % interval == 0, (
+        f"Ling3 scan region ({scan_layers_count} layers) must be divisible by "
+        f"inhomogeneous_layer_cycle_interval ({interval}); unscan_prefix "
+        f"({unscan_prefix}) was supposed to round up to a cycle boundary."
+    )
+    scan_length = scan_layers_count // interval
+    if scan_length > 0:
+      y, _ = self.scan_decoder_layers(
+          cfg,
+          scannable_block,
+          scan_length,
+          "moe_layers",
+          mesh,
+          in_axes_tuple=(nn.broadcast,) * len(broadcast_args),
+          model_mode=model_mode,
+      )(y, *broadcast_args)
+
     return y
 
   # TODO(b/490118813): Relocate the following functions to their designated directories

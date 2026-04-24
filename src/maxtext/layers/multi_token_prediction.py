@@ -171,11 +171,11 @@ class MultiTokenPredictionLayer(nnx.Module):
         rngs=rngs,
     )
     # Use MODEL_MODE_TRAIN for initialization; runtime model_mode is passed dynamically.
-    # Some decoder types (e.g., Ling2) require layer_idx to determine layer
-    # structure (MLA vs GLA). MTP layers get unique indices starting from
+    # Some decoder types (e.g., Ling2/Ling3) require layer_idx to determine layer
+    # structure (MLA vs GLA/KDA). MTP layers get unique indices starting from
     # num_decoder_layers so they don't collide with main model layers.
     layer_idx_kwargs = {}
-    if cfg.decoder_block == DecoderBlockType.LING2:
+    if cfg.decoder_block in (DecoderBlockType.LING2, DecoderBlockType.LING3):
       layer_idx_kwargs["layer_idx"] = cfg.num_decoder_layers + k - 1
 
     is_nnx_layer = issubclass(transformer_layer_module, nnx.Module)

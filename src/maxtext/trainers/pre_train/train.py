@@ -110,7 +110,7 @@ def _collect_moe_intermediate_sum(config, intermediate_outputs, key):
     # Flax/NNX sow() accumulates values into tuples (e.g. (value,)); unwrap to get the scalar.
     return raw[-1] if isinstance(raw, tuple) else raw
 
-  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
+  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
     if config.scan_layers:
       nested_key = ("intermediates", "decoder", "moe_layers", key)
       values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
@@ -224,14 +224,14 @@ def _apply_moe_bias_updates(config, new_state, moe_expert_counts, mtp_expert_cou
   moe_block_name = None
   if config.decoder_block == DecoderBlockType.DEEPSEEK:
     moe_block_name = "DeepSeekMoeBlock_0"
-  elif config.decoder_block == DecoderBlockType.LING2:
+  elif config.decoder_block in (DecoderBlockType.LING2, DecoderBlockType.LING3):
     moe_block_name = "mlp"
 
   # --- Backbone MoE bias updates ---
   if moe_expert_counts is not None:
     if moe_block_name is None:
       max_logging.log("Skipping moe_expert_counts: unsupported decoder block type.")
-    elif config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
+    elif config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
       new_state = _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts)
 
   # --- MTP MoE expert bias updates ---
@@ -469,7 +469,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   # get MoE routed expert counts for bias updates
   moe_expert_counts = None
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
-    if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
+    if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
       if config.scan_layers:
         # Scanned: single stacked tensor from scan intermediates
         nested_key = ("intermediates", "decoder", "moe_layers", "moe_expert_counts")
