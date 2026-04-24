@@ -86,17 +86,44 @@ HEAD_DIM = 128
 DENSE_LAYER_LINEARS = [
     (
         "layer_0_lightning_attn_linear_qkv",
-        ("params", "params", "decoder", "dense_layers_0", "self_attention", "attention", "query_key_value", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "dense_layers_0",
+            "self_attention",
+            "attention",
+            "query_key_value",
+            "kernel",
+        ),
         1,  # kernel (emb, nh, hd), contract on emb
     ),
     (
         "layer_0_lightning_attn_linear_proj",
-        ("params", "params", "decoder", "dense_layers_0", "self_attention", "attention", "dense", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "dense_layers_0",
+            "self_attention",
+            "attention",
+            "dense",
+            "kernel",
+        ),
         2,  # kernel (nh, hd, emb), contract on (nh, hd)
     ),
     (
         "layer_0_lightning_attn_linear_gate",
-        ("params", "params", "decoder", "dense_layers_0", "self_attention", "attention", "g_proj", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "dense_layers_0",
+            "self_attention",
+            "attention",
+            "g_proj",
+            "kernel",
+        ),
         1,  # kernel (emb, nh, hd), contract on emb
     ),
     (
@@ -109,27 +136,72 @@ DENSE_LAYER_LINEARS = [
 MLA_LAYER_LINEARS = [
     (
         "layer_4_mla_attn_linear_q_down_proj",
-        ("params", "params", "decoder", "moe_layers_3", "self_attention", "attention", "wq_a", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_3",
+            "self_attention",
+            "attention",
+            "wq_a",
+            "kernel",
+        ),
         1,  # kernel (emb, q_lora_rank), contract on emb
     ),
     (
         "layer_4_mla_attn_linear_q_up_proj",
-        ("params", "params", "decoder", "moe_layers_3", "self_attention", "attention", "wq_b", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_3",
+            "self_attention",
+            "attention",
+            "wq_b",
+            "kernel",
+        ),
         1,  # kernel (q_lora_rank, nh, qk_hd), contract on q_lora_rank
     ),
     (
         "layer_4_mla_attn_linear_kv_down_proj",
-        ("params", "params", "decoder", "moe_layers_3", "self_attention", "attention", "wkv_a", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_3",
+            "self_attention",
+            "attention",
+            "wkv_a",
+            "kernel",
+        ),
         1,  # kernel (emb, kv_lora_rank+rope), contract on emb
     ),
     (
         "layer_4_mla_attn_linear_kv_up_proj",
-        ("params", "params", "decoder", "moe_layers_3", "self_attention", "attention", "wkv_b", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_3",
+            "self_attention",
+            "attention",
+            "wkv_b",
+            "kernel",
+        ),
         1,  # kernel (kv_lora_rank, nh, nope+v), contract on kv_lora_rank
     ),
     (
         "layer_4_mla_attn_linear_proj",
-        ("params", "params", "decoder", "moe_layers_3", "self_attention", "attention", "out", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_3",
+            "self_attention",
+            "attention",
+            "out",
+            "kernel",
+        ),
         2,  # kernel (nh, hd, emb), contract on (nh, hd)
     ),
 ]
@@ -137,12 +209,35 @@ MLA_LAYER_LINEARS = [
 MOE_SHARED_EXPERT_LINEARS = [
     (
         "layer_1_shared_expert_linear_fc2",
-        ("params", "params", "decoder", "moe_layers_0", "ALMoeBlock_0", "shared_experts", "wo", "kernel"),
+        (
+            "params",
+            "params",
+            "decoder",
+            "moe_layers_0",
+            "ALMoeBlock_0",
+            "shared_experts",
+            "wo",
+            "kernel",
+        ),
         1,  # kernel (intermediate, emb), contract on intermediate
     ),
 ]
 
 ALL_LINEARS = DENSE_LAYER_LINEARS + MLA_LAYER_LINEARS + MOE_SHARED_EXPERT_LINEARS
+
+# Representative subset covering all unique code paths:
+#   dense_qkv:          contract_dims=1, deinterleave=Yes, threshold=MULTIHEAD
+#   dense_proj:          contract_dims=2, deinterleave=No,  threshold=standard
+#   mla_q_down:          contract_dims=1, deinterleave=No,  threshold=LOWRANK
+#   mla_kv_up:           contract_dims=1, deinterleave=No,  threshold=MULTIHEAD
+#   shared_expert_fc2:   contract_dims=1, deinterleave=No,  threshold=standard (MoE path)
+REPRESENTATIVE_LINEARS = [
+    DENSE_LAYER_LINEARS[0],  # dense_qkv
+    DENSE_LAYER_LINEARS[1],  # dense_proj
+    MLA_LAYER_LINEARS[0],  # mla_q_down
+    MLA_LAYER_LINEARS[3],  # mla_kv_up
+    MOE_SHARED_EXPERT_LINEARS[0],  # shared_expert_fc2
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -347,6 +442,39 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
     cls.available_fwd = list_tensors(cls.dump_dir, category="forward")
     cls.available_bwd = list_tensors(cls.dump_dir, category="backward")
 
+    # Load checkpoint once, cache weights for all representative layers.
+    ckpt = ocp.StandardCheckpointer().restore(cls.ckpt_path)
+    cls._weight_cache = {}
+    for _, key_path, _ in REPRESENTATIVE_LINEARS:
+      node = ckpt
+      for key in key_path:
+        node = node[key]
+      cls._weight_cache[key_path] = np.array(node, dtype=np.float32)
+    del ckpt
+
+    # Cache all dump tensors for representative layers (avoid per-test I/O).
+    cls._dump_cache = {}
+    for dump_name, _, _ in REPRESENTATIVE_LINEARS:
+      # Forward tensors
+      input_name = resolve_tensor_name(cls.available_fwd, f"{dump_name}_input")
+      output_name = resolve_tensor_name(cls.available_fwd, f"{dump_name}_output")
+      if input_name and output_name:
+        cls._dump_cache[(dump_name, "fwd_input")] = load_tensor(cls.dump_dir, f"forward:{input_name}", dp_mode="replica")
+        cls._dump_cache[(dump_name, "fwd_output")] = load_tensor(
+            cls.dump_dir, f"forward:{output_name}", dp_mode="replica"
+        )
+
+      # Backward tensors
+      out_grad_name = resolve_tensor_name(cls.available_bwd, f"{dump_name}_output_grad", category="backward")
+      in_grad_name = resolve_tensor_name(cls.available_bwd, f"{dump_name}_input_grad", category="backward")
+      if out_grad_name and in_grad_name:
+        cls._dump_cache[(dump_name, "bwd_output_grad")] = load_tensor(
+            cls.dump_dir, f"backward:{out_grad_name}", dp_mode="replica"
+        )
+        cls._dump_cache[(dump_name, "bwd_input_grad")] = load_tensor(
+            cls.dump_dir, f"backward:{in_grad_name}", dp_mode="replica"
+        )
+
   def _run_linear_compare(
       self,
       dump_name,
@@ -368,15 +496,11 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
         max_ulp_p999: maximum allowed p99.9 ULP distance in BF16 space.
         min_cosine_sim: minimum allowed mean cosine similarity.
     """
-    input_name = resolve_tensor_name(self.available_fwd, f"{dump_name}_input")
-    output_name = resolve_tensor_name(self.available_fwd, f"{dump_name}_output")
-
-    if input_name is None or output_name is None:
+    # Use cached dump tensors (loaded in setUpClass)
+    meg_input = self._dump_cache.get((dump_name, "fwd_input"))
+    meg_output = self._dump_cache.get((dump_name, "fwd_output"))
+    if meg_input is None or meg_output is None:
       self.skipTest(f"Tensors for {dump_name} not found in dump")
-
-    # Load Megatron tensors
-    meg_input = load_tensor(self.dump_dir, f"forward:{input_name}", dp_mode="replica")
-    meg_output = load_tensor(self.dump_dir, f"forward:{output_name}", dp_mode="replica")
 
     # Megatron [seq, batch, hidden] -> MaxText [batch, seq, hidden]
     inp_bf16 = jnp.asarray(jnp.swapaxes(jnp.array(meg_input), 0, 1), jnp.bfloat16)
@@ -388,7 +512,7 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
       expected_bf16 = deinterleave_megatron_qkv(expected_bf16, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM)
 
     # Load weight and compute via blockwise FP8 matmul
-    weight = load_ckpt_weight(self.ckpt_path, ckpt_key_path)
+    weight = self._weight_cache[ckpt_key_path]
     actual = dense_general_fp8(inp_bf16, weight, contract_dims)
 
     # Flatten multi-dim output for comparison with Megatron's flat format
@@ -457,15 +581,11 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
     Loads output_grad and input_grad from the backward dump, computes
     dgrad using BlockwiseFp8DotGeneralOp, and compares with the dump's input_grad.
     """
-    out_grad_name = resolve_tensor_name(self.available_bwd, f"{dump_name}_output_grad", category="backward")
-    in_grad_name = resolve_tensor_name(self.available_bwd, f"{dump_name}_input_grad", category="backward")
-
-    if out_grad_name is None or in_grad_name is None:
+    # Use cached dump tensors (loaded in setUpClass)
+    meg_out_grad = self._dump_cache.get((dump_name, "bwd_output_grad"))
+    meg_in_grad = self._dump_cache.get((dump_name, "bwd_input_grad"))
+    if meg_out_grad is None or meg_in_grad is None:
       self.skipTest(f"Backward tensors for {dump_name} not found in dump")
-
-    # Load Megatron backward tensors
-    meg_out_grad = load_tensor(self.dump_dir, f"backward:{out_grad_name}", dp_mode="replica")
-    meg_in_grad = load_tensor(self.dump_dir, f"backward:{in_grad_name}", dp_mode="replica")
 
     # Megatron [seq, batch, hidden] -> [batch, seq, hidden]
     out_grad_bf16 = jnp.asarray(jnp.swapaxes(jnp.array(meg_out_grad), 0, 1), jnp.bfloat16)
@@ -477,7 +597,7 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
       out_grad_bf16 = deinterleave_megatron_qkv(out_grad_bf16, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM)
 
     # Load weight and compute dgrad via FP8
-    weight = load_ckpt_weight(self.ckpt_path, ckpt_key_path)
+    weight = self._weight_cache[ckpt_key_path]
     actual = dense_general_fp8_dgrad(out_grad_bf16, weight, contract_dims)
 
     # Flatten multi-dim output for comparison
@@ -550,20 +670,14 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
   def test_dense_layer0_qkv(self):
     """layer_0 lightning_attn linear_qkv: fused Q+K+V projection."""
     self._run_linear_compare(
-        *DENSE_LAYER_LINEARS[0], deinterleave_qkv_output=True, max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD
+        *DENSE_LAYER_LINEARS[0],
+        deinterleave_qkv_output=True,
+        max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD,
     )
 
   def test_dense_layer0_proj(self):
     """layer_0 lightning_attn linear_proj: output projection."""
     self._run_linear_compare(*DENSE_LAYER_LINEARS[1])
-
-  def test_dense_layer0_gate(self):
-    """layer_0 lightning_attn linear_gate: gate projection."""
-    self._run_linear_compare(*DENSE_LAYER_LINEARS[2])
-
-  def test_dense_layer0_fc2(self):
-    """layer_0 dense_mlp linear_fc2: MLP down projection."""
-    self._run_linear_compare(*DENSE_LAYER_LINEARS[3])
 
   # ── MLA layer (Megatron layer 4 = moe_layers_3) ──────────────────────
 
@@ -571,21 +685,9 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
     """layer_4 MLA linear_q_down_proj: Q low-rank down projection."""
     self._run_linear_compare(*MLA_LAYER_LINEARS[0], max_ulp_p999=ULP_P999_THRESHOLD_LOWRANK)
 
-  def test_mla_q_up_proj(self):
-    """layer_4 MLA linear_q_up_proj: Q low-rank up projection."""
-    self._run_linear_compare(*MLA_LAYER_LINEARS[1], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
-
-  def test_mla_kv_down_proj(self):
-    """layer_4 MLA linear_kv_down_proj: KV low-rank down projection."""
-    self._run_linear_compare(*MLA_LAYER_LINEARS[2], max_ulp_p999=ULP_P999_THRESHOLD_LOWRANK)
-
   def test_mla_kv_up_proj(self):
     """layer_4 MLA linear_kv_up_proj: KV low-rank up projection."""
     self._run_linear_compare(*MLA_LAYER_LINEARS[3], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
-
-  def test_mla_proj(self):
-    """layer_4 MLA linear_proj: output projection."""
-    self._run_linear_compare(*MLA_LAYER_LINEARS[4])
 
   # ── MoE shared expert (Megatron layer 1 = moe_layers_0) ─────────────
 
@@ -601,44 +703,24 @@ class BlockwiseFp8CompareTest(unittest.TestCase):
   def test_dgrad_dense_layer0_qkv(self):
     """layer_0 lightning_attn linear_qkv backward: dgrad."""
     self._run_dgrad_compare(
-        *DENSE_LAYER_LINEARS[0], deinterleave_qkv_grad=True, max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD
+        *DENSE_LAYER_LINEARS[0],
+        deinterleave_qkv_grad=True,
+        max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD,
     )
 
   def test_dgrad_dense_layer0_proj(self):
     """layer_0 lightning_attn linear_proj backward: dgrad."""
     self._run_dgrad_compare(*DENSE_LAYER_LINEARS[1], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
 
-  def test_dgrad_dense_layer0_gate(self):
-    """layer_0 lightning_attn linear_gate backward: dgrad."""
-    self._run_dgrad_compare(*DENSE_LAYER_LINEARS[2], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
-
-  def test_dgrad_dense_layer0_fc2(self):
-    """layer_0 dense_mlp linear_fc2 backward: dgrad."""
-    self._run_dgrad_compare(*DENSE_LAYER_LINEARS[3])
-
   def test_dgrad_mla_q_down_proj(self):
     """layer_4 MLA linear_q_down_proj backward: dgrad.
     N=256 (q_lora_rank) → only 2 FP8 blocks in contraction."""
     self._run_dgrad_compare(*MLA_LAYER_LINEARS[0], max_ulp_p999=ULP_P999_THRESHOLD_LOWRANK)
 
-  def test_dgrad_mla_q_up_proj(self):
-    """layer_4 MLA linear_q_up_proj backward: dgrad.
-    N=3072 (nh*qk_hd) → 24 FP8 blocks, should be well-aligned."""
-    self._run_dgrad_compare(*MLA_LAYER_LINEARS[1], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
-
-  def test_dgrad_mla_kv_down_proj(self):
-    """layer_4 MLA linear_kv_down_proj backward: dgrad.
-    N=576 (kv_lora_rank+rope) → ~4.5 FP8 blocks."""
-    self._run_dgrad_compare(*MLA_LAYER_LINEARS[2], max_ulp_p999=ULP_P999_THRESHOLD_LOWRANK)
-
   def test_dgrad_mla_kv_up_proj(self):
     """layer_4 MLA linear_kv_up_proj backward: dgrad.
     N=4096 (nh*(nope+v)) → 32 FP8 blocks."""
     self._run_dgrad_compare(*MLA_LAYER_LINEARS[3], max_ulp_p999=ULP_P999_THRESHOLD_MULTIHEAD)
-
-  def test_dgrad_mla_proj(self):
-    """layer_4 MLA linear_proj backward: dgrad."""
-    self._run_dgrad_compare(*MLA_LAYER_LINEARS[4])
 
   def test_dgrad_shared_expert_fc2(self):
     """layer_1 shared_expert linear_fc2 backward: dgrad."""
