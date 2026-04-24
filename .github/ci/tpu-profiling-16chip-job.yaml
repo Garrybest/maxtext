@@ -1,0 +1,182 @@
+# CI TPU Profiling (16 chips) - K8s JobSet
+# Rendered by envsubst with:
+#   $JOB_NAME $BRANCH $BRANCH_LABEL $USER
+#   $ICI_EXPERT_PARALLELISM $ICI_DATA_PARALLELISM $ICI_FSDP_PARALLELISM
+#   $ICI_TENSOR_PARALLELISM $ICI_CONTEXT_PARALLELISM $SHARD_EXP_ON_FSDP
+#   $PROFILER $PROFILER_STEPS $SKIP_FIRST_N_STEPS_FOR_PROFILER
+#   $STEPS $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS
+#   $REMAT_POLICY $LIBTPU_INIT_ARGS $GRAIN_WORKER_COUNT $EXTRA_ARGS
+# 4 pods x 4 TPU chips = 16 chips (32 devices), topology 2x2x4.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+  labels:
+    app: ci-profiling-16chip
+    repo-branch: "${BRANCH_LABEL}"
+    owner: "${USER}"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          app: ci-profiling-16chip
+          repo-branch: "${BRANCH_LABEL}"
+          owner: "${USER}"
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 4
+        parallelism: 4
+        activeDeadlineSeconds: 5400
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+            labels:
+              app: ci-profiling-16chip
+              repo-branch: "${BRANCH_LABEL}"
+              owner: "${USER}"
+          spec:
+            containers:
+            - name: jax-tpu
+              image: python:3.12
+              imagePullPolicy: IfNotPresent
+              command:
+              - bash
+              - -c
+              - |
+                set -exo pipefail
+
+                # 0. Configure git credentials for private repos
+                git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+                # 1. Clone branch
+                git clone --depth=1 --branch="${BRANCH}" https://github.com/primatrix/maxtext.git /root/maxtext
+                cd /root/maxtext
+
+                # 2. Setup Python environment
+                pip install uv
+                uv venv --python 3.12 --seed maxtext_venv
+                source maxtext_venv/bin/activate
+                uv pip install -e '.[tpu]' --resolution=lowest
+                install_maxtext_tpu_github_deps
+
+                # 3. Install optax from source
+                pip uninstall optax -y 2>/dev/null || true
+                pip install git+https://github.com/google-deepmind/optax
+
+                # 4. Log persistence — only on Pod 0
+                if [ "${JOB_COMPLETION_INDEX}" = "0" ]; then
+                  source scripts/job_log_sync.sh "/models/pretrain/profiling-16chip/${RUN_NAME}"
+                fi
+
+                # 5. Run profiling (EXTRA_ARGS passes through pretrain_ling2.sh's "$@")
+                bash scripts/pretrain_ling2.sh ${EXTRA_ARGS}
+              env:
+              # --- Profiling overrides (from workflow_dispatch inputs) ---
+              - name: STEPS
+                value: "${STEPS}"
+              - name: PER_DEVICE_BATCH_SIZE
+                value: "${PER_DEVICE_BATCH_SIZE}"
+              - name: GRADIENT_ACCUMULATION_STEPS
+                value: "${GRADIENT_ACCUMULATION_STEPS}"
+              - name: REMAT_POLICY
+                value: "${REMAT_POLICY}"
+              - name: PROFILER
+                value: "${PROFILER}"
+              - name: SKIP_FIRST_N_STEPS_FOR_PROFILER
+                value: "${SKIP_FIRST_N_STEPS_FOR_PROFILER}"
+              - name: PROFILER_STEPS
+                value: "${PROFILER_STEPS}"
+              - name: EVAL_INTERVAL
+                value: "99999"
+              - name: SHARD_EXP_ON_FSDP
+                value: "${SHARD_EXP_ON_FSDP}"
+              - name: GRAIN_WORKER_COUNT
+                value: "${GRAIN_WORKER_COUNT}"
+              - name: RUN_NAME
+                value: "${JOB_NAME}"
+              - name: GCS_BUCKET
+                value: "gs://data_ant/pretrain/profiling-16chip"
+              # --- Parallelism (all ICI dims from workflow inputs) ---
+              - name: ICI_EXPERT_PARALLELISM
+                value: "${ICI_EXPERT_PARALLELISM}"
+              - name: ICI_DATA_PARALLELISM
+                value: "${ICI_DATA_PARALLELISM}"
+              - name: ICI_FSDP_PARALLELISM
+                value: "${ICI_FSDP_PARALLELISM}"
+              - name: ICI_TENSOR_PARALLELISM
+                value: "${ICI_TENSOR_PARALLELISM}"
+              - name: ICI_CONTEXT_PARALLELISM
+                value: "${ICI_CONTEXT_PARALLELISM}"
+              # --- Extra XLA flags (optional, appended to defaults) ---
+              - name: LIBTPU_INIT_ARGS
+                value: "${LIBTPU_INIT_ARGS}"
+              # --- Disable Vertex TB / Goodput in CI to keep runs lightweight ---
+              - name: USE_VERTEX_TENSORBOARD
+                value: "false"
+              - name: ENABLE_GOODPUT
+                value: "false"
+              # --- GitHub token via pre-existing secret ---
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: perf-64chips-token
+                    key: token
+              # --- Runtime env ---
+              - name: PIP_CACHE_DIR
+                value: /tmp/ramdisk/.cache/pip
+              - name: PATH
+                value: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              - name: TPU_PROCESS_ADDRESSES
+                value: ${JOB_NAME}-worker-0-0.${JOB_NAME}:8476,${JOB_NAME}-worker-0-1.${JOB_NAME}:8476,${JOB_NAME}-worker-0-2.${JOB_NAME}:8476,${JOB_NAME}-worker-0-3.${JOB_NAME}:8476
+              - name: TPU_PROCESS_PORT
+                value: "8476"
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                requests:
+                  ephemeral-storage: 20Gi
+                  google.com/tpu: "4"
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - mountPath: /models
+                name: gcs-fuse-csi-ephemeral
+              - mountPath: /tmp/ramdisk
+                name: tmpfs
+              - mountPath: /dev/shm
+                name: dshm
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 2x2x4
+            restartPolicy: Never
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            terminationGracePeriodSeconds: 30
+            volumes:
+            - emptyDir:
+                medium: Memory
+                sizeLimit: 200Gi
+              name: tmpfs
+            - emptyDir:
+                medium: Memory
+              name: gke-gcsfuse-cache
+            - name: gcs-fuse-csi-ephemeral
+              persistentVolumeClaim:
+                claimName: ant-data-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory

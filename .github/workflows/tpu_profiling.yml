@@ -1,0 +1,275 @@
+name: TPU Profiling (64 chips)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run on (defaults to the branch you triggered from)"
+        required: false
+        type: string
+      remat_policy:
+        description: "Remat policy"
+        required: true
+        type: choice
+        default: "custom"
+        options:
+          - custom
+          - save_out_proj
+          - save_dot_except_mlp
+          - save_all
+          - full
+          - minimal
+          - minimal_with_context
+          - save_dot_with_context_except_mlp
+          - save_dot_except_mlpwi
+          - save_qkv_proj
+          - qkv_proj_offloaded
+          - minimal_offloaded
+      per_device_batch_size:
+        description: "Per-device batch size"
+        required: true
+        type: string
+        default: "2"
+      steps:
+        description: "Total training steps"
+        required: true
+        type: string
+        default: "10"
+      profiler:
+        description: "Profiler type"
+        required: true
+        type: choice
+        default: "xplane"
+        options:
+          - xplane
+          - nsys
+      profiler_steps:
+        description: "Number of steps to profile"
+        required: true
+        type: string
+        default: "1"
+      skip_first_n_steps_for_profiler:
+        description: "Steps to skip before profiling starts"
+        required: true
+        type: string
+        default: "1"
+      gradient_accumulation_steps:
+        description: "Gradient accumulation steps"
+        required: true
+        type: string
+        default: "1"
+      ici_parallelism:
+        description: "ICI parallelism: EP,DP,FSDP,TP,CP (product must be 128)"
+        required: true
+        type: string
+        default: "128,1,1,1,1"
+      grain_worker_count:
+        description: "Grain dataloader worker count"
+        required: false
+        type: string
+        default: "8"
+      libtpu_init_args:
+        description: "Extra XLA flags (appended to defaults, optional)"
+        required: false
+        type: string
+      extra_args:
+        description: "Extra MaxText config overrides (e.g. 'context=device mla_q=device')"
+        required: false
+        type: string
+
+concurrency:
+  group: tpu-profiling-64
+  cancel-in-progress: false
+
+jobs:
+  tpu_profiling:
+    name: "Profiling on 64 TPU chips (16 pods x 4 chips)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+
+      - name: Parse and validate ICI parallelism
+        id: ici
+        run: |
+          ICI="${{ inputs.ici_parallelism }}"
+          IFS=',' read -r EP DP FSDP TP CP <<< "$ICI"
+
+          for name_val in "EP:$EP" "DP:$DP" "FSDP:$FSDP" "TP:$TP" "CP:$CP"; do
+            name="${name_val%%:*}"
+            val="${name_val#*:}"
+            if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+              echo "::error::Invalid ICI parallelism: $name='$val' is not a positive integer. Format: EP,DP,FSDP,TP,CP"
+              exit 1
+            fi
+          done
+
+          PRODUCT=$((EP * DP * FSDP * TP * CP))
+          echo "ICI parallelism: EP=$EP × DP=$DP × FSDP=$FSDP × TP=$TP × CP=$CP = $PRODUCT"
+          if [ "$PRODUCT" -ne 128 ]; then
+            echo "::error::ICI parallelism product must be 128 (64 chips × 2 TensorCores), got $PRODUCT"
+            exit 1
+          fi
+
+          # EP=1 → shard MoE weights on FSDP; EP>1 → shard on expert axis
+          if [ "$EP" -eq 1 ]; then
+            SHARD_EXP="true"
+          else
+            SHARD_EXP="false"
+          fi
+
+          echo "ep=$EP" >> "$GITHUB_OUTPUT"
+          echo "dp=$DP" >> "$GITHUB_OUTPUT"
+          echo "fsdp=$FSDP" >> "$GITHUB_OUTPUT"
+          echo "tp=$TP" >> "$GITHUB_OUTPUT"
+          echo "cp=$CP" >> "$GITHUB_OUTPUT"
+          echo "shard_exp_on_fsdp=$SHARD_EXP" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Generate unique job name
+        id: job
+        run: |
+          JOB_NAME="ci-prof-run${GITHUB_RUN_NUMBER}"
+          JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize branch name for K8s label
+        id: branch
+        run: |
+          RAW="${{ inputs.branch || github.ref_name }}"
+          LABEL=$(echo "$RAW" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 63 | sed 's/^[^a-zA-Z0-9]//;s/[^a-zA-Z0-9]$//')
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup previous JobSets for this branch
+        run: |
+          BRANCH_LABEL="${{ steps.branch.outputs.label }}"
+          echo "Cleaning up leftover 64-chip profiling JobSets for branch=$BRANCH_LABEL..."
+          kubectl delete jobsets -l "app=ci-profiling,repo-branch=$BRANCH_LABEL" --ignore-not-found
+
+      - name: Deploy JobSet
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          BRANCH: ${{ inputs.branch || github.ref_name }}
+          BRANCH_LABEL: ${{ steps.branch.outputs.label }}
+          USER: ${{ github.actor }}
+          STEPS: ${{ inputs.steps }}
+          PER_DEVICE_BATCH_SIZE: ${{ inputs.per_device_batch_size }}
+          GRADIENT_ACCUMULATION_STEPS: ${{ inputs.gradient_accumulation_steps }}
+          REMAT_POLICY: ${{ inputs.remat_policy }}
+          PROFILER: ${{ inputs.profiler }}
+          PROFILER_STEPS: ${{ inputs.profiler_steps }}
+          SKIP_FIRST_N_STEPS_FOR_PROFILER: ${{ inputs.skip_first_n_steps_for_profiler }}
+          ICI_EXPERT_PARALLELISM: ${{ steps.ici.outputs.ep }}
+          ICI_DATA_PARALLELISM: ${{ steps.ici.outputs.dp }}
+          ICI_FSDP_PARALLELISM: ${{ steps.ici.outputs.fsdp }}
+          ICI_TENSOR_PARALLELISM: ${{ steps.ici.outputs.tp }}
+          ICI_CONTEXT_PARALLELISM: ${{ steps.ici.outputs.cp }}
+          SHARD_EXP_ON_FSDP: ${{ steps.ici.outputs.shard_exp_on_fsdp }}
+          LIBTPU_INIT_ARGS: ${{ inputs.libtpu_init_args }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+          GRAIN_WORKER_COUNT: ${{ inputs.grain_worker_count }}
+        run: |
+          echo "=== 64-chip Profiling Configuration ==="
+          echo "  Branch:       $BRANCH"
+          echo "  JobSet:       $JOB_NAME"
+          echo "  Owner:        $USER"
+          echo "  Remat Policy: $REMAT_POLICY"
+          echo "  Batch Size:   $PER_DEVICE_BATCH_SIZE (per-device)"
+          echo "  Steps:        $STEPS (profiling $PROFILER_STEPS step(s) after skip=$SKIP_FIRST_N_STEPS_FOR_PROFILER)"
+          echo "  Profiler:     $PROFILER"
+          echo "  Grad Accum:   $GRADIENT_ACCUMULATION_STEPS"
+          echo "  ICI:          EP=$ICI_EXPERT_PARALLELISM DP=$ICI_DATA_PARALLELISM FSDP=$ICI_FSDP_PARALLELISM TP=$ICI_TENSOR_PARALLELISM CP=$ICI_CONTEXT_PARALLELISM"
+          echo "  Shard Exp:    $SHARD_EXP_ON_FSDP"
+          echo "  Extra XLA:    ${LIBTPU_INIT_ARGS:-<none>}"
+          echo "  Extra Args:   ${EXTRA_ARGS:-<none>}"
+          echo "  Output:       gs://data_ant/pretrain/profiling/${JOB_NAME}/"
+          echo "========================================"
+
+          envsubst '$JOB_NAME $BRANCH $BRANCH_LABEL $USER $STEPS $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS $REMAT_POLICY $PROFILER $PROFILER_STEPS $SKIP_FIRST_N_STEPS_FOR_PROFILER $ICI_EXPERT_PARALLELISM $ICI_DATA_PARALLELISM $ICI_FSDP_PARALLELISM $ICI_TENSOR_PARALLELISM $ICI_CONTEXT_PARALLELISM $SHARD_EXP_ON_FSDP $LIBTPU_INIT_ARGS $EXTRA_ARGS $GRAIN_WORKER_COUNT' \
+            < .github/ci/tpu-profiling-job.yaml \
+            | kubectl apply -f -
+
+      - name: Wait for worker pods to start
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          echo "Waiting for worker pods of JobSet $JOB_NAME (16 pods expected)..."
+          for i in $(seq 1 360); do
+            READY=$(kubectl get pods \
+              -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" \
+              --field-selector=status.phase=Running \
+              -o name 2>/dev/null | wc -l | tr -d ' ')
+            echo "  Running pods: $READY/16 ($i/360)"
+            if [ "$READY" -ge 16 ]; then
+              echo "All 16 pods are running!"
+              break
+            fi
+            if [ "$i" -eq 360 ]; then
+              echo "Timeout waiting for pods. Current status:"
+              kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Stream logs & wait for completion
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+
+          POD_0=$(kubectl get pods \
+            -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "$POD_0" ]; then
+            echo "ERROR: could not locate coordinator pod for JobSet $JOB_NAME"
+            kubectl get jobset "$JOB_NAME" -o wide || true
+            exit 1
+          fi
+
+          echo "Streaming logs from coordinator $POD_0"
+          kubectl logs -f "$POD_0" -c jax-tpu || true
+
+          if kubectl wait --for=condition=Completed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet completed successfully!"
+            echo ""
+            echo "=== Profiling results ==="
+            echo "  GCS path: gs://data_ant/pretrain/profiling/${JOB_NAME}/"
+            echo "  Browse:   gsutil ls gs://data_ant/pretrain/profiling/${JOB_NAME}/"
+            exit 0
+          fi
+          if kubectl wait --for=condition=Failed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet failed! Dumping last 50 lines from corner pods (0, 1, 14, 15):"
+            for idx in 0 1 14 15; do
+              POD=$(kubectl get pods \
+                -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=$idx" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [ -n "$POD" ]; then
+                echo "=== Logs from pod $POD (index $idx) ==="
+                kubectl logs "$POD" -c jax-tpu --tail=50 2>/dev/null || true
+              fi
+            done
+            exit 1
+          fi
+          echo "JobSet in unexpected state:"
+          kubectl get jobset/"$JOB_NAME" -o wide
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          kubectl delete jobset "$JOB_NAME" --ignore-not-found

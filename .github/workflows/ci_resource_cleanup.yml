@@ -24,18 +24,21 @@ jobs:
           cluster_name: ${{ secrets.GKE_CLUSTER }}
           location: ${{ secrets.GKE_LOCATION }}
 
-      - name: Delete CI resources older than 4 hours
+      - name: Delete stale CI resources (per-label thresholds)
         run: |
-          THRESHOLD=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)
           FOUND=0
 
-          for APP_LABEL in ci-smoke-test ci-unit-tests; do
-            echo "Checking $APP_LABEL resources created before $THRESHOLD"
-            for KIND in job service secret; do
+          cleanup_group() {
+            local APP_LABEL=$1
+            local THRESHOLD_HOURS=$2
+            local KINDS=$3
+            local THRESHOLD
+            THRESHOLD=$(date -u -d "${THRESHOLD_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)
+            echo "Checking $APP_LABEL resources created before $THRESHOLD (${THRESHOLD_HOURS}h threshold)"
+            for KIND in $KINDS; do
               ITEMS=$(kubectl get "$KIND" -l "app=$APP_LABEL" \
                 -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' \
                 2>/dev/null || true)
-
               while IFS=$'\t' read -r NAME CREATED; do
                 [ -z "$NAME" ] && continue
                 if [[ "$CREATED" < "$THRESHOLD" ]]; then
@@ -45,7 +48,26 @@ jobs:
                 fi
               done <<< "$ITEMS"
             done
-          done
+          }
+
+          # Short-running pool-based CI (unit tests + smoke test): 4h is plenty
+          cleanup_group ci-smoke-test 4 "job service secret"
+          cleanup_group ci-unit-tests 4 "job service secret"
+
+          # Long-running 1k-step training JobSets (activeDeadlineSeconds=86400 = 24h);
+          # 26h threshold leaves ~2h runway past the deadline for the workflow to self-cleanup.
+          cleanup_group tpu-4chips-ling2-job 26 "jobset"
+          cleanup_group tpu-32chips-ling2-job 26 "jobset"
+
+          # Loss validation (activeDeadlineSeconds=14400 = 4h);
+          # 6h threshold leaves ~2h for workflow self-cleanup past the deadline.
+          cleanup_group ci-loss-validation 6 "jobset"
+
+          # Profiling 16 chips (activeDeadlineSeconds=5400 = 1.5h); 3h threshold.
+          cleanup_group ci-profiling-16chip 3 "jobset"
+
+          # Profiling 64 chips (activeDeadlineSeconds=10800 = 3h); 5h threshold.
+          cleanup_group ci-profiling 5 "jobset"
 
           echo "Cleanup done. Deleted $FOUND stale resources."
 

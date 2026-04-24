@@ -1,0 +1,138 @@
+name: TPU Pretrain 1K Steps
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run on (defaults to the branch you triggered from)"
+        required: false
+        type: string
+      use_fp8_blockwise:
+        description: "Enable FP8 blockwise quantization (Tokamax GMM path)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: tpu-1k-steps
+  cancel-in-progress: true
+
+jobs:
+  tpu_1k_steps:
+    name: "1000-step pretrain on 4 TPU chips"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Generate unique job name
+        id: job
+        run: |
+          JOB_NAME="ci-1k-run${GITHUB_RUN_NUMBER}"
+          JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize branch name for K8s label
+        id: branch
+        run: |
+          RAW="${{ inputs.branch || github.ref_name }}"
+          LABEL=$(echo "$RAW" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 63 | sed 's/^[^a-zA-Z0-9]//;s/[^a-zA-Z0-9]$//')
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup previous JobSets for this branch
+        run: |
+          BRANCH_LABEL="${{ steps.branch.outputs.label }}"
+          echo "Cleaning up leftover JobSets for branch=$BRANCH_LABEL..."
+          kubectl delete jobsets -l "app=tpu-4chips-ling2-job,repo-branch=$BRANCH_LABEL" --ignore-not-found
+
+      - name: Deploy JobSet
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          BRANCH: ${{ inputs.branch || github.ref_name }}
+          BRANCH_LABEL: ${{ steps.branch.outputs.label }}
+          USER: ${{ github.actor }}
+          USE_FP8_BLOCKWISE: ${{ inputs.use_fp8_blockwise }}
+        run: |
+          echo "=== 1K-step Pretrain (4 chips) Configuration ==="
+          echo "  Branch:        $BRANCH"
+          echo "  JobSet:        $JOB_NAME"
+          echo "  Owner:         $USER"
+          echo "  FP8 blockwise: $USE_FP8_BLOCKWISE"
+          echo "================================================"
+
+          envsubst '$JOB_NAME $BRANCH $BRANCH_LABEL $USER $USE_FP8_BLOCKWISE' \
+            < .github/ci/tpu-4chips-ling2-job.yaml \
+            | kubectl apply -f -
+
+      - name: Wait for worker pod to start
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          echo "Waiting for worker pod of JobSet $JOB_NAME (1 pod expected)..."
+          for i in $(seq 1 60); do
+            POD=$(kubectl get pods \
+              -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "$POD" ]; then
+              PHASE=$(kubectl get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              echo "  Pod $POD phase: $PHASE"
+              if [ "$PHASE" = "Running" ] || [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+                break
+              fi
+            fi
+            echo "  Waiting for pod to be scheduled... ($i/60)"
+            sleep 10
+          done
+
+      - name: Stream logs & wait for completion
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+
+          POD=$(kubectl get pods \
+            -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "$POD" ]; then
+            echo "ERROR: could not locate worker pod for JobSet $JOB_NAME"
+            kubectl get jobset "$JOB_NAME" -o wide || true
+            kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+            exit 1
+          fi
+
+          echo "Streaming logs from $POD"
+          kubectl logs -f "$POD" -c jax-tpu || true
+
+          # Wait for JobSet terminal condition (|| true to handle kubectl wait errors on unknown conditions)
+          if kubectl wait --for=condition=Completed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet completed successfully!"
+            exit 0
+          fi
+          if kubectl wait --for=condition=Failed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet failed! Last 50 lines of pod log:"
+            kubectl logs "$POD" -c jax-tpu --tail=50 2>/dev/null || true
+            exit 1
+          fi
+          echo "JobSet in unexpected state:"
+          kubectl get jobset/"$JOB_NAME" -o wide
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          kubectl delete jobset "$JOB_NAME" --ignore-not-found

@@ -1,0 +1,145 @@
+name: TPU Loss Validation (100 steps)
+
+on:
+  schedule:
+    # Daily at midnight UTC+8 (16:00 UTC previous day)
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run on (defaults to main)"
+        required: false
+        type: string
+
+concurrency:
+  group: tpu-loss-validation
+  cancel-in-progress: false
+
+jobs:
+  tpu_loss_validation:
+    name: "100-step loss validation on 64 TPU chips"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Generate unique job name
+        id: job
+        run: |
+          JOB_NAME="ci-lossval-run${GITHUB_RUN_NUMBER}"
+          JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize branch name for K8s label
+        id: branch
+        run: |
+          RAW="${{ inputs.branch || github.ref_name }}"
+          LABEL=$(echo "$RAW" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 63 | sed 's/^[^a-zA-Z0-9]//;s/[^a-zA-Z0-9]$//')
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup previous JobSets for loss validation
+        run: |
+          echo "Cleaning up leftover loss-validation JobSets..."
+          kubectl delete jobsets -l "app=ci-loss-validation" --ignore-not-found
+
+      - name: Deploy JobSet
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          BRANCH: ${{ inputs.branch || 'main' }}
+          BRANCH_LABEL: ${{ steps.branch.outputs.label }}
+          USER: ${{ github.actor }}
+        run: |
+          echo "=== Loss Validation (64 chips, 100 steps) ==="
+          echo "  Branch:    $BRANCH"
+          echo "  JobSet:    $JOB_NAME"
+          echo "  Owner:     $USER"
+          echo "  Parallelism: EP=128 (pure expert parallelism)"
+          echo "  Reference: /models/ci-reference/loss_ling2_100step.json"
+          echo "=============================================="
+
+          envsubst '$JOB_NAME $BRANCH $BRANCH_LABEL $USER' \
+            < .github/ci/tpu-loss-validation-job.yaml \
+            | kubectl apply -f -
+
+      - name: Wait for worker pods to start
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          echo "Waiting for worker pods of JobSet $JOB_NAME (16 pods expected)..."
+          for i in $(seq 1 360); do
+            READY=$(kubectl get pods \
+              -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" \
+              --field-selector=status.phase=Running \
+              -o name 2>/dev/null | wc -l | tr -d ' ')
+            echo "  Running pods: $READY/16 ($i/360)"
+            if [ "$READY" -ge 16 ]; then
+              echo "All 16 pods are running!"
+              break
+            fi
+            if [ "$i" -eq 360 ]; then
+              echo "Timeout waiting for pods. Current status:"
+              kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Stream logs & wait for completion
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+
+          POD_0=$(kubectl get pods \
+            -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -z "$POD_0" ]; then
+            echo "ERROR: could not locate coordinator pod (completion index 0) for JobSet $JOB_NAME"
+            kubectl get jobset "$JOB_NAME" -o wide || true
+            kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+            exit 1
+          fi
+
+          echo "Streaming logs from coordinator $POD_0"
+          kubectl logs -f "$POD_0" -c jax-tpu || true
+
+          if kubectl wait --for=condition=Completed jobset/"$JOB_NAME" --timeout=180m 2>/dev/null; then
+            echo "JobSet completed successfully — loss validation passed!"
+            exit 0
+          fi
+          if kubectl wait --for=condition=Failed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet failed! Dumping last 50 lines from corner pods (0, 1, 14, 15):"
+            for idx in 0 1 14 15; do
+              POD=$(kubectl get pods \
+                -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=$idx" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+              if [ -n "$POD" ]; then
+                echo "=== Logs from pod $POD (index $idx) ==="
+                kubectl logs "$POD" -c jax-tpu --tail=50 2>/dev/null || true
+              fi
+            done
+            exit 1
+          fi
+          echo "JobSet did not reach terminal state:"
+          kubectl get jobset/"$JOB_NAME" -o wide
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          kubectl delete jobset "$JOB_NAME" --ignore-not-found
