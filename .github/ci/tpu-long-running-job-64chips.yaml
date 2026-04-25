@@ -2,8 +2,8 @@
 # Ported from primatrix/ant-pretrain job/256chips-pr.
 # Topology 4x4x4 — 16 pods x 4 chips = 64 chips (128 devices)
 # NOTE: Per-tensor remat envs (MLPWO/CONTEXT/GATE_PROJ) from the source
-# manifest are intentionally omitted — pretrain_ling2.sh does not read them.
-# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER
+# manifest are intentionally omitted — pretrain_multi_dataset_ling2.sh does not read them.
+# This template is rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER $USE_FP8_BLOCKWISE
 ---
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -85,13 +85,17 @@ spec:
                 fi
 
                 # 5. Run training
+                FP8_ARGS=""
+                if [ "${USE_FP8_BLOCKWISE:-}" = "true" ]; then
+                  FP8_ARGS="quantization=fp8_blockwise use_qwix_quantization=true fp8_format=e4m3 use_tokamax_gmm=true"
+                fi
                 if [ -n "$LOG_FILE" ]; then
-                  bash scripts/pretrain_ling2.sh 2>&1 | tee -a "$LOG_FILE"
+                  bash scripts/pretrain_multi_dataset_ling2.sh $FP8_ARGS 2>&1 | tee -a "$LOG_FILE"
                 else
-                  bash scripts/pretrain_ling2.sh
+                  bash scripts/pretrain_multi_dataset_ling2.sh $FP8_ARGS
                 fi
               env:
-              # --- CI overrides (picked up by pretrain_ling2.sh) ---
+              # --- CI overrides (picked up by pretrain_multi_dataset_ling2.sh) ---
               - name: STEPS
                 value: "95367"
               - name: PER_DEVICE_BATCH_SIZE
@@ -106,6 +110,9 @@ spec:
                 value: "${JOB_NAME}"
               - name: GCS_BUCKET
                 value: "gs://ant-pretrain/pretrain/64chips"
+              # --- FP8 blockwise quantization (set to "true" to enable) ---
+              - name: USE_FP8_BLOCKWISE
+                value: "${USE_FP8_BLOCKWISE}"
               - name: ICI_DATA_PARALLELISM
                 value: "4"
               - name: ICI_FSDP_PARALLELISM
