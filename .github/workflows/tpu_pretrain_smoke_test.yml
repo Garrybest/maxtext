@@ -6,14 +6,16 @@ on:
     paths-ignore:
       - 'tests/**'
       - 'docs/**'
-      - '.github/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/CODEOWNERS'
       - '**/*.md'
   pull_request:
     branches: [main]
     paths-ignore:
       - 'tests/**'
       - 'docs/**'
-      - '.github/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/CODEOWNERS'
       - '**/*.md'
   workflow_dispatch:
 

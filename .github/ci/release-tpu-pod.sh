@@ -45,23 +45,33 @@ kubectl exec "${POD}" -- find /workspace /opt/ci-env -mindepth 1 -delete \
   2>/dev/null || true
 
 # --- Atomic release: set status=idle and remove claim annotations ---
-# Use temp files to avoid bash variable mangling JSON escape sequences.
-RELEASE_JSON_FILE=$(mktemp)
-RELEASE_PATCHED_FILE=$(mktemp)
-trap 'rm -f "${RELEASE_JSON_FILE}" "${RELEASE_PATCHED_FILE}"' EXIT
+# Use JSON Merge Patch so we only send the fields we want to change. The
+# previous `kubectl replace -f` path embedded the pod's resourceVersion
+# and PUT the whole object, which routinely 409'd because kubelet updates
+# pod status (containerStatuses, probe state) every few seconds — leaving
+# stale "busy" claims whose Release step still silently exited 0.
+PATCH_BODY='{"metadata":{"labels":{"status":"idle"},"annotations":{"ci.primatrix/claimed-by":null,"ci.primatrix/claimed-at":null,"ci.primatrix/task-type":null}}}'
 
-kubectl get pod "${POD}" -o json > "${RELEASE_JSON_FILE}" 2>/dev/null || true
-if [[ -s "${RELEASE_JSON_FILE}" ]]; then
-  jq '
-      .metadata.labels.status = "idle"
-      | del(.metadata.annotations["ci.primatrix/claimed-by"])
-      | del(.metadata.annotations["ci.primatrix/claimed-at"])
-      | del(.metadata.annotations["ci.primatrix/task-type"])
-    ' < "${RELEASE_JSON_FILE}" > "${RELEASE_PATCHED_FILE}" \
-    && kubectl replace -f "${RELEASE_PATCHED_FILE}" \
-    || echo "WARNING: kubectl replace failed; pod may not have been reset to idle" >&2
-else
-  echo "WARNING: pod ${POD} not found; skipping label reset" >&2
+if ! kubectl patch pod "${POD}" --type=merge -p "${PATCH_BODY}"; then
+  echo "::warning::kubectl patch failed on pod ${POD}; claim may be stale" >&2
+fi
+
+# --- Readback verification ---
+# A zero exit from patch is not sufficient — network or auth flakes can
+# still leave the claim in place. Read live state back so infra issues
+# surface as GitHub warnings instead of silently leaking a pool slot.
+#
+# We only flag a leak when the claim is *still our own JOB_NAME* — anything
+# else (empty/idle, or claimed-by another job that won the acquire race
+# milliseconds after our patch) means our release succeeded. The acquire
+# loop polls every 15s and can legitimately reclaim a freshly-released pod
+# before this readback runs; treating that as a leak would create noisy
+# false-positive infra alerts.
+read -r actual_status actual_claim <<< "$(kubectl get pod "${POD}" \
+  -o jsonpath='{.metadata.labels.status}{" "}{.metadata.annotations.ci\.primatrix/claimed-by}' \
+  2>/dev/null || true)"
+if [[ "${actual_claim:-}" == "${JOB_NAME}" ]]; then
+  echo "::warning::Pod ${POD} release did not take effect (status='${actual_status}', claimed-by still '${actual_claim}'); pool capacity leaked one slot" >&2
 fi
 
 echo "Released pod ${POD}"
