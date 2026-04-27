@@ -15,6 +15,7 @@
  -->
 
 (performance-metrics)=
+
 # Performance metrics
 
 ## MFU
@@ -23,14 +24,14 @@ Model Flops Utilization (MFU) is one of the most commonly used metrics to summar
 
 ### Definition
 
-Model FLOPs are the floating point operations required to perform model computations regardless of implementation or hardware limitations. 
+Model FLOPs are the floating point operations required to perform model computations regardless of implementation or hardware limitations.
 For training, this corresponds to the operations in a single forward and backward pass (one model step).
 
 $$ MFU:= \frac{\text{model flops/s}}{\text{peak hardware flops/s}} $$
 
 Model flops are generally easy to calculate/estimate theoretically since the model is mostly performing matmuls, and so we can just sum up the flops of each matmul. For example a $[A,B] \times [B,C] = [A,C]$ matmul has $2ABC$ flops. Hence, to calculate the observed model flops/s we can sum up the theoretical flops required in a training step of the model and then divide by the measured step time (in seconds).
 
- $$ MFU = \frac{\text{model flops/s}}{\text{peak hardware flops/s}} = \frac{\text{theoretical model flops per step}}{\text{measured step time} \times \text{peak hardware flops/s}}$$
+$$ MFU = \frac{\text{model flops/s}}{\text{peak hardware flops/s}} = \frac{\text{theoretical model flops per step}}{\text{measured step time} \times \text{peak hardware flops/s}}$$
 
 Furthermore, since
 
@@ -59,10 +60,14 @@ $$
 Hence, MFU is the fraction of peak hardware performance actually utilized by the model, and can be expressed in different units — step time, throughput, or raw flops/s.
 
 ### MaxText calculating + reporting
+
 In MaxText, we sum all of the matmuls performed in one step, see [calculate_tflops_per_device](https://github.com/AI-Hypercomputer/maxtext/blob/fafdeaa14183a8f5ca7b9f7b7542ce1655237574/src/MaxText/maxtext_utils.py#L454)
-and divide it by the measured (via python `time.time()`) step time. In each step we print the resulting Model Flops per second [`per_device_tflops_per_sec`](https://github.com/AI-Hypercomputer/maxtext/blob/fafdeaa14183a8f5ca7b9f7b7542ce1655237574/src/MaxText/metric_logger.py#L211-L213). One can calculate the MFU by dividing this number by the peak tflops of the hardware (e.g., $918e^{12}$ FLOPS/s for Trillium).
+and divide it by the measured (via python `time.time()`) step time. In each step we print the resulting Model Flops per second [`per_device_tflops_per_sec`](https://github.com/AI-Hypercomputer/maxtext/blob/fafdeaa14183a8f5ca7b9f7b7542ce1655237574/src/MaxText/metric_logger.py#L211-L213).
+
+MaxText emits `perf/mfu` directly whenever the hardware bf16 peak is known. The peak is auto-detected from `jax.devices()[0].device_kind` (see `src/maxtext/utils/peak_tflops_map.py` for the supported chip table). To override — e.g. for fp8/int8 training or chips not yet in the table — set `peak_tflops_per_device` in your config. When neither auto-detect nor override provides a positive peak, `perf/mfu` is not emitted (a single WARNING is logged at setup).
 
 ### Causal attention
+
 Due to causality only half of the (query, key) pairs need to be computed, those with query_idx >= key_idx. This accounts for the fact only prior tokens can be used to predict future ones. Prior to https://github.com/AI-Hypercomputer/maxtext/pull/1988 MaxText did not account for sparsity for theoretical flops, and used
 
 Attention Flops ~= 4 * sequence^2 * batch * heads * head_dim
@@ -75,19 +80,22 @@ Which maxtext now uses since this [PR/1988](https://github.com/AI-Hypercomputer/
 
 Note that
 
-$$ \text{Total Flops} =  \text{Attention (quadratic in sequence) + Non-attention  (linear)}$$ 
+$$ \text{Total Flops} =  \text{Attention (quadratic in sequence) + Non-attention  (linear)}$$
 
 Thus the distinction between causal vs non causal flops is particularly important for long sequence when the attention flops dominate / are a significant fraction of the total flops. For 8k sequence length, the attention flops are generally around 10% of total flops (depending on exact model dims), whereas for 128k seq, the attention flops may be around 90%. Note however the attention flops also vary by attention type, e.g. sliding window flops are not quadratic in sequence, but are only linear in both sequence length and window length. We updated our model flops calculation to account for sliding window attention and chunked attention in [PR 2009](https://github.com/AI-Hypercomputer/maxtext/pull/2009) and [PR 2030](https://github.com/AI-Hypercomputer/maxtext/pull/2030).
 
 ### Why MFU
+
 MFU is a very useful metric to understand your systems performance, but like step time or tokens/s, there are pros and cons of summarizing the system’s performance to a single number.
 
 **Pros**
-* Clearly shows room left to improve, how much more the hardware is capable of. (e.g. 25% MFU means it's possible to get 4x more performance and 4x smaller step times). Note that achieving 100% is not practical due to many factors, but MFU score effectively shows how much room is left for optimization.
-* Generalizable across hardwares, model, configs (e.g. batch sizes)
+
+- Clearly shows room left to improve, how much more the hardware is capable of. (e.g. 25% MFU means it's possible to get 4x more performance and 4x smaller step times). Note that achieving 100% is not practical due to many factors, but MFU score effectively shows how much room is left for optimization.
+- Generalizable across hardwares, model, configs (e.g. batch sizes)
 
 **Cons**
-* Care needs to be token to compare MFU across codebases that the model flops calculation are identcail (e.g. was causality taken into account in both code bases?)
+
+- Care needs to be token to compare MFU across codebases that the model flops calculation are identcail (e.g. was causality taken into account in both code bases?)
 
 Step time, tokens/s, and MFU all can be used to calculate how long training will take (e.g. how long will it take to train my model on $T$ tokens given $C$ chips?)
 

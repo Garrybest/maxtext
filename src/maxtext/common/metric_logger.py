@@ -33,6 +33,7 @@ from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
+from maxtext.utils.peak_tflops_map import get_peak_tflops_per_device
 from collections import defaultdict
 
 mldiag, _ = mldiagnostics_modules()
@@ -47,8 +48,9 @@ _METRICS_TO_MANAGED = {
     "perf/step_time_seconds": "step_time",
     "perf/per_device_tokens_per_sec": "throughput",
     "perf/per_device_tflops_per_sec": "tflops",
+    "perf/mfu": "mfu",
     # There are no mappings to the following metrics yet:
-    # "latency", "mfu"
+    # "latency"
 }
 
 
@@ -83,6 +85,7 @@ def record_activation_metrics(output_metrics, intermediate_outputs, config):
 class MetadataKey(enum.Enum):
   PER_DEVICE_TFLOPS = "per_device_tflops"
   PER_DEVICE_TOKENS = "per_device_tokens"
+  PEAK_TFLOPS_PER_DEVICE = "peak_tflops_per_device"
 
 
 class MetricLogger:
@@ -317,6 +320,7 @@ class MetricLogger:
     num_model_parameters = max_utils.calculate_num_params_from_pytree(params)
     self.metadata[MetadataKey.PER_DEVICE_TFLOPS], _, _ = maxtext_utils.calculate_tflops_training_per_device(self.config)
     self.metadata[MetadataKey.PER_DEVICE_TOKENS] = maxtext_utils.calculate_tokens_training_per_device(self.config)
+    self.metadata[MetadataKey.PEAK_TFLOPS_PER_DEVICE] = get_peak_tflops_per_device(self.config)
     max_logging.log(f"number parameters: {num_model_parameters/1e9:.3f} billion")
     max_utils.add_text_to_summary_writer("num_model_parameters", str(num_model_parameters), self.writer)
     max_utils.add_text_to_summary_writer("libtpu_init_args", os.getenv("LIBTPU_INIT_ARGS", ""), self.writer)
@@ -365,9 +369,11 @@ class MetricLogger:
     metrics["scalar"].update({"learning/global_batch_size": self.config.global_batch_size_to_train_on})
     if step >= self.config.rampup_end_step:
       metrics["scalar"].update({"perf/per_device_tflops": self.metadata[MetadataKey.PER_DEVICE_TFLOPS]})
-      metrics["scalar"].update(
-          {"perf/per_device_tflops_per_sec": (self.metadata[MetadataKey.PER_DEVICE_TFLOPS] / step_time)}
-      )
+      tflops_per_sec = self.metadata[MetadataKey.PER_DEVICE_TFLOPS] / step_time
+      metrics["scalar"].update({"perf/per_device_tflops_per_sec": tflops_per_sec})
+      peak = self.metadata[MetadataKey.PEAK_TFLOPS_PER_DEVICE]
+      if peak > 0:
+        metrics["scalar"]["perf/mfu"] = tflops_per_sec / peak
       metrics["scalar"].update({"perf/per_device_tokens": self.metadata[MetadataKey.PER_DEVICE_TOKENS]})
       metrics["scalar"].update(
           {"perf/per_device_tokens_per_sec": (self.metadata[MetadataKey.PER_DEVICE_TOKENS] / step_time)}

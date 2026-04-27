@@ -1733,6 +1733,14 @@ class Metrics(BaseModel):
       False,
       description="Whether to enable Tunix-managed metrics measurement. The metrics will be uploaded to tensorboard.",
   )
+  peak_tflops_per_device: NonNegativeFloat = Field(
+      0.0,
+      description=(
+          "Override for bf16 peak TFLOPs per device (for perf/mfu). "
+          "Default 0 triggers auto-detect via jax.devices()[0].device_kind. "
+          "Set explicitly for fp8/int8 training or unrecognized chips."
+      ),
+  )
 
 
 class ManagedMLDiagnostics(BaseModel):

@@ -109,6 +109,11 @@ DATA_SHUFFLE_SEED=42
 INIT_WEIGHTS_SEED=42
 REMAT_POLICY=${REMAT_POLICY:-"save_out_proj"}
 
+# MFU override (optional). Auto-detected by default from jax device_kind.
+# Only set for fp8/int8 training, or if your chip isn't in the bf16 peak table.
+# See src/maxtext/utils/peak_tflops_map.py for the supported chip table.
+PEAK_TFLOPS_PER_DEVICE=${PEAK_TFLOPS_PER_DEVICE:-0.0}
+
 CHECKPOINT_PERIOD=${CHECKPOINT_PERIOD:-100}
 
 # ============================================================================
@@ -229,6 +234,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     checkpoint_period=$CHECKPOINT_PERIOD \
     async_checkpointing=false \
     gcs_metrics=false \
+    peak_tflops_per_device=$PEAK_TFLOPS_PER_DEVICE \
     save_config_to_gcs=false \
     jax_cache_dir=$JAX_CACHE_DIR \
     load_parameters_path=/models/gpu-ckpt-ling2.5/ling2.5-maxtext/0/items/ \
