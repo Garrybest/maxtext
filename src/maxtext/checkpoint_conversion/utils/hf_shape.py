@@ -879,6 +879,162 @@ def LING2_HF_WEIGHTS_TO_SHAPE(config):
   return mapping
 
 
+def LING3_HF_WEIGHTS_TO_SHAPE(config):
+  """Returns mapping between HuggingFace Ling3 (BailingMoeV3) weights path and their shape.
+
+  Ling3 shares Ling2's skeleton (heterogeneous dense/MoE layers, mixed MLA/linear attention,
+  optional MTP at `model.layers.{num_hidden_layers}`) but replaces GLA with KDA and adds a
+  head-wise MLA output gate `g_proj` when `enable_gated_attention=True`.
+  """
+  hidden_size = config["hidden_size"]
+  num_hidden_layers = config["num_hidden_layers"]
+  vocab_size = config["vocab_size"]
+  first_k_dense = int(config.get("first_k_dense_replace", 0))
+  layer_group_size = int(config["layer_group_size"])
+  q_lora_rank = int(config.get("q_lora_rank", 0) or 0)
+  kv_lora_rank = int(config["kv_lora_rank"])
+  qk_nope_head_dim = int(config["qk_nope_head_dim"])
+  qk_rope_head_dim = int(config["qk_rope_head_dim"])
+  v_head_dim = int(config["v_head_dim"])
+  num_attention_heads = int(config["num_attention_heads"])
+  head_dim = int(config.get("head_dim", qk_nope_head_dim))
+  moe_intermediate_size = int(config["moe_intermediate_size"])
+  intermediate_size = int(config.get("intermediate_size", moe_intermediate_size))
+  num_experts = int(config.get("num_experts", config.get("n_routed_experts")))
+  n_shared_experts = int(config.get("num_shared_experts", config.get("n_shared_experts", 1)) or 1)
+  shared_intermediate = int(
+      config.get(
+          "moe_shared_expert_intermediate_size",
+          n_shared_experts * moe_intermediate_size,
+      )
+  )
+  # MLA gated-attention granularity (three-way field introduced by PR #71):
+  #   "disabled"      → no g_proj
+  #   "head_wise"     → [num_heads, hidden] per-head scalar gate (Ling3 default)
+  #   "element_wise"  → [num_heads * v_head_dim, hidden] per-element gate
+  # Detection priority:
+  #   1. BailingMoeV3 HF config `gated_attention_proj_granularity_type` (real ckpt)
+  #   2. Legacy `enable_gated_attention=True` bool → head_wise (v1 compatibility)
+  mla_gated_attention_type = config.get("gated_attention_proj_granularity_type") or (
+      "head_wise" if config.get("enable_gated_attention", False) else "disabled"
+  )
+  short_conv_kernel_size = int(config.get("short_conv_kernel_size", config.get("linear_conv_kernel_dim", 4)))
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+
+  # MLA derived (same as Ling2)
+  q_dim = num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)
+  kv_b_dim = num_attention_heads * (qk_nope_head_dim + v_head_dim)
+  o_proj_in_dim = num_attention_heads * v_head_dim
+  kv_a_proj_out_dim = kv_lora_rank + qk_rope_head_dim
+
+  # KDA derived: PR #76 uses num_key_heads == num_value_heads == num_attention_heads,
+  # and key_head_dim == value_head_dim == head_dim. Projections flatten (H, D) to H*D.
+  kda_proj_size = num_attention_heads * head_dim  # used for q/k/v_proj, f_a_proj, g_a_proj
+
+  def _is_mla(i):
+    return (i + 1) % layer_group_size == 0 or i == num_hidden_layers - 1
+
+  mapping = {
+      "model.word_embeddings.weight": [vocab_size, hidden_size],
+      "model.norm.weight": [hidden_size],
+      "lm_head.weight": [vocab_size, hidden_size],
+  }
+
+  def _add_mla(prefix):
+    if q_lora_rank > 0:
+      mapping[f"{prefix}.q_a_proj.weight"] = [q_lora_rank, hidden_size]
+      mapping[f"{prefix}.q_a_layernorm.weight"] = [q_lora_rank]
+      mapping[f"{prefix}.q_b_proj.weight"] = [q_dim, q_lora_rank]
+    else:
+      mapping[f"{prefix}.query.weight"] = [q_dim, hidden_size]
+    mapping[f"{prefix}.kv_a_proj_with_mqa.weight"] = [kv_a_proj_out_dim, hidden_size]
+    mapping[f"{prefix}.kv_a_layernorm.weight"] = [kv_lora_rank]
+    mapping[f"{prefix}.kv_b_proj.weight"] = [kv_b_dim, kv_lora_rank]
+    mapping[f"{prefix}.dense.weight"] = [hidden_size, o_proj_in_dim]
+    # Ling3 gated-MLA output: shape depends on granularity type (RFC-0017 §3).
+    #   head_wise     → per-head scalar gate [num_heads, hidden]
+    #   element_wise  → per-element gate [num_heads * v_head_dim, hidden]
+    if mla_gated_attention_type == "head_wise":
+      mapping[f"{prefix}.g_proj.weight"] = [num_attention_heads, hidden_size]
+    elif mla_gated_attention_type == "element_wise":
+      mapping[f"{prefix}.g_proj.weight"] = [num_attention_heads * v_head_dim, hidden_size]
+
+  def _add_kda(prefix):
+    """KDA (Kimi Delta Attention) — PR #76 parameter tree.
+
+    Attribute names on the HF side mirror bailing_moe_v3 exactly:
+    q_proj / k_proj / v_proj / q_conv1d / k_conv1d / v_conv1d / A_log / dt_bias /
+    f_a_proj (gate-decay) / b_proj (beta) / g_a_proj (output gate) / o_norm / o_proj.
+    """
+    # Separate Q/K/V projections (not fused, unlike Ling2 GLA)
+    mapping[f"{prefix}.q_proj.weight"] = [kda_proj_size, hidden_size]
+    mapping[f"{prefix}.k_proj.weight"] = [kda_proj_size, hidden_size]
+    mapping[f"{prefix}.v_proj.weight"] = [kda_proj_size, hidden_size]
+    # Depthwise Conv1d with groups=channels in PyTorch: shape [channels, 1, kernel_size]
+    mapping[f"{prefix}.q_conv1d.weight"] = [kda_proj_size, 1, short_conv_kernel_size]
+    mapping[f"{prefix}.k_conv1d.weight"] = [kda_proj_size, 1, short_conv_kernel_size]
+    mapping[f"{prefix}.v_conv1d.weight"] = [kda_proj_size, 1, short_conv_kernel_size]
+    # Learnable gate-decay parameters
+    mapping[f"{prefix}.A_log"] = [num_attention_heads]
+    mapping[f"{prefix}.dt_bias"] = [kda_proj_size]
+    # Gate-decay input projection (HF attribute: `f_proj` in the saved checkpoint format,
+    # though the HF modeling file's `__init__` names it `f_a_proj` on the `no_kda_lora`
+    # path; the state_dict key written to safetensors is `f_proj.weight`).
+    mapping[f"{prefix}.f_proj.weight"] = [kda_proj_size, hidden_size]
+    # Beta (Delta rule mixing) projection (per-head scalar)
+    mapping[f"{prefix}.b_proj.weight"] = [num_attention_heads, hidden_size]
+    # Output gate projection (HF attribute `g_proj` in the saved checkpoint format,
+    # same caveat as `f_proj` above).
+    mapping[f"{prefix}.g_proj.weight"] = [kda_proj_size, hidden_size]
+    # Output gated RMSNorm (per head_dim)
+    mapping[f"{prefix}.o_norm.weight"] = [head_dim]
+    # Output projection
+    mapping[f"{prefix}.o_proj.weight"] = [hidden_size, kda_proj_size]
+
+  def _add_dense_mlp(prefix):
+    mapping[f"{prefix}.gate_proj.weight"] = [intermediate_size, hidden_size]
+    mapping[f"{prefix}.up_proj.weight"] = [intermediate_size, hidden_size]
+    mapping[f"{prefix}.down_proj.weight"] = [hidden_size, intermediate_size]
+
+  def _add_moe_mlp(prefix):
+    mapping[f"{prefix}.gate.weight"] = [num_experts, hidden_size]
+    mapping[f"{prefix}.gate.expert_bias"] = [num_experts]
+    mapping[f"{prefix}.shared_experts.gate_proj.weight"] = [shared_intermediate, hidden_size]
+    mapping[f"{prefix}.shared_experts.up_proj.weight"] = [shared_intermediate, hidden_size]
+    mapping[f"{prefix}.shared_experts.down_proj.weight"] = [hidden_size, shared_intermediate]
+    for e in range(num_experts):
+      ep = f"{prefix}.experts.{e}"
+      mapping[f"{ep}.gate_proj.weight"] = [moe_intermediate_size, hidden_size]
+      mapping[f"{ep}.up_proj.weight"] = [moe_intermediate_size, hidden_size]
+      mapping[f"{ep}.down_proj.weight"] = [hidden_size, moe_intermediate_size]
+
+  for i in range(num_hidden_layers):
+    lp = f"model.layers.{i}"
+    mapping[f"{lp}.input_layernorm.weight"] = [hidden_size]
+    mapping[f"{lp}.post_attention_layernorm.weight"] = [hidden_size]
+    if _is_mla(i):
+      _add_mla(f"{lp}.attention")
+    else:
+      _add_kda(f"{lp}.attention")
+    if i < first_k_dense:
+      _add_dense_mlp(f"{lp}.mlp")
+    else:
+      _add_moe_mlp(f"{lp}.mlp")
+
+  if has_mtp:
+    mp = f"model.layers.{num_hidden_layers}"
+    mapping[f"{mp}.enorm.weight"] = [hidden_size]
+    mapping[f"{mp}.hnorm.weight"] = [hidden_size]
+    mapping[f"{mp}.final_layernorm.weight"] = [hidden_size]
+    mapping[f"{mp}.eh_proj.weight"] = [hidden_size, 2 * hidden_size]
+    mapping[f"{mp}.input_layernorm.weight"] = [hidden_size]
+    mapping[f"{mp}.post_attention_layernorm.weight"] = [hidden_size]
+    _add_mla(f"{mp}.attention")
+    _add_moe_mlp(f"{mp}.mlp")
+
+  return mapping
+
+
 # {maxtext model name: {hf weight name: hf shape}}
 HF_SHAPE = {
     "gemma2-2b": GEMMA2_HF_WEIGHTS_TO_SHAPE,
@@ -907,4 +1063,5 @@ HF_SHAPE = {
     "mixtral-8x7b": MIXTRAL_HF_WEIGHTS_TO_SHAPE,
     "mixtral-8x22b": MIXTRAL_HF_WEIGHTS_TO_SHAPE,
     "ling2": LING2_HF_WEIGHTS_TO_SHAPE,
+    "ling3-tiny": LING3_HF_WEIGHTS_TO_SHAPE,
 }

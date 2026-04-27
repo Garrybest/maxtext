@@ -211,9 +211,20 @@ def _process(hf_path, processed_slice, output_weights, current_hook_fns, hf_shap
   # If hook is unsepecified, use identity
   if current_hook_fns:
     processed_slice = apply_hook_fns(processed_slice, target_hf_shape, current_hook_fns)
-  numpy_slice = convert_jax_weight_to_numpy(processed_slice).squeeze()
+  numpy_slice = convert_jax_weight_to_numpy(processed_slice)
+  # Only squeeze if the un-squeezed shape does not already match the declared HF
+  # target. This preserves intentional singleton dims — e.g. depthwise-conv
+  # weights stored as [channels, 1, kernel_size] in PyTorch — while still letting
+  # legacy hooks that over-produce leading dims be normalized via .squeeze().
   if numpy_slice.shape != tuple(target_hf_shape):
-    raise ValueError(f"Shape mismatch for {hf_path}: Expect {target_hf_shape}, got {numpy_slice.shape}")
+    squeezed = numpy_slice.squeeze()
+    if squeezed.shape == tuple(target_hf_shape):
+      numpy_slice = squeezed
+    else:
+      raise ValueError(
+          f"Shape mismatch for {hf_path}: Expect {target_hf_shape}, "
+          f"got {numpy_slice.shape} (squeezed: {squeezed.shape})"
+      )
   output_weights.append((hf_path, numpy_slice))
 
 

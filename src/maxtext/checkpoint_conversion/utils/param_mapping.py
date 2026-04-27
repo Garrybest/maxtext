@@ -2576,6 +2576,418 @@ def LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   return hooks
 
 
+def LING3_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
+  """Generates a parameter mapping from MaxText to HuggingFace for Ling3.
+
+  Ling3 shares Ling2's architectural skeleton (heterogeneous dense/MoE layers,
+  mixed MLA/linear attention, optional MTP at `model.layers.{num_hidden_layers}`)
+  but replaces GLA with KDA (Kimi Delta Attention, per PR #76) and adds a
+  head-wise MLA output gate (MaxText attr `g_proj` on the MLA module, mapped
+  to HF `attention.g_proj.weight`) when `enable_gated_attention` is
+  True (RFC-0012 §模型配置对比, RFC-0017 §3).
+
+  Supports both unscan (`scan_layers=False`) and scan (`scan_layers=True`)
+  modes. In scan mode, the hybrid unscan-prefix + scan-ScannableBlock layout
+  (RFC-0012 §4.6, RFC-0017 §7) is encoded as:
+    - HF layer < first_num_dense_layers   → `dense_layers_{i}` (single-value)
+    - HF layer < unscan_prefix (rounded)  → `moe_layers_{i - first_dense}` (single-value)
+    - Remaining HF layers                 → `moe_layers-layers_{intra_idx}` (list-value
+      of length scan_length; outer list enumerates scan iterations).
+    - MoE expert stacking inside scan becomes a nested list: outer=num_experts,
+      inner=scan_length (matching DeepSeek's scan-mode convention).
+
+  KDA attribute names follow PR #76 `feat/kda-attention` branch
+  (src/maxtext/layers/attention_kda.py) exactly: MaxText side uses `q_conv`
+  (not `q_conv1d`), `g_proj` for gate-decay, `gate_proj` for output gate;
+  HF side uses `q_conv1d` / `f_a_proj` / `g_a_proj` per bailing_moe_v3.
+
+  Args:
+    config: HF model configuration dictionary (BailingMoeV3).
+    maxtext_config: MaxText configuration object.
+    scan_layers: If True, generate scan-mode paths; else per-layer paths.
+
+  Returns:
+    dict: Mapping from MaxText parameter keys to HF parameter key(s) (str or list).
+  """
+  # pylint: disable=line-too-long
+  num_layers = int(config["num_hidden_layers"])
+  first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
+  num_experts = int(config.get("num_experts", config.get("n_routed_experts", maxtext_config.num_experts)))
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+  layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
+  q_lora_rank = int(config.get("q_lora_rank", maxtext_config.q_lora_rank))
+  # MLA gated-attention granularity (v2 three-state enum introduced by PR #71
+  # `mla_gated_attention_type`). Detection priority:
+  #   1. MaxText `mla_gated_attention_type` (v2 canonical attribute on the config)
+  #   2. HF config `gated_attention_proj_granularity_type` (real bailing_moe_v3 ckpt)
+  #   3. v1 legacy booleans (`enable_gated_attention` on either HF config or
+  #      MaxText config) → `head_wise` (matching the v1 fixed granularity)
+  #   4. otherwise `disabled`
+  # The mapping function itself only cares whether the gate is enabled (to decide
+  # emission); the shape (`head_wise` vs `element_wise`) is handled in HF_SHAPE.
+  mla_gated_attention_type = (
+      getattr(maxtext_config, "mla_gated_attention_type", None)
+      or config.get("gated_attention_proj_granularity_type")
+      or (
+          "head_wise"
+          if (config.get("enable_gated_attention", False) or getattr(maxtext_config, "enable_gated_attention", False))
+          else "disabled"
+      )
+  )
+  enable_gated_attention = mla_gated_attention_type != "disabled"
+
+  def _is_mla(global_layer_idx):
+    is_last_layer_of_group = (global_layer_idx + 1) % layer_group_size == 0
+    is_last_layer_of_model = global_layer_idx == num_layers - 1
+    return is_last_layer_of_group or is_last_layer_of_model
+
+  if scan_layers:
+    if has_mtp and maxtext_config.mtp_num_layers > 0:
+      # MTP is always a single unscanned layer whose MoE expert tensor is
+      # shape [num_experts, ...]. `process_maxtext_param` Case 2 in scan mode
+      # slices any 1D list along `param_scan_axis`, which would mis-slice this
+      # expert-stacked tensor. Fixing this cleanly requires a per-key
+      # scanned/unscanned discriminator in `utils.py:process_maxtext_param`
+      # (framework scope, out of this RFC).
+      #
+      # Note: ling3-tiny.yml sets `scan_layers: true` for training efficiency,
+      # but checkpoint conversion is typically run with `scan_layers=false`
+      # overridden on the CLI (same pattern Ling2 requires; see RFC-0017
+      # §测试方案 for the exact invocation).
+      raise NotImplementedError(
+          "Ling3 checkpoint conversion with scan_layers=True + MTP enabled is not "
+          "supported: the shared framework cannot disambiguate MTP expert-stacking "
+          "(1D list of num_experts HF keys) from scan-axis slicing in scan mode. "
+          "Workaround: pass `scan_layers=false` at the conversion CLI (this is the "
+          "standard ckpt-conversion workflow; the ling3-tiny.yml default "
+          "`scan_layers: true` applies to training only), or set "
+          "`mtp_num_layers=0` if MTP is not needed."
+      )
+    if first_num_dense_layers > 0:
+      unscan_prefix = ((first_num_dense_layers + layer_group_size - 1) // layer_group_size) * layer_group_size
+    else:
+      unscan_prefix = 0
+    if unscan_prefix >= num_layers:
+      raise ValueError(
+          f"unscan_prefix ({unscan_prefix}) >= num_decoder_layers ({num_layers}); "
+          "check first_num_dense_layers / inhomogeneous_layer_cycle_interval."
+      )
+    scan_length = (num_layers - unscan_prefix) // layer_group_size
+  else:
+    unscan_prefix = num_layers
+    scan_length = 0
+
+  mapping = {
+      "params-token_embedder-embedding": "model.word_embeddings.weight",
+      "params-decoder-decoder_norm-scale": "model.norm.weight",
+      "params-decoder-logits_dense-kernel": "lm_head.weight",
+  }
+
+  def _emit_layer(mt_prefix, hf_prefix_or_list, *, is_moe, is_mla_layer):
+    """Populate mapping entries for one layer-worth of params.
+
+    hf_prefix_or_list: str (unscan) or list[str] (scan, len=scan_length).
+    """
+    is_list = isinstance(hf_prefix_or_list, list)
+
+    def emit(mt_suffix, hf_suffix):
+      if is_list:
+        mapping[f"{mt_prefix}-{mt_suffix}"] = [f"{hp}.{hf_suffix}" for hp in hf_prefix_or_list]
+      else:
+        mapping[f"{mt_prefix}-{mt_suffix}"] = f"{hf_prefix_or_list}.{hf_suffix}"
+
+    def emit_expert(mt_suffix, hf_suffix):
+      if is_list:
+        # Nested: outer=experts, inner=scan_length (DeepSeek convention)
+        mapping[f"{mt_prefix}-{mt_suffix}"] = [
+            [f"{hp}.mlp.experts.{e}.{hf_suffix}" for hp in hf_prefix_or_list] for e in range(num_experts)
+        ]
+      else:
+        mapping[f"{mt_prefix}-{mt_suffix}"] = [
+            f"{hf_prefix_or_list}.mlp.experts.{e}.{hf_suffix}" for e in range(num_experts)
+        ]
+
+    emit("input_layernorm-scale", "input_layernorm.weight")
+    emit("post_attention_layernorm-scale", "post_attention_layernorm.weight")
+
+    if is_mla_layer:
+      if q_lora_rank > 0:
+        emit("attention-wq_a-kernel", "attention.q_a_proj.weight")
+        emit("attention-q_norm-scale", "attention.q_a_layernorm.weight")
+        emit("attention-wq_b-kernel", "attention.q_b_proj.weight")
+      else:
+        emit("attention-query-kernel", "attention.query.weight")
+      emit("attention-wkv_a-kernel", "attention.kv_a_proj_with_mqa.weight")
+      emit("attention-kv_norm-scale", "attention.kv_a_layernorm.weight")
+      emit("attention-wkv_b-kernel", "attention.kv_b_proj.weight")
+      emit("attention-out-kernel", "attention.dense.weight")
+      if enable_gated_attention:
+        emit("attention-g_proj-kernel", "attention.g_proj.weight")
+    else:
+      # KDA (non-MLA linear attention). MaxText attrs follow PR #76; HF follows bailing_moe_v3.
+      emit("attention-q_proj-kernel", "attention.q_proj.weight")
+      emit("attention-k_proj-kernel", "attention.k_proj.weight")
+      emit("attention-v_proj-kernel", "attention.v_proj.weight")
+      emit("attention-q_conv-kernel", "attention.q_conv1d.weight")
+      emit("attention-k_conv-kernel", "attention.k_conv1d.weight")
+      emit("attention-v_conv-kernel", "attention.v_conv1d.weight")
+      emit("attention-A_log", "attention.A_log")
+      emit("attention-dt_bias", "attention.dt_bias")
+      emit("attention-g_proj-kernel", "attention.f_proj.weight")  # gate-decay projection (HF state_dict key)
+      emit("attention-b_proj-kernel", "attention.b_proj.weight")  # beta projection
+      emit("attention-gate_proj-kernel", "attention.g_proj.weight")  # output gate projection (HF state_dict key)
+      emit("attention-out_norm-scale", "attention.o_norm.weight")
+      emit("attention-o_proj-kernel", "attention.o_proj.weight")
+
+    if not is_moe:
+      emit("mlp-wi_0-kernel", "mlp.gate_proj.weight")
+      emit("mlp-wi_1-kernel", "mlp.up_proj.weight")
+      emit("mlp-wo-kernel", "mlp.down_proj.weight")
+    else:
+      emit("mlp-shared_experts-wi_0-kernel", "mlp.shared_experts.gate_proj.weight")
+      emit("mlp-shared_experts-wi_1-kernel", "mlp.shared_experts.up_proj.weight")
+      emit("mlp-shared_experts-wo-kernel", "mlp.shared_experts.down_proj.weight")
+      emit("mlp-MoeBlock_0-gate-kernel", "mlp.gate.weight")
+      emit("mlp-MoeBlock_0-gate-bias", "mlp.gate.expert_bias")
+      emit_expert("mlp-MoeBlock_0-wi_0", "gate_proj.weight")
+      emit_expert("mlp-MoeBlock_0-wi_1", "up_proj.weight")
+      emit_expert("mlp-MoeBlock_0-wo", "down_proj.weight")
+
+  # Unscan prefix: per-layer, single-value mapping
+  for hf_idx in range(min(unscan_prefix, num_layers)):
+    is_moe = hf_idx >= first_num_dense_layers
+    if is_moe:
+      mt_prefix = f"params-decoder-moe_layers_{hf_idx - first_num_dense_layers}"
+    else:
+      mt_prefix = f"params-decoder-dense_layers_{hf_idx}"
+    _emit_layer(mt_prefix, f"model.layers.{hf_idx}", is_moe=is_moe, is_mla_layer=_is_mla(hf_idx))
+
+  # Scan region: per-intra_idx, list-value mapping
+  if scan_layers:
+    for intra_idx in range(layer_group_size):
+      mt_prefix = f"params-decoder-moe_layers-layers_{intra_idx}"
+      hf_prefixes = [f"model.layers.{unscan_prefix + si * layer_group_size + intra_idx}" for si in range(scan_length)]
+      # is_mla is fixed by intra_idx position (same across scan iterations)
+      is_mla_at_intra = _is_mla(unscan_prefix + intra_idx)
+      _emit_layer(mt_prefix, hf_prefixes, is_moe=True, is_mla_layer=is_mla_at_intra)
+
+  if has_mtp and maxtext_config.mtp_num_layers > 0:
+    mtp_hf = f"model.layers.{num_layers}"
+    mtp_mt = "params-mtp_block-mtp_layer_1"
+    mtp_tf = f"{mtp_mt}-mtp_1_transformer_layer"
+    mapping.update(
+        {
+            f"{mtp_mt}-mtp_1_embedding_norm-scale": f"{mtp_hf}.enorm.weight",
+            f"{mtp_mt}-mtp_1_hidden_state_norm-scale": f"{mtp_hf}.hnorm.weight",
+            f"{mtp_mt}-mtp_1_final_layernorm-scale": f"{mtp_hf}.final_layernorm.weight",
+            f"{mtp_mt}-mtp_1_projection-kernel": f"{mtp_hf}.eh_proj.weight",
+            f"{mtp_tf}-input_layernorm-scale": f"{mtp_hf}.input_layernorm.weight",
+            f"{mtp_tf}-post_attention_layernorm-scale": f"{mtp_hf}.post_attention_layernorm.weight",
+            f"{mtp_tf}-attention-wkv_a-kernel": f"{mtp_hf}.attention.kv_a_proj_with_mqa.weight",
+            f"{mtp_tf}-attention-kv_norm-scale": f"{mtp_hf}.attention.kv_a_layernorm.weight",
+            f"{mtp_tf}-attention-wkv_b-kernel": f"{mtp_hf}.attention.kv_b_proj.weight",
+            f"{mtp_tf}-attention-out-kernel": f"{mtp_hf}.attention.dense.weight",
+            f"{mtp_tf}-mlp-MoeBlock_0-gate-kernel": f"{mtp_hf}.mlp.gate.weight",
+            f"{mtp_tf}-mlp-MoeBlock_0-gate-bias": f"{mtp_hf}.mlp.gate.expert_bias",
+            f"{mtp_tf}-mlp-shared_experts-wi_0-kernel": f"{mtp_hf}.mlp.shared_experts.gate_proj.weight",
+            f"{mtp_tf}-mlp-shared_experts-wi_1-kernel": f"{mtp_hf}.mlp.shared_experts.up_proj.weight",
+            f"{mtp_tf}-mlp-shared_experts-wo-kernel": f"{mtp_hf}.mlp.shared_experts.down_proj.weight",
+            f"{mtp_tf}-mlp-MoeBlock_0-wi_0": [f"{mtp_hf}.mlp.experts.{e}.gate_proj.weight" for e in range(num_experts)],
+            f"{mtp_tf}-mlp-MoeBlock_0-wi_1": [f"{mtp_hf}.mlp.experts.{e}.up_proj.weight" for e in range(num_experts)],
+            f"{mtp_tf}-mlp-MoeBlock_0-wo": [f"{mtp_hf}.mlp.experts.{e}.down_proj.weight" for e in range(num_experts)],
+        }
+    )
+    # MTP MLA Q-path mirrors main-layer MLA's q_lora_rank branch (LING3_HF_WEIGHTS_TO_SHAPE
+    # applies the same conditional, so configs with q_lora_rank=0 + MTP would otherwise
+    # emit wq_a/wq_b mapping entries whose HF targets are absent from HF_SHAPE).
+    if q_lora_rank > 0:
+      mapping[f"{mtp_tf}-attention-wq_a-kernel"] = f"{mtp_hf}.attention.q_a_proj.weight"
+      mapping[f"{mtp_tf}-attention-q_norm-scale"] = f"{mtp_hf}.attention.q_a_layernorm.weight"
+      mapping[f"{mtp_tf}-attention-wq_b-kernel"] = f"{mtp_hf}.attention.q_b_proj.weight"
+    else:
+      mapping[f"{mtp_tf}-attention-query-kernel"] = f"{mtp_hf}.attention.query.weight"
+    if enable_gated_attention:
+      mapping[f"{mtp_tf}-attention-g_proj-kernel"] = f"{mtp_hf}.attention.g_proj.weight"
+
+  return mapping
+
+
+def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, saving_to_hf=False):
+  """Transformation hooks for Ling3 checkpoint conversion.
+
+  Differences from Ling2:
+  - KDA (non-MLA) params: `q_proj`/`k_proj`/`v_proj`/`g_proj`/`b_proj`/
+    `gate_proj`/`o_proj` kernels use `reshape_kernel`; `q_conv`/`k_conv`/
+    `v_conv` kernels use the new `reshape_depthwise_conv` hook.
+  - MLA gains a conditional `g_proj` kernel when `enable_gated_attention` (PR #71;
+    maps to HF `attention.g_proj.weight` with head-wise shape).
+  - Scan-mode hook keys use `params-decoder-moe_layers-layers_{intra_idx}`.
+
+  Args:
+    config: HF model configuration dictionary.
+    maxtext_config: MaxText configuration object.
+    scan_layers: If True, emit hook keys for scan-region prefixes.
+    saving_to_hf: Direction flag. True = MaxText→HF, False = HF→MaxText.
+
+  Returns:
+    dict: Mapping from MaxText parameter keys to hook callables.
+  """
+
+  def reshape_kernel(input_tensor, target_shape):
+    if saving_to_hf:
+      return input_tensor.reshape(np.flip(np.array(target_shape))).T
+    return input_tensor.T.reshape(target_shape)
+
+  def transpose(input_tensor, target_shape=None):
+    del target_shape
+    return input_tensor.T
+
+  def reshape_depthwise_conv(input_tensor, target_shape=None):
+    """Depthwise Conv1d weight reshape.
+
+    PR #76 `ShortConvolution.kernel` is custom 2D `[kernel_size, features]`;
+    HF `nn.Conv1d(groups=channels)` weight is `[channels, 1, kernel_size]`.
+    """
+    del target_shape
+    if saving_to_hf:
+      return np.expand_dims(np.transpose(input_tensor, (1, 0)), axis=1)
+    return np.transpose(np.squeeze(input_tensor, axis=1), (1, 0))
+
+  num_layers = int(config["num_hidden_layers"])
+  first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
+  layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
+  q_lora_rank = int(config.get("q_lora_rank", maxtext_config.q_lora_rank))
+  # MLA gated-attention granularity (v2 three-state enum introduced by PR #71
+  # `mla_gated_attention_type`). Detection priority:
+  #   1. MaxText `mla_gated_attention_type` (v2 canonical attribute on the config)
+  #   2. HF config `gated_attention_proj_granularity_type` (real bailing_moe_v3 ckpt)
+  #   3. v1 legacy booleans (`enable_gated_attention` on either HF config or
+  #      MaxText config) → `head_wise` (matching the v1 fixed granularity)
+  #   4. otherwise `disabled`
+  # The mapping function itself only cares whether the gate is enabled (to decide
+  # emission); the shape (`head_wise` vs `element_wise`) is handled in HF_SHAPE.
+  mla_gated_attention_type = (
+      getattr(maxtext_config, "mla_gated_attention_type", None)
+      or config.get("gated_attention_proj_granularity_type")
+      or (
+          "head_wise"
+          if (config.get("enable_gated_attention", False) or getattr(maxtext_config, "enable_gated_attention", False))
+          else "disabled"
+      )
+  )
+  enable_gated_attention = mla_gated_attention_type != "disabled"
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+
+  def _is_mla(global_layer_idx):
+    is_last_layer_of_group = (global_layer_idx + 1) % layer_group_size == 0
+    is_last_layer_of_model = global_layer_idx == num_layers - 1
+    return is_last_layer_of_group or is_last_layer_of_model
+
+  if scan_layers:
+    if has_mtp and maxtext_config.mtp_num_layers > 0:
+      # Mirror the same guard as LING3_MAXTEXT_TO_HF_PARAM_MAPPING.
+      raise NotImplementedError(
+          "Ling3 checkpoint conversion with scan_layers=True + MTP enabled is not "
+          "supported: the shared framework cannot disambiguate MTP expert-stacking "
+          "from scan-axis slicing in scan mode. Workaround: pass `scan_layers=false` "
+          "at the conversion CLI (standard ckpt-conversion workflow), or set "
+          "`mtp_num_layers=0`."
+      )
+    if first_num_dense_layers > 0:
+      unscan_prefix = ((first_num_dense_layers + layer_group_size - 1) // layer_group_size) * layer_group_size
+    else:
+      unscan_prefix = 0
+  else:
+    unscan_prefix = num_layers
+
+  hooks = {"params-decoder-logits_dense-kernel": transpose}
+
+  def _emit_hooks(mt_prefix, *, is_moe, is_mla_layer):
+    if is_mla_layer:
+      if q_lora_rank > 0:
+        for suffix in ["wq_a-kernel", "wq_b-kernel"]:
+          hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_kernel
+      else:
+        hooks[f"{mt_prefix}-attention-query-kernel"] = reshape_kernel
+      for suffix in ["wkv_a-kernel", "wkv_b-kernel", "out-kernel"]:
+        hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_kernel
+      if enable_gated_attention:
+        hooks[f"{mt_prefix}-attention-g_proj-kernel"] = reshape_kernel
+    else:
+      # KDA kernels
+      for suffix in [
+          "q_proj-kernel",
+          "k_proj-kernel",
+          "v_proj-kernel",
+          "g_proj-kernel",
+          "b_proj-kernel",
+          "gate_proj-kernel",
+          "o_proj-kernel",
+      ]:
+        hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_kernel
+      # KDA depthwise convs (new hook)
+      for suffix in ["q_conv-kernel", "k_conv-kernel", "v_conv-kernel"]:
+        hooks[f"{mt_prefix}-attention-{suffix}"] = reshape_depthwise_conv
+      # A_log / dt_bias / out_norm.scale: no hook (1-D passthrough)
+
+    if not is_moe:
+      for suffix in ["wi_0-kernel", "wi_1-kernel", "wo-kernel"]:
+        hooks[f"{mt_prefix}-mlp-{suffix}"] = reshape_kernel
+    else:
+      for suffix in [
+          "shared_experts-wi_0-kernel",
+          "shared_experts-wi_1-kernel",
+          "shared_experts-wo-kernel",
+          "MoeBlock_0-gate-kernel",
+          "MoeBlock_0-wi_0",
+          "MoeBlock_0-wi_1",
+          "MoeBlock_0-wo",
+      ]:
+        hooks[f"{mt_prefix}-mlp-{suffix}"] = reshape_kernel
+
+  for hf_idx in range(min(unscan_prefix, num_layers)):
+    is_moe = hf_idx >= first_num_dense_layers
+    if is_moe:
+      mt_prefix = f"params-decoder-moe_layers_{hf_idx - first_num_dense_layers}"
+    else:
+      mt_prefix = f"params-decoder-dense_layers_{hf_idx}"
+    _emit_hooks(mt_prefix, is_moe=is_moe, is_mla_layer=_is_mla(hf_idx))
+
+  if scan_layers:
+    for intra_idx in range(layer_group_size):
+      mt_prefix = f"params-decoder-moe_layers-layers_{intra_idx}"
+      is_mla_at_intra = _is_mla(unscan_prefix + intra_idx)
+      _emit_hooks(mt_prefix, is_moe=True, is_mla_layer=is_mla_at_intra)
+
+  if has_mtp and maxtext_config.mtp_num_layers > 0:
+    mtp_mt = "params-mtp_block-mtp_layer_1"
+    mtp_tf = f"{mtp_mt}-mtp_1_transformer_layer"
+    mtp_kernel_keys = [
+        f"{mtp_mt}-mtp_1_projection-kernel",
+        f"{mtp_tf}-attention-wkv_a-kernel",
+        f"{mtp_tf}-attention-wkv_b-kernel",
+        f"{mtp_tf}-attention-out-kernel",
+        f"{mtp_tf}-mlp-MoeBlock_0-gate-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wi_0-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wi_1-kernel",
+        f"{mtp_tf}-mlp-shared_experts-wo-kernel",
+        f"{mtp_tf}-mlp-MoeBlock_0-wi_0",
+        f"{mtp_tf}-mlp-MoeBlock_0-wi_1",
+        f"{mtp_tf}-mlp-MoeBlock_0-wo",
+    ]
+    # MTP MLA Q-path hooks mirror main-layer MLA's q_lora_rank branch.
+    if q_lora_rank > 0:
+      mtp_kernel_keys.extend([f"{mtp_tf}-attention-wq_a-kernel", f"{mtp_tf}-attention-wq_b-kernel"])
+    else:
+      mtp_kernel_keys.append(f"{mtp_tf}-attention-query-kernel")
+    for key in mtp_kernel_keys:
+      hooks[key] = reshape_kernel
+    if enable_gated_attention:
+      hooks[f"{mtp_tf}-attention-g_proj-kernel"] = reshape_kernel
+
+  return hooks
+
+
 # {maxtext model name: {maxtext weight name: hf weight name}}
 PARAM_MAPPING = {
     "gemma2-2b": GEMMA2_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -2613,6 +3025,7 @@ PARAM_MAPPING = {
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_MAPPING,
     "ling2": LING2_MAXTEXT_TO_HF_PARAM_MAPPING,
+    "ling3-tiny": LING3_MAXTEXT_TO_HF_PARAM_MAPPING,
 }
 
 # {maxtext model name: {maxtext weight name: bi-directional transform}}
@@ -2652,6 +3065,7 @@ HOOK_FNS = {
     "olmo3-7b-pt": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "olmo3-32b": OLMO3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     "ling2": LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN,
+    "ling3-tiny": LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
 }
 
 VLLM_HOOK_FNS = {
