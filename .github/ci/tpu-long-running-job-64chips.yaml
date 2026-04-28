@@ -109,10 +109,18 @@ spec:
               - name: RUN_NAME
                 value: "${JOB_NAME}"
               - name: GCS_BUCKET
-                value: "gs://ant-pretrain/pretrain/64chips"
+                value: "gs://data_ant/pretrain/ling2"
               # --- FP8 blockwise quantization (set to "true" to enable) ---
               - name: USE_FP8_BLOCKWISE
                 value: "${USE_FP8_BLOCKWISE}"
+              # --- Vertex AI TensorBoard ---
+              - name: USE_VERTEX_TENSORBOARD
+                value: "true"
+              - name: VERTEX_TB_PROJECT
+                value: "tpu-for-training"
+              - name: VERTEX_TB_REGION
+                value: "us-central1"
+              # --- Parallelism ---
               - name: ICI_DATA_PARALLELISM
                 value: "4"
               - name: ICI_FSDP_PARALLELISM
