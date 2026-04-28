@@ -35,6 +35,22 @@ python3 -m maxtext.checkpoint_conversion.to_maxtext \
     scan_layers=False
 ```
 
+**Ling3 example:**
+
+```bash
+python3 -m maxtext.checkpoint_conversion.to_maxtext \
+    src/maxtext/configs/base.yml \
+    model_name=ling3-tiny \
+    base_output_directory=/path/to/ling3-maxtext-output \
+    attention=dot_product \
+    --hf_model_path=/path/to/ling3-hf/ \
+    --trust_remote_code=True \
+    --lazy_load_tensors=True \
+    hardware=cpu \
+    skip_jax_distributed_system=True \
+    scan_layers=False
+```
+
 ## 2. MaxText (Orbax) → HF
 
 ```bash
@@ -65,6 +81,22 @@ python3 -m maxtext.checkpoint_conversion.to_huggingface \
     base_output_directory=/path/to/ling2-hf-output \
     attention=dot_product \
     --hf_reference_path=/path/to/ling2-hf/ \
+    --trust_remote_code=True \
+    hardware=cpu \
+    skip_jax_distributed_system=True \
+    scan_layers=False
+```
+
+**Ling3 example:**
+
+```bash
+python3 -m maxtext.checkpoint_conversion.to_huggingface \
+    src/maxtext/configs/base.yml \
+    model_name=ling3-tiny \
+    load_parameters_path=/path/to/ling3-maxtext-output/0/items/ \
+    base_output_directory=/path/to/ling3-hf-output \
+    attention=dot_product \
+    --hf_reference_path=/path/to/ling3-hf/ \
     --trust_remote_code=True \
     hardware=cpu \
     skip_jax_distributed_system=True \

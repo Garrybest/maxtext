@@ -269,6 +269,22 @@ def _build_mt_to_hf_mapping(model_name: str, hf_config: dict) -> dict:
   return out
 
 
+def _build_mt_hook_fn_map(model_name: str, hf_config: dict) -> dict:
+  """Build {maxtext_orbax_key: hook_fn_or_list} matching the conversion-time hook chain.
+
+  The numerical compare phase needs to apply the same HF→MT hooks that
+  to_maxtext.py used during conversion (e.g. reshape_kernel, reshape_depthwise_conv).
+  Without this, layout transformations like the depthwise-conv squeeze+transpose
+  cannot be inverted by the simple b.reshape(a.shape) fallback in _compare_pair.
+  """
+  from maxtext.checkpoint_conversion.utils.param_mapping import HOOK_FNS  # pylint: disable=import-outside-toplevel
+
+  if model_name not in HOOK_FNS:
+    return {}
+  hooks = HOOK_FNS[model_name](hf_config, _make_maxtext_config(hf_config), saving_to_hf=False)
+  return {_pm_key_to_orbax_key(pm_key): hook for pm_key, hook in hooks.items()}
+
+
 def _numel(shape) -> int:
   n = 1
   for d in shape:
@@ -456,8 +472,25 @@ _MT_NON_LAYER_KEYS = frozenset(
 )
 
 
-def _phase_numerical_mt_hf(mt: Source, hf: HFSource, mapping: dict, layer_filter: set, atol: float):
-  """MT↔HF numerical: apply PARAM_MAPPING, compare with transpose for kernels."""
+def _phase_numerical_mt_hf(
+    mt: Source,
+    hf: HFSource,
+    mapping: dict,
+    hooks_map: dict,
+    layer_filter: set,
+    atol: float,
+):
+  """MT↔HF numerical: apply PARAM_MAPPING + HOOK_FNS, compare element-wise.
+
+  When a hook is registered for a given mt_key, it is applied to the HF tensor
+  (HF→MT direction) before the diff. This is required for params like KDA
+  depthwise conv kernels where MT layout ([K, C]) is not a flat-buffer view of
+  HF layout ([C, 1, K]) — only the conversion-time hook can invert the
+  squeeze+transpose. When no hook is registered, fall back to the legacy
+  transpose_b/reshape heuristic.
+  """
+  from maxtext.checkpoint_conversion.utils.utils import apply_hook_fns  # pylint: disable=import-outside-toplevel
+
   results = []
   ok = 0
   bad = 0
@@ -491,7 +524,11 @@ def _phase_numerical_mt_hf(mt: Source, hf: HFSource, mapping: dict, layer_filter
         bad += 1
         continue
       consumed_hf.add(hf_keys[0])
-      stats = _compare_pair(mt_arr, hf.load(hf_keys[0]), transpose_b=needs_transpose)
+      hf_arr = hf.load(hf_keys[0])
+      hook = hooks_map.get(mt_key)
+      if hook is not None:
+        hf_arr = apply_hook_fns(hf_arr, mt_arr.shape, hook)
+      stats = _compare_pair(mt_arr, hf_arr, transpose_b=(needs_transpose and hook is None))
       stats["key"] = mt_key
       results.append(stats)
       if stats["status"] == "ok" and stats.get("max_diff", 0.0) <= atol:
@@ -523,7 +560,11 @@ def _phase_numerical_mt_hf(mt: Source, hf: HFSource, mapping: dict, layer_filter
           expert_errors.append({"expert": ei, "hf_key": hk, "status": "hf_missing"})
           continue
         consumed_hf.add(hk)
-        s = _compare_pair(mt_arr[ei], hf.load(hk), transpose_b=needs_transpose)
+        hf_arr = hf.load(hk)
+        hook = hooks_map.get(mt_key)
+        if hook is not None:
+          hf_arr = apply_hook_fns(hf_arr, mt_arr[ei].shape, hook)
+        s = _compare_pair(mt_arr[ei], hf_arr, transpose_b=(needs_transpose and hook is None))
         if s["status"] == "ok":
           expert_diffs.append(s)
         else:
@@ -687,6 +728,7 @@ def main():
       ap.error(f"cross-format compare between {left.kind} and {right.kind} not supported (need one HF side)")
     hf_config = hf_side.config()
     mapping = _build_mt_to_hf_mapping(args.model_name, hf_config)
+    hooks_map = _build_mt_hook_fn_map(args.model_name, hf_config)
 
   report = {"args": {k: str(v) for k, v in vars(args).items() if k not in ("left", "right")}}
   structure_ok = True
@@ -709,7 +751,7 @@ def main():
       t0 = time.time()
       if cross:
         layer_filter = {int(x.strip()) for x in args.layers.split(",") if x.strip()}
-        phase_r = _phase_numerical_mt_hf(mt_side, hf_side, mapping, layer_filter, args.atol)
+        phase_r = _phase_numerical_mt_hf(mt_side, hf_side, mapping, hooks_map, layer_filter, args.atol)
       else:
         phase_r = _phase_numerical_hf_hf(left, right, args.sample, args.atol, args.verbose)
       phase_r["elapsed_sec"] = time.time() - t0
