@@ -120,6 +120,7 @@ class MLATestBase(parameterized.TestCase):
         qk_nope_head_dim=cfg.qk_nope_head_dim,
         qk_rope_head_dim=cfg.qk_rope_head_dim,
         v_head_dim=cfg.v_head_dim,
+        mla_gated_attention_type=cfg.mla_gated_attention_type,
         model_mode=MODEL_MODE_PREFILL,
         rngs=self.nnx_rng,
     )

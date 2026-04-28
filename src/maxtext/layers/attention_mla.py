@@ -15,7 +15,7 @@
 """MLA Attention Layer."""
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
 import copy
 
 import jax
@@ -398,6 +398,7 @@ def mla_as_linen(
     original_max_position_embeddings: int = 4096,
     mscale: float = 1.0,  # scaling factor for softmax
     rope_factor: float = 40.0,  # rotary embedding factor
+    mla_gated_attention_type: Literal["disabled", "head_wise", "element_wise"] = "disabled",
     name: str | None = None,
 ):
   """A factory function to create an MLA as a Linen module.
@@ -469,6 +470,7 @@ def mla_as_linen(
       original_max_position_embeddings=original_max_position_embeddings,
       mscale=mscale,
       rope_factor=rope_factor,
+      mla_gated_attention_type=mla_gated_attention_type,
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,
@@ -546,6 +548,7 @@ class MLA(Attention):
       original_max_position_embeddings: int = 4096,
       mscale: float = 1.0,  # scaling factor for softmax
       rope_factor: float = 40.0,  # rotary embedding factor
+      mla_gated_attention_type: Literal["disabled", "head_wise", "element_wise"] = "disabled",
       name: str | None = None,
       rngs: Optional[nnx.Rngs] = None,
   ):
@@ -568,6 +571,7 @@ class MLA(Attention):
     self.original_max_position_embeddings = original_max_position_embeddings
     self.mscale = mscale
     self.rope_factor = rope_factor
+    self.mla_gated_attention_type = mla_gated_attention_type
 
     self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
 
@@ -763,6 +767,45 @@ class MLA(Attention):
     if self.max_position_embeddings > self.original_max_position_embeddings:
       mscale = 0.1 * self.mscale * math.log(self.rope_factor) + 1.0
       self.softmax_scale = self.softmax_scale * mscale * mscale
+
+    # Gated attention output projection (see
+    # docs/superpowers/specs/2026-04-26-mla-gated-attention-ling3-design.md §4.3).
+    # head_wise: g_proj produces [B, S, num_heads]; element_wise: [B, S, num_heads, v_head_dim].
+    # Disabled by default; opt-in via cfg.mla_gated_attention_type.
+    assert self.mla_gated_attention_type in ("disabled", "head_wise", "element_wise"), (
+        f"Unknown mla_gated_attention_type={self.mla_gated_attention_type!r}; "
+        "expected one of 'disabled', 'head_wise', 'element_wise'."
+    )
+    if self.mla_gated_attention_type == "head_wise":
+      self.g_proj = DenseGeneral(
+          in_features_shape=self.config.emb_dim,
+          out_features_shape=self.num_query_heads,
+          axis=-1,
+          kernel_init=self.kernel_init,
+          kernel_axes=("embed", "heads"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+          shard_mode=self.config.shard_mode,
+          rngs=self.rngs,
+      )
+    elif self.mla_gated_attention_type == "element_wise":
+      self.g_proj = DenseGeneral(
+          in_features_shape=self.config.emb_dim,
+          out_features_shape=(self.num_query_heads, self.v_head_dim),
+          axis=-1,
+          kernel_init=self.kernel_init,
+          kernel_axes=("embed", "heads", "kv"),
+          dtype=self.dtype,
+          weight_dtype=self.weight_dtype,
+          quant=self.quant,
+          matmul_precision=self.config.matmul_precision,
+          shard_mode=self.config.shard_mode,
+          rngs=self.rngs,
+      )
+    else:
+      self.g_proj = None
 
     self.out = self.init_out_w(
         output_dim=inputs_q_shape[-1],
@@ -1176,6 +1219,19 @@ class MLA(Attention):
       out = self._maybe_shard_with_logical(out, self.out_axis_names)
 
     out_sharding = create_sharding(self.mesh, out_logical_name)
+    # Gated attention output (see
+    # docs/superpowers/specs/2026-04-26-mla-gated-attention-ling3-design.md §4.4).
+    # element_wise multiplies the gate exactly once, matching the Megatron-LM
+    # training reference apply_gated_attention_linear_gate. The HF PyTorch
+    # bailing_moe_v3 element_wise branch appears to multiply twice; we follow
+    # Megatron here as the authoritative training implementation.
+    if self.g_proj is not None:
+      gate = self.g_proj(inputs_q)
+      # sigmoid in fp32 for numerical stability near saturation, then cast back
+      gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(out.dtype)
+      if self.mla_gated_attention_type == "head_wise":
+        gate = jnp.expand_dims(gate, axis=-1)  # [B, S, H] -> [B, S, H, 1]
+      out = out * gate
     out = self.out_projection(out, out_sharding=out_sharding)
     out = checkpoint_name(out, "out_proj")
     return out, kv_cache

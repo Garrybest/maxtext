@@ -56,9 +56,9 @@ class Ling3ConfigLoadingTest(unittest.TestCase):
     self.assertEqual(self.cfg.v_head_dim, 128)
     self.assertTrue(self.cfg.mla_interleaved_rope)
 
-  def test_ling3_gated_attention_field(self):
-    """Tests Ling3-specific MLA output gating field (RFC §3.2)."""
-    self.assertTrue(self.cfg.enable_gated_attention)
+  def test_ling3_mla_gated_attention_type_field(self):
+    """Tests Ling3-specific mla_gated_attention_type field (RFC §3.2)."""
+    self.assertEqual(self.cfg.mla_gated_attention_type, "head_wise")
 
   def test_ling3_kda_fields(self):
     """Tests KDA-related fields from ling3-tiny.yml (RFC §3.1)."""
@@ -107,7 +107,7 @@ class Ling3DefaultsBackwardCompatTest(unittest.TestCase):
     """Tests llama2-7b is not affected by Ling3-specific new fields."""
     cfg = initialize_pydantic(["", _BASE_CONFIG_PATH, "model_name=llama2-7b"])
     # Newly added fields must default to safe values
-    self.assertFalse(cfg.enable_gated_attention)
+    self.assertEqual(cfg.mla_gated_attention_type, "disabled")
     self.assertEqual(cfg.linear_conv_kernel_dim, 4)
     self.assertFalse(cfg.use_kda_lora)
     self.assertFalse(cfg.use_kda_safe_gate)
@@ -116,7 +116,7 @@ class Ling3DefaultsBackwardCompatTest(unittest.TestCase):
   def test_ling2_unaffected(self):
     """Tests Ling2 still loads and the new MLA gate stays off (Ling2 has no gated attention)."""
     cfg = initialize_pydantic(["", _BASE_CONFIG_PATH, "model_name=ling2"])
-    self.assertFalse(cfg.enable_gated_attention)
+    self.assertEqual(cfg.mla_gated_attention_type, "disabled")
 
 
 class Ling3DecoderBlockTypeTest(unittest.TestCase):

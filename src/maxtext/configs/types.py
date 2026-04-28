@@ -563,18 +563,19 @@ class MlaAttention(BaseModel):
           "to match the non-interleaved RoPE convention."
       ),
   )
-  enable_gated_attention: bool = Field(
-      False,
+  mla_gated_attention_type: Literal["disabled", "head_wise", "element_wise"] = Field(
+      "disabled",
       description=(
-          "Whether to enable gated attention output for MLA layers in Ling3. "
-          "When True, applies a learnable gating mechanism (sigmoid-activated projection) "
-          "to the MLA attention output with per-head granularity (head_wise) using "
-          "linear_qkv_input as the gate input. "
-          "This is a Ling3-specific feature that adds a gate to MLA layer output, different from "
-          "the 'Gated' in GLA (which gates the attention computation itself). "
-          "Ling3 uses True for improved training stability and model quality. "
-          "Note: When enabled, the granularity is fixed to 'head_wise' and input tensor "
-          "is fixed to 'linear_qkv_input' as per Ling3 design."
+          "MLA gated attention output: 'disabled' | 'head_wise' | 'element_wise'. "
+          "When non-disabled, applies sigmoid(g_proj(hidden_states)) as a multiplicative "
+          "gate on the MLA attention output before out_projection. "
+          "'head_wise' produces a per-head scalar gate (g_proj: emb_dim -> num_heads) "
+          "broadcast over v_head_dim. "
+          "'element_wise' produces a per-element gate (g_proj: emb_dim -> num_heads * v_head_dim), "
+          "multiplied once (matching the Megatron-LM training reference; the HF PyTorch "
+          "element_wise branch appears to multiply twice — we follow Megatron here as the "
+          "authoritative training implementation). "
+          "Input tensor is fixed to hidden_states (Megatron's linear_qkv_input)."
       ),
   )
 

@@ -21,7 +21,7 @@ output land in independent PRs.
 Differences from Ling2 (`maxtext/models/ling2.py`):
   * Non-MLA positions use KDA (Kimi Delta Attention) instead of GLA. KDA is
     not yet implemented — see TODO in `Ling3GenericLayer.__init__`.
-  * MLA output gating is controlled by `cfg.enable_gated_attention` and lives
+  * MLA output gating is controlled by `cfg.mla_gated_attention_type` and lives
     inside `attention_mla.MLA` itself (separate PR). This module is unaware
     of the gate; it just instantiates MLA with the same parameters as Ling2.
 """
@@ -108,8 +108,8 @@ class Ling3GenericLayer(nnx.Module):
         self.layer_idx + 1
     ) % cfg.inhomogeneous_layer_cycle_interval == 0 or self.layer_idx >= cfg.num_decoder_layers
     if is_full_attention_layer:
-      # MLA — gating (cfg.enable_gated_attention) is applied inside attention_mla.MLA
-      # in a separate PR; this module passes through the same parameters as Ling2.
+      # MLA — gating (cfg.mla_gated_attention_type) is applied inside attention_mla.MLA;
+      # this module forwards the config field via the constructor kwarg below.
       self.attention = attention_mla.MLA(
           config=cfg,
           num_query_heads=cfg.num_query_heads,
@@ -140,6 +140,7 @@ class Ling3GenericLayer(nnx.Module):
           model_mode=model_mode,
           rngs=rngs,
           attn_logits_soft_cap=cfg.attn_logits_soft_cap,
+          mla_gated_attention_type=cfg.mla_gated_attention_type,
       )
     else:
       self.attention = attention_kda.KimiDeltaAttention(

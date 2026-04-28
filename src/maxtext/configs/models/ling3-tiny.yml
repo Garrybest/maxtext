@@ -39,8 +39,8 @@ v_head_dim: 128
 mscale: 1.0
 mla_interleaved_rope: true             # de-interleave RoPE dims before rotary embedding
 dropout_rate: 0.0
-## Gated Attention [NEW] - Ling3 specific MLA output gating
-enable_gated_attention: true                           # [NEW] enable gate on MLA output
+## Gated Attention - Ling3 specific MLA output gating
+mla_gated_attention_type: "head_wise"                  # MLA output gate (head_wise gate broadcast over v_head_dim)
 ## QK-Clip (MuonClip) - training stability; mirrors Megatron's enable_qkclip / attention_max_qkscores
 use_qk_clip: true
 qk_clip_threshold: 100

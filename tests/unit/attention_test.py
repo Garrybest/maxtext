@@ -1392,6 +1392,95 @@ class MLATest(attention_test_util.MLATestBase):
     self.assertTrue(hasattr(mla_layer, "out"), "MLA should have 'out' projection.")
 
   @parameterized.named_parameters(
+      {"testcase_name": "head_wise", "gated_type": "head_wise"},
+      {"testcase_name": "element_wise", "gated_type": "element_wise"},
+  )
+  @pytest.mark.tpu_only
+  def test_mla_gated_attention(self, gated_type):
+    """Tests that gated MLA constructs g_proj and produces expected output shape."""
+    config_arguments = self.config_arguments.copy()
+    config_arguments["mla_gated_attention_type"] = gated_type
+
+    cfg, mla_gated = self.init_mla(config_arguments, "default")
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, cfg.dtype)
+
+    mla_gated_out, _ = mla_gated(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    self.assertEqual(mla_gated_out.shape, lnx.shape)
+    self.assertIsNotNone(mla_gated.g_proj, f"MLA with {gated_type} gating should have g_proj.")
+
+    ungated_config = self.config_arguments.copy()
+    ungated_config["mla_gated_attention_type"] = "disabled"
+    _, mla_ungated = self.init_mla(ungated_config, "default")
+    self.assertIsNone(mla_ungated.g_proj, "MLA with 'disabled' gating should not have g_proj.")
+
+  @parameterized.named_parameters(
+      {"testcase_name": "head_wise_autoregression", "gated_type": "head_wise"},
+      {"testcase_name": "element_wise_autoregression", "gated_type": "element_wise"},
+  )
+  @pytest.mark.tpu_only
+  def test_mla_gated_attention_autoregression(self, gated_type):
+    """Tests that gated MLA prefill matches autoregressive decode."""
+    config_arguments = self.config_arguments.copy()
+    config_arguments["mla_gated_attention_type"] = gated_type
+
+    cfg, mla = self.init_mla(config_arguments, "default")
+    prefill_length = cfg.max_prefill_predict_length
+    decode_total_length = cfg.max_target_length
+    lnx, decoder_segment_ids, decoder_positions = self.get_structured_data(cfg, cfg.dtype)
+
+    mla_full, _ = mla(
+        lnx,
+        lnx,
+        decoder_segment_ids=decoder_segment_ids,
+        inputs_positions=decoder_positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    lnx_prefill = lnx[:, 0:prefill_length, :]
+    decoder_segment_ids_prefill = decoder_segment_ids[:, 0:prefill_length]
+    decoder_positions_prefill = decoder_positions[:, 0:prefill_length]
+
+    mla_prefill, _ = mla(
+        lnx_prefill,
+        lnx_prefill,
+        decoder_segment_ids=decoder_segment_ids_prefill,
+        inputs_positions=decoder_positions_prefill,
+        deterministic=True,
+        model_mode=MODEL_MODE_PREFILL,
+    )
+
+    self.assertTrue(
+        jax.numpy.allclose(mla_prefill, mla_full[:, :prefill_length, :], rtol=1e-02, atol=1e-02, equal_nan=False)
+    )
+
+    for idx in range(prefill_length, decode_total_length):
+      lnx_idx = lnx[:, idx : idx + 1, :]
+      decoder_positions_idx = decoder_positions[:, idx : idx + 1]
+      mla_idx, _ = mla(
+          lnx_idx,
+          lnx_idx,
+          inputs_positions=decoder_positions_idx,
+          deterministic=True,
+          model_mode=MODEL_MODE_AUTOREGRESSIVE,
+      )
+
+      mla_full_this_idx = mla_full[:, idx : idx + 1, :]
+      self.assertEqual(mla_full_this_idx.shape, mla_idx.shape)
+      # Looser tolerance than the disabled-mode test_autoregression (1e-2): the gate
+      # adds an extra fp32 sigmoid + bf16 round-trip per step, and the AR loop also
+      # exercises the KV-cache prefill→AR boundary tracked in b/394626702.
+      self.assertTrue(jax.numpy.allclose(mla_full_this_idx, mla_idx, rtol=2e-02, atol=2e-02, equal_nan=False))
+
+  @parameterized.named_parameters(
       {
           "testcase_name": "cp_no_load_balance",
           "ici_context_parallelism": 4,
