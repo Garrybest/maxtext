@@ -39,30 +39,6 @@ DTYPE_CODES = {
 DTYPE_CODES_INV = {v: k for k, v in DTYPE_CODES.items()}
 
 
-def _check_eod_presence(source, eod_id, mode_label):
-  """Warn if documents do not appear to end with eod_id.
-
-  Spot-checks the first few documents and emits a warning if none end
-  with ``eod_id``.  Both ``mmap`` and ``mmap_npy`` modes rely on the raw
-  data having been preprocessed with ``--append-eod``.
-  """
-  num_docs = len(source)
-  if num_docs == 0:
-    return
-  check_count = min(num_docs, 20)
-  docs_with_eod = sum(1 for i in range(check_count) if len(source[i]["text"]) > 0 and source[i]["text"][-1] == eod_id)
-  if docs_with_eod == 0:
-    log.warning(
-        "None of the first %d documents end with eod_id=%d. "
-        "%s does NOT insert EOD tokens — the dataset should "
-        "be preprocessed with --append-eod for correct document boundary "
-        "detection. Segment IDs and loss masking may be incorrect.",
-        check_count,
-        eod_id,
-        mode_label,
-    )
-
-
 @dataclasses.dataclass(frozen=True)
 class MMapDatasetConfig:
   """Dataset-specific config for mmap / mmap_npy formats."""
@@ -103,6 +79,8 @@ class MMapIndexedDataset:
     self._pointers = None
     self._doc_idx = None
     self._bin_fd = None
+    self._idx_buffer_mmap = None
+    self._idx_buffer = None
     self._read_index()
     self._open_bin()
 
@@ -168,16 +146,10 @@ class MMapIndexedDataset:
             f"got {file_size} bytes"
         )
 
-      sizes_bytes = f.read(self._num_sequences * 4)
-      self._sizes = np.frombuffer(sizes_bytes, dtype=np.int32).copy()
+      sizes_offset = f.tell()
+      pointers_offset = sizes_offset + self._num_sequences * 4
+      doc_idx_offset = pointers_offset + self._num_sequences * 8
 
-      pointers_bytes = f.read(self._num_sequences * 8)
-      self._pointers = np.frombuffer(pointers_bytes, dtype=np.int64).copy()
-
-      doc_idx_bytes = f.read(doc_idx_entries * 8)
-      self._doc_idx = np.frombuffer(doc_idx_bytes, dtype=np.int64).copy()
-
-      # Detect trailing data (e.g. Megatron multimodal sequence_modes)
       trailing_bytes = file_size - expected_total
       if trailing_bytes > 0:
         # Megatron-Core's multimodal format appends a uint8
@@ -199,22 +171,45 @@ class MMapIndexedDataset:
             f"corrupt or use an unsupported format extension."
         )
 
-    if self._num_sequences > 0:
-      neg_sizes = np.where(self._sizes < 0)[0]
-      if len(neg_sizes) > 0:
-        raise ValueError(
-            f"Negative sizes in {self._idx_path}: "
-            f"sequence(s) {neg_sizes[:5].tolist()} have negative sizes "
-            f"{self._sizes[neg_sizes[:5]].tolist()}"
-        )
+    self._idx_buffer_mmap = np.memmap(self._idx_path, mode="r", order="C")
+    self._idx_buffer = memoryview(self._idx_buffer_mmap)
+    self._sizes = np.frombuffer(self._idx_buffer, dtype=np.int32, count=self._num_sequences, offset=sizes_offset)
+    self._pointers = np.frombuffer(self._idx_buffer, dtype=np.int64, count=self._num_sequences, offset=pointers_offset)
+    self._doc_idx = np.frombuffer(self._idx_buffer, dtype=np.int64, count=doc_idx_entries, offset=doc_idx_offset)
+
+    _full_validation = os.environ.get("MMAP_IDX_FULL_VALIDATION", "").lower() in ("1", "true", "yes")
+    _sample_size = 256
+
+    def _idx_sample(n):
+      if n <= 0:
+        return np.empty(0, dtype=np.int64)
+      if _full_validation or n <= _sample_size + 2:
+        return np.arange(n, dtype=np.int64)
+      head_tail = np.array([0, n - 1], dtype=np.int64)
+      rng = np.random.default_rng(seed=0xC0FFEE)
+      sampled = rng.integers(low=0, high=n, size=_sample_size, dtype=np.int64)
+      return np.concatenate([head_tail, sampled])
 
     if self._num_sequences > 0:
-      neg_ptrs = np.where(self._pointers < 0)[0]
-      if len(neg_ptrs) > 0:
+      sample_idx = _idx_sample(self._num_sequences)
+      sampled_sizes = self._sizes[sample_idx]
+      neg_mask = sampled_sizes < 0
+      if neg_mask.any():
+        bad_pos = sample_idx[neg_mask][:5].tolist()
+        raise ValueError(
+            f"Negative sizes in {self._idx_path}: "
+            f"sequence(s) {bad_pos} have negative sizes "
+            f"{sampled_sizes[neg_mask][:5].tolist()}"
+        )
+
+      sampled_ptrs = self._pointers[sample_idx]
+      neg_mask = sampled_ptrs < 0
+      if neg_mask.any():
+        bad_pos = sample_idx[neg_mask][:5].tolist()
         raise ValueError(
             f"Negative pointers in {self._idx_path}: "
-            f"sequence(s) {neg_ptrs[:5].tolist()} have negative byte offsets "
-            f"{self._pointers[neg_ptrs[:5]].tolist()}"
+            f"sequence(s) {bad_pos} have negative byte offsets "
+            f"{sampled_ptrs[neg_mask][:5].tolist()}"
         )
 
     if self._num_documents > 0:
@@ -227,30 +222,38 @@ class MMapIndexedDataset:
             f"({self._num_sequences}), got {self._doc_idx[-1]}"
         )
       if len(self._doc_idx) > 1:
-        diffs = np.diff(self._doc_idx)
-        non_mono = np.where(diffs < 0)[0]
-        if len(non_mono) > 0:
+        n = len(self._doc_idx) - 1
+        pair_idx = _idx_sample(n)
+        a = self._doc_idx[pair_idx]
+        b = self._doc_idx[pair_idx + 1]
+        bad = b < a
+        if bad.any():
           raise ValueError(
-              f"Non-monotonic doc_idx in {self._idx_path}: " f"decreases at position(s) {non_mono[:5].tolist()}"
+              f"Non-monotonic doc_idx in {self._idx_path}: " f"decreases at position(s) {pair_idx[bad][:5].tolist()}"
           )
 
     element_size = np.dtype(self._dtype).itemsize
-    if element_size > 1:
-      misaligned = np.where(self._pointers % element_size != 0)[0]
-      if len(misaligned) > 0:
+    if element_size > 1 and self._num_sequences > 0:
+      sample_idx = _idx_sample(self._num_sequences)
+      sampled_ptrs = self._pointers[sample_idx]
+      misaligned_mask = (sampled_ptrs % element_size) != 0
+      if misaligned_mask.any():
+        bad_pos = sample_idx[misaligned_mask][:5].tolist()
         raise ValueError(
             f"Misaligned pointers in {self._idx_path}: "
-            f"sequence(s) {misaligned[:5].tolist()} have byte offsets "
+            f"sequence(s) {bad_pos} have byte offsets "
             f"not aligned to dtype itemsize ({element_size})"
         )
 
     if self._validate_bin_size and self._num_sequences > 0:
       bin_size = os.path.getsize(self._bin_path)
-      max_end = int(np.max(self._pointers + self._sizes.astype(np.int64) * element_size))
+      sample_idx = _idx_sample(self._num_sequences)
+      ends = self._pointers[sample_idx].astype(np.int64) + self._sizes[sample_idx].astype(np.int64) * element_size
+      max_end = int(np.max(ends))
       if max_end > bin_size:
         raise ValueError(
             f"Binary file {self._bin_path} is too small ({bin_size} bytes) "
-            f"for the indexed data (requires {max_end} bytes)"
+            f"for the indexed data (sampled requirement: {max_end} bytes)"
         )
 
   def _open_bin(self):
@@ -332,10 +335,22 @@ class MMapIndexedDataset:
     return self.get(idx)
 
   def close(self):
-    """Close the .bin file descriptor if open."""
+    """Close the .bin file descriptor and idx mmap if open."""
     if self._bin_fd is not None:
       os.close(self._bin_fd)
       self._bin_fd = None
+    self._sizes = None
+    self._pointers = None
+    self._doc_idx = None
+    if self._idx_buffer is not None:
+      try:
+        self._idx_buffer.release()
+      except (BufferError, ValueError):
+        pass
+      self._idx_buffer = None
+    if self._idx_buffer_mmap is not None:
+      del self._idx_buffer_mmap
+      self._idx_buffer_mmap = None
 
   def __del__(self):
     try:
@@ -376,6 +391,43 @@ class MMapIndexedDataSource(grain.RandomAccessDataSource):
     self._feature_name = feature_name
     self._split_sentences = split_sentences
     self._dataset = MMapIndexedDataset(path_prefix)
+
+  def check_eod_presence(self, eod_id: int, mode_label: str):
+    """Warn if documents do not appear to end with eod_id.
+
+    Reads only the last token of each checked sequence to minimise IO.
+    """
+    ds = self._dataset
+    num_docs = ds._num_documents if self._split_sentences else ds._num_sequences  # pylint: disable=protected-access
+    if num_docs == 0:
+      return
+    check_count = min(num_docs, 20)
+    docs_with_eod = 0
+    for i in range(check_count):
+      if self._split_sentences:
+        seq_start = int(ds.doc_idx[i])
+        seq_end = int(ds.doc_idx[i + 1])
+        if seq_end <= seq_start:
+          continue
+        last_seq = seq_end - 1
+      else:
+        last_seq = i
+      seq_size = int(ds.sizes[last_seq])
+      if seq_size <= 0:
+        continue
+      last_token = ds.get(last_seq, offset=seq_size - 1, length=1)
+      if int(last_token[0]) == eod_id:
+        docs_with_eod += 1
+    if docs_with_eod == 0:
+      log.warning(
+          "None of the first %d documents end with eod_id=%d. "
+          "%s does NOT insert EOD tokens — the dataset should "
+          "be preprocessed with --append-eod for correct document boundary "
+          "detection. Segment IDs and loss masking may be incorrect.",
+          check_count,
+          eod_id,
+          mode_label,
+      )
 
   def __len__(self):
     if self._split_sentences:
@@ -458,6 +510,10 @@ class MultiShardMMapIndexedDataSource(grain.RandomAccessDataSource):
       total += len(s)
       self._cumulative_sizes.append(total)
 
+  def check_eod_presence(self, eod_id: int, mode_label: str):
+    """Delegate EOD check to the first shard."""
+    self._sources[0].check_eod_presence(eod_id, mode_label)
+
   def __len__(self):
     return self._cumulative_sizes[-1] if self._cumulative_sizes else 0
 
@@ -522,7 +578,7 @@ class MMapSampleIndexDataSource(grain.RandomAccessDataSource):
     self._eod_id = eod_id
     self._drop_last = drop_last
     self._build_sample_index()
-    _check_eod_presence(self._inner_source, self._eod_id, "mmap mode")
+    self._inner_source.check_eod_presence(self._eod_id, "mmap mode")
 
   def _get_idx_paths(self):
     """Get all .idx file paths from the inner source for cache validation."""
@@ -807,15 +863,10 @@ class MegatronNpyDataSource(grain.RandomAccessDataSource):
       self._document_index, self._sample_index, self._shuffle_index = prebuilt_indices
       index_label = "<in-memory>"
     else:
-      # NOTE:
-      #   Using mmap_mode='r' here can trigger SIGBUS in Grain worker
-      #   processes on some shared/networked filesystems. For multi-host
-      #   training stability, default to fully loading these index arrays
-      #   into process memory.
       doc_path, sample_path, shuffle_path = _discover_npy_indices(npy_dir, expected_hash=expected_hash)
-      self._document_index = np.load(doc_path, allow_pickle=False)
-      self._sample_index = np.load(sample_path, allow_pickle=False)
-      self._shuffle_index = np.load(shuffle_path, allow_pickle=False)
+      self._document_index = np.load(doc_path, allow_pickle=False, mmap_mode="r")
+      self._sample_index = np.load(sample_path, allow_pickle=False, mmap_mode="r")
+      self._shuffle_index = np.load(shuffle_path, allow_pickle=False, mmap_mode="r")
       index_label = npy_dir
 
     prefixes = _resolve_bin_prefixes(bin_paths)
@@ -827,7 +878,7 @@ class MegatronNpyDataSource(grain.RandomAccessDataSource):
     self._check_split_sentences_consistency(split_sentences)
 
     self._validate_indices(index_label)
-    _check_eod_presence(self._token_source, self._eod_id, "mmap_npy mode")
+    self._token_source.check_eod_presence(self._eod_id, "mmap_npy mode")
 
   def _check_split_sentences_consistency(self, split_sentences: bool):
     """Detect split_sentences misconfiguration against the actual data.
@@ -857,7 +908,11 @@ class MegatronNpyDataSource(grain.RandomAccessDataSource):
         )
 
   def _validate_indices(self, index_label: str):
-    """Validate precomputed index files and fail fast with Python errors."""
+    """Validate precomputed index files and fail fast with Python errors.
+
+    Default lightweight mode checks shape/dtype + head/tail elements only.
+    Set MMAP_NPY_FULL_VALIDATION=1 for the original O(N) scan.
+    """
     if self._sample_index.ndim != 2 or self._sample_index.shape[1] != 2:
       raise ValueError(f"Invalid sample_index shape {self._sample_index.shape} in {index_label}; expected (N, 2).")
     if self._sample_index.shape[0] < 2:
@@ -869,38 +924,62 @@ class MegatronNpyDataSource(grain.RandomAccessDataSource):
     if len(self._shuffle_index) == 0:
       raise ValueError(f"shuffle_index in {index_label} is empty.")
 
-    min_sample_id = int(np.min(self._shuffle_index))
-    max_sample_id = int(np.max(self._shuffle_index))
+    _full_validation = os.environ.get("MMAP_NPY_FULL_VALIDATION", "").lower() in ("1", "true", "yes")
     sample_upper = int(self._sample_index.shape[0] - 1)
-    if min_sample_id < 0 or max_sample_id > sample_upper - 1:
-      raise ValueError(
-          f"shuffle_index in {index_label} references sample_id range [{min_sample_id}, {max_sample_id}], "
-          f"but valid range is [0, {sample_upper - 1}]."
-      )
-
-    min_doc_pos = int(np.min(self._sample_index[:, 0]))
-    max_doc_pos = int(np.max(self._sample_index[:, 0]))
     max_doc_upper = int(self._document_index.shape[0] - 1)
-    if min_doc_pos < 0 or max_doc_pos > max_doc_upper:
-      raise ValueError(
-          f"sample_index in {index_label} references doc_pos range [{min_doc_pos}, {max_doc_pos}], "
-          f"but valid document_index range is [0, {max_doc_upper}]."
-      )
-
-    # Validate document_index values against the token source
-    min_doc_id = int(np.min(self._document_index))
-    max_doc_id = int(np.max(self._document_index))
     num_total_docs = len(self._token_source)
-    if min_doc_id < 0 or max_doc_id >= num_total_docs:
-      raise ValueError(
-          f"document_index in {index_label} references doc_id range [{min_doc_id}, {max_doc_id}], "
-          f"but token source only has {num_total_docs} documents (valid range [0, {num_total_docs - 1}])."
-      )
 
-    # Validate sample_index token offsets are non-negative
-    min_token_offset = int(np.min(self._sample_index[:, 1]))
-    if min_token_offset < 0:
-      raise ValueError(f"sample_index in {index_label} contains negative token offset {min_token_offset}.")
+    if _full_validation:
+      min_sample_id = int(np.min(self._shuffle_index))
+      max_sample_id = int(np.max(self._shuffle_index))
+      if min_sample_id < 0 or max_sample_id > sample_upper - 1:
+        raise ValueError(
+            f"shuffle_index in {index_label} references sample_id range [{min_sample_id}, {max_sample_id}], "
+            f"but valid range is [0, {sample_upper - 1}]."
+        )
+
+      min_doc_pos = int(np.min(self._sample_index[:, 0]))
+      max_doc_pos = int(np.max(self._sample_index[:, 0]))
+      if min_doc_pos < 0 or max_doc_pos > max_doc_upper:
+        raise ValueError(
+            f"sample_index in {index_label} references doc_pos range [{min_doc_pos}, {max_doc_pos}], "
+            f"but valid document_index range is [0, {max_doc_upper}]."
+        )
+
+      min_doc_id = int(np.min(self._document_index))
+      max_doc_id = int(np.max(self._document_index))
+      if min_doc_id < 0 or max_doc_id >= num_total_docs:
+        raise ValueError(
+            f"document_index in {index_label} references doc_id range [{min_doc_id}, {max_doc_id}], "
+            f"but token source only has {num_total_docs} documents (valid range [0, {num_total_docs - 1}])."
+        )
+
+      min_token_offset = int(np.min(self._sample_index[:, 1]))
+      if min_token_offset < 0:
+        raise ValueError(f"sample_index in {index_label} contains negative token offset {min_token_offset}.")
+      return
+
+    for sid in (int(self._shuffle_index[0]), int(self._shuffle_index[-1])):
+      if sid < 0 or sid > sample_upper - 1:
+        raise ValueError(
+            f"shuffle_index in {index_label} contains sample_id {sid} outside valid range [0, {sample_upper - 1}]."
+        )
+
+    for label, row in (("first", self._sample_index[0]), ("last", self._sample_index[-1])):
+      doc_pos, tok_off = int(row[0]), int(row[1])
+      if doc_pos < 0 or doc_pos > max_doc_upper:
+        raise ValueError(
+            f"sample_index[{label}] in {index_label} references doc_pos {doc_pos} outside valid range "
+            f"[0, {max_doc_upper}]."
+        )
+      if tok_off < 0:
+        raise ValueError(f"sample_index[{label}] in {index_label} has negative token offset {tok_off}.")
+
+    for did in (int(self._document_index[0]), int(self._document_index[-1])):
+      if did < 0 or did >= num_total_docs:
+        raise ValueError(
+            f"document_index in {index_label} references doc_id {did} outside valid range " f"[0, {num_total_docs - 1}]."
+        )
 
   def __len__(self):
     return len(self._shuffle_index)
