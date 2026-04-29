@@ -2863,6 +2863,7 @@ class MaxTextConfig(
         DecoderBlockType.DEEPSEEK,
         DecoderBlockType.QWEN3,
         DecoderBlockType.GEMMA3,
+        DecoderBlockType.LING3,
         DecoderBlockType.LLAMA2,
     ]:
       raise ValueError(

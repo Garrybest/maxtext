@@ -23,8 +23,6 @@ import jax
 from jax.core import Tracer
 from jax.sharding import PartitionSpec as P, NamedSharding, reshard
 
-import optax
-
 from maxtext.common.common_types import ShardMode
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -454,9 +452,10 @@ def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
   """Updates parameter sharding configuration when optimizer state sharding is enabled.
 
   When shard_optimizer_over_data is enabled (Zero-1 style sharding), this function
-  extracts the optimizer state shardings from the Adam optimizer's first moment (mu)
-  and merges them with the parameter shardings. This ensures parameter sharding is
-  consistent with how the optimizer state is distributed across the compute mesh.
+  extracts the optimizer state shardings from the first-moment accumulator tree
+  (e.g. Adam's ``mu`` or Muon's masked/partitioned ``mu`` trees) and merges them
+  with the parameter shardings. This ensures parameter sharding is consistent with
+  how the optimizer state is distributed across the compute mesh.
 
   Args:
     config: Configuration object with shard_optimizer_over_data flag
@@ -468,16 +467,46 @@ def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
       - updated_state_mesh_shardings: State mesh shardings with updated params field
         (unchanged if shard_optimizer_over_data is False)
   """
+
+  def _is_masked_node(x):
+    return type(x).__name__ == "MaskedNode"
+
+  def _collect_optimizer_mu_trees(opt_state):
+    if hasattr(opt_state, "mu"):
+      return [opt_state.mu]
+    if hasattr(opt_state, "inner_states"):
+      mu_trees = []
+      inner_states = opt_state.inner_states
+      it = inner_states.values() if isinstance(inner_states, dict) else inner_states
+      for inner_state in it:
+        mu_trees.extend(_collect_optimizer_mu_trees(inner_state))
+      return mu_trees
+    if hasattr(opt_state, "inner_state"):
+      return _collect_optimizer_mu_trees(opt_state.inner_state)
+    if isinstance(opt_state, tuple):
+      mu_trees = []
+      for inner_state in opt_state:
+        mu_trees.extend(_collect_optimizer_mu_trees(inner_state))
+      return mu_trees
+    return []
+
+  def _merge_optimizer_mu_trees(mu_trees):
+    merged_tree = mu_trees[0]
+    for tree in mu_trees[1:]:
+      merged_tree = jax.tree.map(
+          lambda x, y: y if _is_masked_node(x) else x,
+          merged_tree,
+          tree,
+          is_leaf=_is_masked_node,
+      )
+    return merged_tree
+
   prev_params_shardings = state_mesh_shardings.params
   if config.shard_optimizer_over_data:
-    if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):
-      sharded_fp32_params = state_mesh_shardings.opt_state.mu
-    elif isinstance(state_mesh_shardings.opt_state, tuple) and isinstance(
-        state_mesh_shardings.opt_state[0], optax.ScaleByAdamState
-    ):
-      sharded_fp32_params = state_mesh_shardings.opt_state[0].mu
-    else:
+    mu_trees = _collect_optimizer_mu_trees(state_mesh_shardings.opt_state)
+    if not mu_trees:
       raise NotImplementedError(f"Could not find optimizer state shardings from {type(state_mesh_shardings.opt_state)}")
+    sharded_fp32_params = _merge_optimizer_mu_trees(mu_trees)
     if "params" not in sharded_fp32_params.keys():
       # When quantization=fp8 is enabled the sharded_fp32_params
       # are not wrapped in `params`. Here we wrap them back.

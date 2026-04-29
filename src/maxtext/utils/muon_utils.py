@@ -70,28 +70,27 @@ def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
     An instance of `MuonDimensionNumbers` if a specific mapping is found,
     `None` for excluded parameters, or a default `mdn` for standard weights.
   """
+  param_name = path[-2] if len(path) >= 2 and path[-1] == "kernel" else path[-1]
 
   # 1 Exclude parameters not suitable for Muon (scalar, embeddings, unembedding)
   if _is_path_contain_any(("scale", "bias", "embedding", "logits_dense"), path):
+    return None
+  if param_name in ("A_log", "dt_bias", "q_conv", "k_conv", "v_conv"):
     return None
 
   # 2 Special weights
   # 2.1 Special weights: MoE, [0, L, -2, -1]
   # L (optional) stands for layer when scan_layers=True
   if "MoeBlock_0" in path:
-    # exclude gate
-    if _is_path_contain_any(("wi_0", "wi_1", "wo"), path):
+    if param_name in ("wi_0", "wi_1", "wo"):
       return mdn((-2,), (-1,))
 
-  # 2.2 Special weights: Self attention
-  elif "self_attention" in path:
-    # Attention output projection: [0, L, -2, -1]
-    if "out" in path:
-      return mdn((0, -2), (-1,))
-    # Attention qkv projection: [0, L, -2, -1]
-    # MLA, exclude wq_a / wkv_a
-    elif _is_path_contain_any(("query", "key", "value", "wq_b", "wkv_b"), path):
-      return mdn((0,), (-2, -1))
+  # 2.2 Special weights: Attention projections. These include standard attention,
+  # MLA, and Ling3's KDA attention, which all materialize heads in the kernel.
+  if param_name in ("out", "o_proj"):
+    return mdn((0, -2), (-1,))
+  if param_name in ("query", "key", "value", "wq_b", "wkv_b", "q_proj", "k_proj", "v_proj", "g_proj", "gate_proj"):
+    return mdn((0,), (-2, -1))
 
   # 3 Standard weights, [0, L, -1]
   return mdn((0,), (-1,))

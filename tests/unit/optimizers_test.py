@@ -21,11 +21,13 @@ import jax
 import pytest
 from absl.testing import parameterized
 from optax.contrib import MuonDimensionNumbers as mdn
+from optax.contrib._muon import muon
 
 from maxtext.configs import pyconfig
 from maxtext.optimizers import optimizers
 from maxtext.utils import maxtext_utils
-from maxtext.utils.muon_utils import get_model_mdn
+from maxtext.utils import sharding
+from maxtext.utils.muon_utils import get_model_mdn, transform_logic
 from tests.utils.test_helpers import get_test_config_path
 from typing import NamedTuple
 
@@ -243,6 +245,90 @@ class MuonDimensionTest(parameterized.TestCase):
     """
     actual_output = get_model_mdn(model_name, scan_layers=True)
     self.assertEqual(actual_output, expected_output)
+
+
+class MuonTransformLogicTest(parameterized.TestCase):
+  """Tests Ling3-specific Muon dimension-number routing."""
+
+  @parameterized.named_parameters(
+      (
+          "kda_q_proj",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "q_proj", "kernel"),
+          mdn((0,), (-2, -1)),
+      ),
+      (
+          "kda_gate_proj",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "gate_proj", "kernel"),
+          mdn((0,), (-2, -1)),
+      ),
+      (
+          "kda_o_proj",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "o_proj", "kernel"),
+          mdn((0, -2), (-1,)),
+      ),
+      (
+          "kda_short_conv_kernel",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "q_conv", "kernel"),
+          None,
+      ),
+      (
+          "kda_a_log",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "A_log"),
+          None,
+      ),
+      (
+          "kda_dt_bias",
+          ("params", "decoder", "moe_layers", "layers_0", "attention", "dt_bias"),
+          None,
+      ),
+  )
+  def test_transform_logic_for_ling3_kda(self, path, expected):
+    self.assertEqual(transform_logic(path), expected)
+
+  def test_ling3_muon_config_is_allowed(self):
+    argv = ["", get_test_config_path(), "run_name=test", "model_name=ling3-tiny", "opt_type=muon"]
+    config = pyconfig.initialize(argv)
+    self.assertEqual(config.opt_type.value, "muon")
+
+
+class _DummyState:
+  """Minimal stand-in for the sharding helper's state object."""
+
+  def __init__(self, params, opt_state):
+    self.params = params
+    self.opt_state = opt_state
+
+  def replace(self, **kwargs):
+    return _DummyState(
+        params=kwargs.get("params", self.params),
+        opt_state=kwargs.get("opt_state", self.opt_state),
+    )
+
+
+class MuonOptimizerShardingTest(unittest.TestCase):
+  """Tests optimizer-state sharding helpers with Muon."""
+
+  def test_maybe_update_params_sharding_with_muon_partition_state(self):
+    params = {"a": jax.numpy.ones((2, 3)), "b": jax.numpy.ones((3,))}
+    tx = muon(
+        learning_rate=0.1,
+        muon_weight_dimension_numbers={"a": mdn((0,), (1,)), "b": None},
+    )
+    opt_state = tx.init(params)
+    state_mesh_shardings = _DummyState(
+        params={"params": {"a": "orig_a", "b": "orig_b"}, "other_collection": {"c": "keep_me"}},
+        opt_state=opt_state,
+    )
+    config = type("Config", (), {"shard_optimizer_over_data": True})()
+
+    prev_params_shardings, updated_state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(
+        config, state_mesh_shardings
+    )
+
+    self.assertEqual(prev_params_shardings, state_mesh_shardings.params)
+    self.assertEqual(updated_state_mesh_shardings.params["other_collection"], {"c": "keep_me"})
+    self.assertTrue(jax.numpy.array_equal(updated_state_mesh_shardings.params["params"]["a"], params["a"] * 0))
+    self.assertTrue(jax.numpy.array_equal(updated_state_mesh_shardings.params["params"]["b"], params["b"] * 0))
 
 
 class AdamWMaskTest(parameterized.TestCase):
