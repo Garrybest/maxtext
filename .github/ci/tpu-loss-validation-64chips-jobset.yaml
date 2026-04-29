@@ -1,0 +1,194 @@
+# CI TPU Loss Validation (GBS=5120) - K8s JobSet
+# Rendered by envsubst with: $JOB_NAME $BRANCH $BRANCH_LABEL $USER
+# 16 pods x 4 TPU chips = 64 chips (128 devices), topology 4x4x4.
+# Runs 100 training steps; pod 0 then runs scripts/compare_loss_100step.py
+# against the in-repo reference at scripts/reference_losses_100step.json
+# (lm_loss/mtp_loss tolerances: step 0 <= 0.01%, avg steps 1..N-1 <= 0.1%).
+# Config lock-in points (must match the Megatron reference run):
+#   - global_batch_size = 5120   => 128 devices × BATCH=2 × GRAD_ACCUM=20
+#   - sequence_length   = 4096   (hardcoded in pretrain_ling2.sh)
+#   - Checkpoint init   = /models/gpu-ckpt-ling2.5/ling2.5-maxtext/0/items/
+#   - Seeds             = 42 (DATA_SHUFFLE_SEED, INIT_WEIGHTS_SEED)
+# Parallelism: EP=8, DP=16, FSDP=TP=CP=1 (matches the long-running config).
+# Numerically equivalent to pure EP=128 within bf16 + reduction-order rounding,
+# but ~5-10x faster on 64 chips because expert all-to-all is local to 8-device
+# groups instead of the full 128-device mesh.
+---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: ${JOB_NAME}
+  namespace: default
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+  labels:
+    app: ci-loss-validation
+    repo-branch: "${BRANCH_LABEL}"
+    owner: "${USER}"
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+  replicatedJobs:
+  - name: worker
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          app: ci-loss-validation-64chips
+          repo-branch: "${BRANCH_LABEL}"
+          owner: "${USER}"
+      spec:
+        backoffLimit: 0
+        completionMode: Indexed
+        completions: 16
+        parallelism: 16
+        activeDeadlineSeconds: 82800
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+            labels:
+              app: ci-loss-validation-64chips
+              repo-branch: "${BRANCH_LABEL}"
+              owner: "${USER}"
+          spec:
+            containers:
+            - name: jax-tpu
+              image: python:3.12
+              imagePullPolicy: IfNotPresent
+              command:
+              - bash
+              - -c
+              - |
+                set -exo pipefail
+
+                # 0. Configure git credentials for private repos
+                git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+                # 1. Clone branch
+                git clone --depth=1 --branch="${BRANCH}" https://github.com/primatrix/maxtext.git /root/maxtext
+                cd /root/maxtext
+
+                # 2. Setup Python environment
+                pip install uv
+                uv venv --python 3.12 --seed maxtext_venv
+                source maxtext_venv/bin/activate
+                uv pip install -e '.[tpu]' --resolution=lowest
+                install_maxtext_tpu_github_deps
+
+                # 3. Install optax from source
+                pip uninstall optax -y 2>/dev/null || true
+                pip install git+https://github.com/google-deepmind/optax
+
+                # 4. Log persistence — only on Pod 0 (LOG_FILE = /tmp/train.log,
+                #    EXIT trap copies it to the dir on success or failure).
+                if [ "${JOB_COMPLETION_INDEX}" = "0" ]; then
+                  source scripts/job_log_sync.sh "/models/pretrain/ci-loss-validation/${RUN_NAME}"
+                fi
+
+                # 5. Run 100-step training with metrics_file output for the gate.
+                METRICS_FILE=/tmp/ramdisk/loss_validation_metrics.txt
+                if [ -n "$LOG_FILE" ]; then
+                  bash scripts/pretrain_ling2.sh metrics_file=${METRICS_FILE} 2>&1 | tee -a "$LOG_FILE"
+                else
+                  bash scripts/pretrain_ling2.sh metrics_file=${METRICS_FILE}
+                fi
+
+                # 6. Threshold gate (pod 0 only) against the in-repo reference JSON.
+                if [ "${JOB_COMPLETION_INDEX:-0}" = "0" ]; then
+                  python3 scripts/compare_loss_100step.py "${METRICS_FILE}"
+                fi
+              env:
+              # --- CI overrides ---
+              - name: STEPS
+                value: "100"
+              # Match Megatron reference run's --train-iters so warmup LR profile
+              # in steps 0..99 lines up exactly with megatron[5120].log.
+              - name: LEARNING_RATE_SCHEDULE_STEPS
+                value: "1000"
+              - name: WARMUP_ITERS
+                value: "250"
+              - name: EVAL_INTERVAL
+                value: "200"
+              - name: PER_DEVICE_BATCH_SIZE
+                value: "2"
+              # GRAD_ACCUM=20 so GBS = 128 devices × 2 × 20 = 5120, matching
+              # the Megatron reference's global_batch_size.
+              - name: GRADIENT_ACCUMULATION_STEPS
+                value: "20"
+              - name: GCS_BUCKET
+                value: "gs://data_ant/pretrain/ci-loss-validation"
+              - name: RUN_NAME
+                value: "${JOB_NAME}"
+              # --- Parallelism: EP=8 × DP=16 = 128 devices (matches long-running config) ---
+              - name: ICI_EXPERT_PARALLELISM
+                value: "8"
+              - name: ICI_DATA_PARALLELISM
+                value: "16"
+              - name: ICI_FSDP_PARALLELISM
+                value: "1"
+              - name: ICI_TENSOR_PARALLELISM
+                value: "1"
+              - name: ICI_CONTEXT_PARALLELISM
+                value: "1"
+              - name: SHARD_EXP_ON_FSDP
+                value: "false"
+              # --- Disable Vertex TB / Goodput in CI to keep runs lightweight ---
+              - name: USE_VERTEX_TENSORBOARD
+                value: "false"
+              - name: ENABLE_GOODPUT
+                value: "false"
+              # --- GitHub token via pre-existing secret ---
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: perf-64chips-token
+                    key: token
+              # --- Runtime env ---
+              - name: PIP_CACHE_DIR
+                value: /tmp/ramdisk/.cache/pip
+              - name: PATH
+                value: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+              - name: TPU_PROCESS_ADDRESSES
+                value: ${JOB_NAME}-worker-0-0.${JOB_NAME}:8476,${JOB_NAME}-worker-0-1.${JOB_NAME}:8476,${JOB_NAME}-worker-0-2.${JOB_NAME}:8476,${JOB_NAME}-worker-0-3.${JOB_NAME}:8476,${JOB_NAME}-worker-0-4.${JOB_NAME}:8476,${JOB_NAME}-worker-0-5.${JOB_NAME}:8476,${JOB_NAME}-worker-0-6.${JOB_NAME}:8476,${JOB_NAME}-worker-0-7.${JOB_NAME}:8476,${JOB_NAME}-worker-0-8.${JOB_NAME}:8476,${JOB_NAME}-worker-0-9.${JOB_NAME}:8476,${JOB_NAME}-worker-0-10.${JOB_NAME}:8476,${JOB_NAME}-worker-0-11.${JOB_NAME}:8476,${JOB_NAME}-worker-0-12.${JOB_NAME}:8476,${JOB_NAME}-worker-0-13.${JOB_NAME}:8476,${JOB_NAME}-worker-0-14.${JOB_NAME}:8476,${JOB_NAME}-worker-0-15.${JOB_NAME}:8476
+              - name: TPU_PROCESS_PORT
+                value: "8476"
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                requests:
+                  ephemeral-storage: 20Gi
+                  google.com/tpu: "4"
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - mountPath: /models
+                name: gcs-fuse-csi-ephemeral
+              - mountPath: /tmp/ramdisk
+                name: tmpfs
+              - mountPath: /dev/shm
+                name: dshm
+            nodeSelector:
+              cloud.google.com/gke-tpu-accelerator: tpu7x
+              cloud.google.com/gke-tpu-topology: 4x4x4
+            restartPolicy: Never
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            terminationGracePeriodSeconds: 30
+            volumes:
+            - emptyDir:
+                medium: Memory
+                sizeLimit: 200Gi
+              name: tmpfs
+            - emptyDir:
+                medium: Memory
+              name: gke-gcsfuse-cache
+            - name: gcs-fuse-csi-ephemeral
+              persistentVolumeClaim:
+                claimName: ant-data-pvc
+            - name: dshm
+              emptyDir:
+                medium: Memory

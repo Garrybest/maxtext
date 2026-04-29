@@ -3,8 +3,16 @@ name: Manage TPU Pool
 on:
   workflow_dispatch:
     inputs:
+      pool:
+        description: "Which pool to manage"
+        required: true
+        type: choice
+        default: unit-tests
+        options:
+          - unit-tests
+          - lossval16
       action:
-        description: "Preview or apply the shared TPU pool manifest"
+        description: "Preview or apply the pool manifest"
         required: true
         type: choice
         default: plan
@@ -13,7 +21,7 @@ on:
           - apply
 
 concurrency:
-  group: ci-tpu-pool-manage-${{ github.ref }}
+  group: ci-tpu-pool-manage-${{ github.event.inputs.pool || 'unit-tests' }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -48,32 +56,50 @@ jobs:
           cluster_name: ${{ secrets.GKE_CLUSTER }}
           location: ${{ secrets.GKE_LOCATION }}
 
-      - name: Preview TPU pool changes
+      - name: Resolve pool manifest + rollout target
+        id: pool
+        run: |
+          case "${{ github.event.inputs.pool }}" in
+            unit-tests)
+              echo "manifest=.github/ci/tpu-pool-deployment.yaml" >> "$GITHUB_OUTPUT"
+              echo "rollout=deployment/ci-tpu-pool" >> "$GITHUB_OUTPUT"
+              echo "label=pool=ci-tpu" >> "$GITHUB_OUTPUT"
+              ;;
+            lossval16)
+              echo "manifest=.github/ci/tpu-lossval16-pool.yaml" >> "$GITHUB_OUTPUT"
+              echo "rollout=statefulset/ci-lossval16-pool" >> "$GITHUB_OUTPUT"
+              echo "label=pool=ci-lossval16" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::unknown pool: ${{ github.event.inputs.pool }}"; exit 1 ;;
+          esac
+
+      - name: Preview pool changes
         run: |
           set +e
-          kubectl diff -f .github/ci/tpu-pool-deployment.yaml
+          kubectl diff -f "${{ steps.pool.outputs.manifest }}"
           DIFF_EXIT=$?
           set -e
 
           if [ "$DIFF_EXIT" -eq 0 ]; then
-            echo "TPU pool is already up to date."
+            echo "Pool is already up to date."
           elif [ "$DIFF_EXIT" -eq 1 ]; then
-            echo "TPU pool diff detected."
+            echo "Pool diff detected."
           else
             echo "kubectl diff failed with exit code $DIFF_EXIT" >&2
             exit "$DIFF_EXIT"
           fi
 
-      - name: Apply TPU pool manifest
+      - name: Apply pool manifest
         if: github.event.inputs.action == 'apply'
-        run: kubectl apply -f .github/ci/tpu-pool-deployment.yaml
+        run: kubectl apply -f "${{ steps.pool.outputs.manifest }}"
 
-      - name: Wait for TPU pool rollout
+      - name: Wait for pool rollout
         if: github.event.inputs.action == 'apply'
-        run: kubectl rollout status deployment/ci-tpu-pool --timeout=10m
+        run: kubectl rollout status "${{ steps.pool.outputs.rollout }}" --timeout=15m
 
-      - name: Show TPU pool status
+      - name: Show pool status
         if: always()
         run: |
-          kubectl get deployment ci-tpu-pool -o wide || true
-          kubectl get pods -l "pool=ci-tpu" -o wide || true
+          kubectl get "${{ steps.pool.outputs.rollout }}" -o wide || true
+          kubectl get pods -l "${{ steps.pool.outputs.label }}" -o wide || true

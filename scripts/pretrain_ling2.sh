@@ -101,10 +101,14 @@ GRADIENT_CLIPPING_THRESHOLD=1.0
 LEARNING_RATE=0.000336
 MIN_LEARNING_RATE=0.000336  # Constant LR: min_lr = lr
 WARMUP_ITERS=${WARMUP_ITERS:-250}
-WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${STEPS})")
+# LEARNING_RATE_SCHEDULE_STEPS defaults to STEPS (so warmup_fraction = warmup/STEPS) but
+# can be overridden — important for short CI runs where STEPS < WARMUP_ITERS would
+# otherwise produce warmup_fraction > 1 (rejected by pydantic). Set this to the
+# Megatron reference's --train-iters so the LR curve matches the reference exactly.
+LEARNING_RATE_SCHEDULE_STEPS=${LEARNING_RATE_SCHEDULE_STEPS:-$STEPS}
+WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${LEARNING_RATE_SCHEDULE_STEPS})")
 # Constant learning rate schedule (matching Megatron --lr-decay-style constant)
 LEARNING_RATE_FINAL_FRACTION=1.0  # Keep at 1.0 for constant LR
-LEARNING_RATE_SCHEDULE_STEPS=$STEPS
 DATA_SHUFFLE_SEED=42
 INIT_WEIGHTS_SEED=42
 REMAT_POLICY=${REMAT_POLICY:-"save_out_proj"}

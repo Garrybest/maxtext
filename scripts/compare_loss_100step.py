@@ -22,7 +22,7 @@ import json
 import os
 import sys
 
-DEFAULT_REFERENCE = "/models/ci-reference/loss_ling2_100step.json"
+DEFAULT_REFERENCE = "scripts/reference_losses_100step.json"
 DEFAULT_FIRST_STEP_TOL = 0.0001  # 0.01%
 DEFAULT_AVG_TOL = 0.001  # 0.1%
 

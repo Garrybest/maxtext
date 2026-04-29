@@ -1,0 +1,280 @@
+name: TPU Loss Validation (16 chips, 100 steps, pool)
+
+# Loss-validation runs on a long-lived 16-chip "shell pool" (4 v7x pods, 2x2x4
+# topology) on tpu7x-cluster, claimed via a coordination.k8s.io/v1 Lease and
+# driven by short kubectl-exec calls + per-pod /tmp/ramdisk/runs/$RUN_ID/
+# status files. Replaces the per-run Job/Service/Secret pattern. See pool yaml
+# at .github/ci/tpu-lossval16-pool.yaml for the StatefulSet definition.
+#
+# Failure detection: the Poll step checks every 30s that (a) all 4 pool pods
+# remain Ready, (b) the Lease holder is still us, (c) no pod's exit_code is
+# non-zero. First violation → exit failure → if-always Release cleanly tears
+# down the trainer process groups (SIGTERM-then-SIGKILL) so JAX releases the
+# TPU /dev/vfio/* IOMMU group cleanly for the next run.
+
+on:
+  schedule:
+    # Every 2 hours during stress-test phase: each run takes ~2h, so cadence
+    # aligns naturally with one run per slot, no concurrent queue thrash.
+    # PR review may revert this to nightly ("0 17 * * *") once the path is
+    # validated for a few cycles.
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run on (defaults to main)"
+        required: false
+        type: string
+
+concurrency:
+  group: tpu-loss-validation-16chips-pool
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  tpu_loss_validation:
+    name: "100-step loss validation on 16 TPU chips (pool, gbs=5120)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # 30min acquire wait + ~110min train + ~3min gate + buffer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Generate JOB_NAME
+        id: job
+        run: |
+          JOB_NAME="lossval16-pool-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire pool
+        id: acquire
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: |
+          # acquire script: idempotent kubectl apply pool yaml, wait Ready,
+          # defensive cleanup, atomic Lease claim. Exports RUN_ID via
+          # $GITHUB_OUTPUT.
+          source .github/ci/acquire-lossval16-pool.sh
+
+      - name: Stage run.env + clone branch on all 4 pods
+        env:
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+          BRANCH: ${{ inputs.branch || 'main' }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          POOL_PODS="ci-lossval16-pool-0 ci-lossval16-pool-1 ci-lossval16-pool-2 ci-lossval16-pool-3"
+          RUN_NAME="ci-lossval16-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+
+          # Build per-run env. RUN_ID_INSIDE_ENV check in run-loss-validation-16.sh
+          # rejects stale env from a previous run.
+          cat > /tmp/run.env <<EOF
+          RUN_ID_INSIDE_ENV=$RUN_ID
+          RUN_NAME=$RUN_NAME
+          GITHUB_TOKEN=$TOKEN
+          STEPS=100
+          LEARNING_RATE_SCHEDULE_STEPS=1000
+          WARMUP_ITERS=250
+          EVAL_INTERVAL=200
+          PER_DEVICE_BATCH_SIZE=5
+          GRADIENT_ACCUMULATION_STEPS=32
+          GCS_BUCKET=gs://ant-pretrain/pretrain/ci-loss-validation
+          ICI_EXPERT_PARALLELISM=1
+          ICI_DATA_PARALLELISM=4
+          ICI_FSDP_PARALLELISM=8
+          ICI_TENSOR_PARALLELISM=1
+          ICI_CONTEXT_PARALLELISM=1
+          SHARD_EXP_ON_FSDP=true
+          REMAT_POLICY=custom
+          USE_VERTEX_TENSORBOARD=false
+          ENABLE_GOODPUT=false
+          PIP_CACHE_DIR=/tmp/ramdisk/.cache/pip
+          EOF
+
+          # Stage atomically (.tmp + mv) and clone in parallel on all 4 pods.
+          # Track PIDs so we surface per-pod failures (a bare `wait` returns
+          # 0 regardless of child exit codes). Inner shell uses
+          # `set -euo pipefail` and unpiped git output so transient git
+          # failures don't get masked by a `| tail` discarding non-zero
+          # exit. GIT_CONFIG_GLOBAL is scoped to a temp file (cleaned by
+          # trap) so the token-bearing `insteadOf` rule does NOT persist
+          # in /root/.gitconfig across runs on this pod.
+          declare -a PIDS
+          for pod in $POOL_PODS; do
+            (
+              set -euo pipefail
+              kubectl cp /tmp/run.env "$pod:/tmp/ramdisk/runs/$RUN_ID/run.env.tmp" -c jax-tpu
+              kubectl exec "$pod" -c jax-tpu -- mv "/tmp/ramdisk/runs/$RUN_ID/run.env.tmp" "/tmp/ramdisk/runs/$RUN_ID/run.env"
+              echo "$TOKEN" | kubectl exec -i "$pod" -c jax-tpu -- bash -c '
+                set -euo pipefail
+                read -r TOKEN
+                export GIT_CONFIG_GLOBAL=/tmp/git-config-clone
+                trap "rm -f $GIT_CONFIG_GLOBAL" EXIT
+                git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+                rm -rf /workspace/maxtext
+                git init /workspace/maxtext >/dev/null
+                cd /workspace/maxtext
+                git remote add origin "https://github.com/primatrix/maxtext.git"
+                git fetch --depth=1 origin "'"$BRANCH"'" >/dev/null
+                git checkout --detach FETCH_HEAD >/dev/null
+                git rev-parse --short HEAD
+              '
+            ) &
+            PIDS+=("$!:$pod")
+          done
+
+          fail=0
+          for entry in "${PIDS[@]}"; do
+            pid="${entry%%:*}"
+            pod_name="${entry#*:}"
+            if ! wait "$pid"; then
+              echo "::error::stage+clone failed on $pod_name"
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then
+            exit 1
+          fi
+          echo "Stage + clone done on 4 pods"
+
+      - name: Launch trainer detached on all 4 pods
+        env:
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+        run: |
+          set -euo pipefail
+          # `setsid` puts the trainer in its own session/process group so the
+          # subsequent kubectl-exec stream close (SIGHUP) doesn't kill it.
+          # The script writes /tmp/ramdisk/runs/$RUN_ID/{pgid,log,exit_code,done}
+          # which the next step polls.
+          for i in 0 1 2 3; do
+            pod=ci-lossval16-pool-$i
+            kubectl exec "$pod" -c jax-tpu -- bash -c "
+              setsid bash /workspace/maxtext/.github/ci/run-loss-validation-16.sh $RUN_ID < /dev/null > /dev/null 2>&1 &
+              disown
+            "
+          done
+          echo "Trainers launched on all 4 pods"
+
+      - name: Poll status + heartbeat lease
+        env:
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: |
+          set -uo pipefail
+          POOL_PODS="ci-lossval16-pool-0 ci-lossval16-pool-1 ci-lossval16-pool-2 ci-lossval16-pool-3"
+          deadline=$(( $(date +%s) + 7800 ))   # 130min hard timeout (~110min train + buffer)
+          last_step=-1
+
+          while true; do
+            now=$(date +%s)
+            if [ $now -ge $deadline ]; then
+              echo "::error::run timeout 130min reached"
+              exit 1
+            fi
+
+            # Lease heartbeat: prevents another workflow's stale-acquire path
+            # from force-releasing us.
+            kubectl patch lease ci-lossval16-pool-claim --type=merge -p \
+              "{\"spec\":{\"renewTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)\"}}" >/dev/null 2>&1 || true
+
+            # All-Ready check: any pod going NotReady (e.g. livenessProbe restart,
+            # node loss) is unrecoverable mid-run; fail fast and let release tear
+            # down peers cleanly.
+            for pod in $POOL_PODS; do
+              ready=$(kubectl get pod "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+              if [ "$ready" != "True" ]; then
+                echo "::error::$pod NotReady (livenessProbe restart or node loss)"
+                exit 1
+              fi
+            done
+
+            # Lease ownership: shouldn't change unless force-released.
+            holder=$(kubectl get lease ci-lossval16-pool-claim -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
+            if [ "$holder" != "$JOB_NAME" ]; then
+              echo "::error::Lease lost — holder is now '$holder' (expected '$JOB_NAME')"
+              exit 1
+            fi
+
+            # Per-pod exit_code (written by run-loss-validation-16.sh on completion).
+            done_count=0
+            for pod in $POOL_PODS; do
+              rc=$(kubectl exec "$pod" -c jax-tpu -- bash -c "test -f /tmp/ramdisk/runs/$RUN_ID/exit_code && cat /tmp/ramdisk/runs/$RUN_ID/exit_code 2>/dev/null" 2>/dev/null || true)
+              if [ -n "$rc" ]; then
+                done_count=$((done_count + 1))
+                if [ "$rc" != "0" ]; then
+                  echo "::error::$pod exited rc=$rc"
+                  exit 1
+                fi
+              fi
+            done
+            if [ $done_count -eq 4 ]; then
+              echo "All 4 pods done OK"
+              break
+            fi
+
+            # Pod-0 progress (visible in workflow log every iteration).
+            log_tail=$(kubectl exec ci-lossval16-pool-0 -c jax-tpu -- bash -c "tail -n 60 /tmp/ramdisk/runs/$RUN_ID/log 2>/dev/null" 2>/dev/null || true)
+            step=$(echo "$log_tail" | grep -oE 'completed step: [0-9]+' | tail -1 | grep -oE '[0-9]+$' || true)
+            if [ -n "$step" ] && [ "$step" != "$last_step" ]; then
+              echo "[progress] step=$step  (done_count=$done_count/4)"
+              last_step="$step"
+            fi
+
+            sleep 30
+          done
+
+      - name: Stream pod-0 final log (always)
+        if: always()
+        env:
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+        run: |
+          echo "=== pod-0 log tail ==="
+          kubectl exec ci-lossval16-pool-0 -c jax-tpu -- cat "/tmp/ramdisk/runs/$RUN_ID/log" 2>/dev/null | tail -200 || true
+
+      - name: Collect per-pod logs as artifact
+        if: always()
+        env:
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+        run: |
+          mkdir -p logs
+          for i in 0 1 2 3; do
+            kubectl exec "ci-lossval16-pool-$i" -c jax-tpu -- cat "/tmp/ramdisk/runs/$RUN_ID/log" > "logs/pod-$i.log" 2>/dev/null || true
+          done
+          ls -la logs/
+
+      - name: Upload per-pod logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lossval16-pool-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: logs/
+          retention-days: 14
+
+      - name: Release pool
+        if: always()
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
+        run: |
+          # Tears down trainer process groups (SIGTERM grace then SIGKILL),
+          # wipes /workspace, /opt/ci-env, /tmp/ramdisk/runs/$RUN_ID, and the
+          # libtpu lockfile; releases the Lease. Owner check skips work if
+          # another job already won the Lease (rare; can happen if a later
+          # workflow took over after a failed-fast detected stale Lease).
+          bash .github/ci/release-lossval16-pool.sh

@@ -1,0 +1,160 @@
+name: TPU Loss Validation (64 chips, 100 steps)
+
+on:
+  # Manual-only trigger for now (64-chip CI is gated on cluster reservation
+  # availability; running it nightly is wasteful when 16-chip already covers
+  # the same GBS=5120 + same reference). Enable the `schedule:` block once
+  # the CI cluster has dedicated 64-chip capacity.
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to run on (defaults to main)"
+        required: false
+        type: string
+
+concurrency:
+  group: tpu-loss-validation-64chips
+  cancel-in-progress: false
+
+jobs:
+  tpu_loss_validation:
+    name: "100-step loss validation on 64 TPU chips (gbs=5120)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER }}
+          location: ${{ secrets.GKE_LOCATION }}
+
+      - name: Generate unique job name
+        id: job
+        run: |
+          JOB_NAME="ci-lossval-run${GITHUB_RUN_NUMBER}"
+          JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup previous CI resources
+        run: |
+          echo "Cleaning up leftover 64-chip loss-validation CI resources..."
+          kubectl delete jobs     -l "app=ci-loss-validation-64chips" --ignore-not-found
+          kubectl delete services -l "app=ci-loss-validation-64chips" --ignore-not-found
+          kubectl delete secrets  -l "app=ci-loss-validation-64chips" --ignore-not-found
+
+      - name: Create GitHub token secret
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          kubectl create secret generic "${JOB_NAME}-token" \
+            --from-literal=token="${{ github.token }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label secret "${JOB_NAME}-token" \
+            app=ci-loss-validation-64chips \
+            --overwrite
+
+      - name: Deploy K8s Job
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          BRANCH: ${{ inputs.branch || 'main' }}
+        run: |
+          # Build TPU_PROCESS_ADDRESSES for 16 pods. Each pod's DNS name is
+          # `<job-name>-<index>.<headless-svc>:<port>` once the headless
+          # service routes pod IPs.
+          TPU_ADDRS=""
+          for i in $(seq 0 15); do
+            [ -n "$TPU_ADDRS" ] && TPU_ADDRS="${TPU_ADDRS},"
+            TPU_ADDRS="${TPU_ADDRS}${JOB_NAME}-${i}.${JOB_NAME}-headless-svc:8476"
+          done
+          export TPU_PROCESS_ADDRESSES="$TPU_ADDRS"
+
+          echo "=== Loss Validation (64 chips, gbs=5120, 100 steps) ==="
+          echo "  Branch:    $BRANCH"
+          echo "  Job:       $JOB_NAME"
+          echo "  Pods:      16 (topology 4x4x4)"
+          echo "  Parallelism: EP=8 × DP=16 (matches long-running config)"
+          echo "=================================================="
+
+          envsubst '$JOB_NAME $BRANCH $TPU_PROCESS_ADDRESSES' \
+            < .github/ci/tpu-loss-validation-64chips-job.yaml \
+            | kubectl apply -f -
+
+      - name: Wait for pods to start
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          echo "Waiting for pods of job/$JOB_NAME to start (16 pods expected)..."
+          for i in $(seq 1 360); do
+            JOB_STATUS=$(kubectl get job "$JOB_NAME" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$JOB_STATUS" = "True" ]; then
+              echo "Job already failed! Pod status:"
+              kubectl get pods -l "job-name=$JOB_NAME" -o wide
+              exit 1
+            fi
+
+            READY=$(kubectl get pods -l "job-name=$JOB_NAME" \
+              --field-selector=status.phase=Running \
+              -o name 2>/dev/null | wc -l | tr -d ' ')
+            echo "  Running pods: $READY/16 ($i/360)"
+            if [ "$READY" -ge 16 ]; then
+              echo "All 16 pods are running!"
+              break
+            fi
+            if [ "$i" -eq 360 ]; then
+              echo "Timeout waiting for pods. Current pod status:"
+              kubectl get pods -l "job-name=$JOB_NAME" -o wide
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Stream logs & wait for completion
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+
+          POD_0=$(kubectl get pods -l "job-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+            -o jsonpath='{.items[0].metadata.name}')
+          echo "Streaming logs from coordinator pod: $POD_0"
+          kubectl logs -f "$POD_0" -c jax-tpu || true
+
+          echo "Waiting for job to finish..."
+          if kubectl wait --for=condition=Complete "job/$JOB_NAME" --timeout=180m 2>/dev/null; then
+            echo "Job completed successfully — loss validation passed!"
+            exit 0
+          fi
+
+          FAILED=$(kubectl get job "$JOB_NAME" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+          if [ "$FAILED" = "True" ]; then
+            echo "Job failed! Last 50 lines from corner pods (0, 1, 14, 15):"
+            for idx in 0 1 14 15; do
+              POD=$(kubectl get pods -l "job-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=$idx" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+              if [ -n "$POD" ]; then
+                echo "=== Logs from pod $POD (index $idx) ==="
+                kubectl logs "$POD" -c jax-tpu --tail=50 2>/dev/null || true
+              fi
+            done
+            exit 1
+          fi
+          echo "Job did not reach a terminal state in 180 minutes."
+          kubectl get job "$JOB_NAME" -o wide
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          JOB_NAME="${{ steps.job.outputs.name }}"
+          kubectl delete job     "$JOB_NAME"                  --ignore-not-found
+          kubectl delete service "${JOB_NAME}-headless-svc"   --ignore-not-found
+          kubectl delete secret  "${JOB_NAME}-token"          --ignore-not-found

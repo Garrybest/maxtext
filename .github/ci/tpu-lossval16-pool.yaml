@@ -1,0 +1,211 @@
+# Persistent CI TPU shell pool for 16-chip loss validation.
+# 4 v7x pods (one 2x2x4 slice = 16 chips) kept always Running on the
+# `ci-loss-validation` nodepool (tpu7x-cluster). Workflow claims the pool via
+# a Lease object, drops a per-run directory under /tmp/ramdisk/runs/, fires
+# the trainer detached, then polls status files. See plan v2 for rationale.
+#
+# Notes:
+# - PriorityClass `ci-tpu-pool` is already declared by tpu-pool-deployment.yaml;
+#   we reuse it (do NOT redeclare here).
+# - publishNotReadyAddresses=true so peer DNS resolves during JAX init even
+#   if a peer is briefly NotReady (e.g. mid livenessProbe).
+# - podManagementPolicy: Parallel keeps initContainer bootstrap from
+#   serializing into 4×5min.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ci-lossval16-pool-headless
+  namespace: default
+  labels:
+    pool: ci-lossval16
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    pool: ci-lossval16
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: ci-lossval16-pool-claim
+  namespace: default
+  labels:
+    pool: ci-lossval16
+spec:
+  leaseDurationSeconds: 60
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ci-lossval16-pool
+  namespace: default
+  labels:
+    pool: ci-lossval16
+spec:
+  serviceName: ci-lossval16-pool-headless
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      pool: ci-lossval16
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+      labels:
+        pool: ci-lossval16
+    spec:
+      priorityClassName: ci-tpu-pool
+      serviceAccountName: gcs-account
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: cloud.google.com/gke-nodepool
+            labelSelector:
+              matchLabels:
+                pool: ci-lossval16
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                pool: ci-lossval16
+      initContainers:
+      - name: runtime-bootstrap
+        image: python:3.12
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          # (a) Install uv to shared tools dir
+          pip install --quiet uv
+          mkdir -p /opt/tools
+          cp "$(which uv)" /opt/tools/uv
+
+          # (b) Pre-build base venv with jax[tpu] (heaviest install, persistent
+          #     across runs since release only wipes /opt/ci-env, not base-env)
+          /opt/tools/uv venv --python 3.12 --seed --clear /opt/base-env
+          /opt/tools/uv pip install --python /opt/base-env "jax[tpu]" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+        env:
+        - name: UV_CACHE_DIR
+          value: /tmp/ramdisk/.cache/uv
+        volumeMounts:
+        - mountPath: /opt/tools
+          name: tools
+        - mountPath: /opt/base-env
+          name: base-env
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        imagePullPolicy: IfNotPresent
+        command: ["sleep", "infinity"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_INDEX
+          valueFrom:
+            fieldRef:
+              # Downward API exposes the StatefulSet ordinal label
+              # (auto-set on pods in K8s ≥1.28). Run scripts validate
+              # numeric and fall back to ${POD_NAME##*-} if empty.
+              fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+        - name: TPU_PROCESS_ADDRESSES
+          # Hardcoded: stable forever for this pool. JAX init connects
+          # peer-to-peer via these names. Headless svc + subdomain
+          # (auto from serviceName) gives the DNS shape below.
+          value: "ci-lossval16-pool-0.ci-lossval16-pool-headless:8476,ci-lossval16-pool-1.ci-lossval16-pool-headless:8476,ci-lossval16-pool-2.ci-lossval16-pool-headless:8476,ci-lossval16-pool-3.ci-lossval16-pool-headless:8476"
+        - name: TPU_PROCESS_PORT
+          value: "8476"
+        - name: UV_CACHE_DIR
+          value: /tmp/ramdisk/.cache/uv
+        - name: PATH
+          value: /opt/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        - name: PIP_CACHE_DIR
+          value: /tmp/ramdisk/.cache/pip
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+            ephemeral-storage: 20Gi
+        securityContext:
+          privileged: true
+        livenessProbe:
+          # Same shape as unit-tests pool. Note: probe runs during JAX
+          # training too — workflow's failure-detection logic explicitly
+          # treats container restart as a peer failure (kills all peers,
+          # releases lease).
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - >-
+              (test -r /dev/accel0 || test -r /dev/vfio/0) &&
+              mountpoint -q /models &&
+              test "$(ps -eo stat | grep -c Z)" -lt 500
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - mountPath: /opt/tools
+          name: tools
+        - mountPath: /opt/base-env
+          name: base-env
+        - mountPath: /opt/ci-env
+          name: ci-env
+        - mountPath: /workspace
+          name: workspace
+        - mountPath: /tmp/ramdisk
+          name: tmpfs
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: gcs-fuse-csi-ephemeral
+      volumes:
+      - name: tools
+        emptyDir: {}
+      - name: base-env
+        emptyDir: {}
+      - name: ci-env
+        emptyDir: {}
+      - name: workspace
+        emptyDir: {}
+      - name: tmpfs
+        emptyDir:
+          medium: Memory
+          sizeLimit: 800Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      - name: gke-gcsfuse-cache
+        emptyDir:
+          medium: Memory
+      - name: gcs-fuse-csi-ephemeral
+        persistentVolumeClaim:
+          claimName: ant-pretrain-pvc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ci-lossval16-pool-pdb
+  namespace: default
+  labels:
+    pool: ci-lossval16
+spec:
+  # Loss validation needs all 4 pods; degraded pool can't run.
+  minAvailable: 4
+  selector:
+    matchLabels:
+      pool: ci-lossval16
