@@ -27,7 +27,7 @@ orbax-checkpoint
 pathwaysutils
 pillow
 pre-commit
-protobuf
+protobuf<6.0.0
 pydantic
 pyink
 pylint
