@@ -14,11 +14,15 @@ name: TPU Loss Validation (16 chips, 100 steps, pool)
 
 on:
   schedule:
-    # Every 2 hours during stress-test phase: each run takes ~2h, so cadence
-    # aligns naturally with one run per slot, no concurrent queue thrash.
-    # PR review may revert this to nightly ("0 17 * * *") once the path is
-    # validated for a few cycles.
-    - cron: "0 */2 * * *"
+    # Every 2.5 hours. Single run takes ~115min, leaving ~35min buffer
+    # before next cron — enough to absorb step-time drift without queue
+    # backup. Cron can't express 2.5h uniformly (24h / 2.5h = 9.6), so
+    # two cron lines: 5 fires per line × 2 lines = 10 fires/day. Most
+    # gaps are 2.5h; one wrap-around gap (22:30 -> 00:00) is 1.5h.
+    # PR review may revert this to nightly ("0 17 * * *") once the path
+    # is validated for a few cycles.
+    - cron: "0 0,5,10,15,20 * * *"
+    - cron: "30 2,7,12,17,22 * * *"
   workflow_dispatch:
     inputs:
       branch:
@@ -49,6 +53,13 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          # Default 3600s expires mid-run for ~110min runs; bump to 7200s
+          # (max without org-policy allowlist) so a single token covers the
+          # whole run. If the SA is NOT on the
+          # constraints/iam.allowServiceAccountCredentialLifetimeExtension
+          # allowlist, this step will hard-fail with INVALID_ARGUMENT — fall
+          # back to in-loop refresh in that case.
+          access_token_lifetime: 7200s
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
@@ -76,7 +87,11 @@ jobs:
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
           BRANCH: ${{ inputs.branch || 'main' }}
-          TOKEN: ${{ github.token }}
+          # CROSS_REPO_TOKEN scopes to multiple primatrix/* repos so the
+          # in-pod `uv pip install -e '.[tpu]'` can resolve private deps
+          # (tops @ git+primatrix/pallas-kernel, tokamax @ git+primatrix/tokamax).
+          # Falls back to per-repo github.token for forks/repos without the secret.
+          TOKEN: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
         run: |
           set -euo pipefail
           POOL_PODS="ci-lossval16-pool-0 ci-lossval16-pool-1 ci-lossval16-pool-2 ci-lossval16-pool-3"
@@ -180,12 +195,58 @@ jobs:
           POOL_PODS="ci-lossval16-pool-0 ci-lossval16-pool-1 ci-lossval16-pool-2 ci-lossval16-pool-3"
           deadline=$(( $(date +%s) + 7800 ))   # 130min hard timeout (~110min train + buffer)
           last_step=-1
+          # Polling cadence: 90s. For a 110min run this drops the kubectl call
+          # count from ~2400 (30s polling) to ~800; combined with the labeled
+          # `kubectl get pods` below (1 call vs 4), per-iter cost falls from
+          # 11 calls to 5. Heartbeat at 90s is well within the 300s STALE_AFTER
+          # window in acquire-lossval16-pool.sh.
+          POLL_INTERVAL=90
+          # Tolerate transient kubectl/API hiccups. `kubectl ... 2>/dev/null || true`
+          # treats a network error as if the field were empty, which used to
+          # cascade-fail healthy 60min+ runs on a single hiccup. Require N
+          # consecutive observations (~270s) before bailing — still well below
+          # the 5min Lease stale window.
+          not_ready_count=0
+          holder_mismatch_count=0
+          RETRY_THRESHOLD=3
+          # Token refresh: kubeconfig has a STATIC bearer token written by
+          # google-github-actions/auth@v2 with default 3600s lifetime. After
+          # 60min ALL kubectl calls 401 (validated by test_kubectl_auth_refresh.yml).
+          # Force-refresh via `gcloud auth print-access-token` (which triggers
+          # the WIF ADC chain: GHA OIDC -> STS exchange) and write the new
+          # token back into kubeconfig. Refresh at iter 30 (~45min) and
+          # iter 60 (~90min); each refresh extends validity by another 60min.
+          KUBE_USER=$(kubectl config view -o jsonpath='{.contexts[?(@.name=="'"$(kubectl config current-context)"'")].context.user}')
+          echo "kube_user=$KUBE_USER  POLL_INTERVAL=${POLL_INTERVAL}s  RETRY_THRESHOLD=$RETRY_THRESHOLD"
+          iter=0
 
           while true; do
+            iter=$((iter + 1))
             now=$(date +%s)
             if [ $now -ge $deadline ]; then
               echo "::error::run timeout 130min reached"
               exit 1
+            fi
+
+            # Token refresh at iter 30 (~45min) and iter 60 (~90min).
+            if [ $iter -eq 30 ] || [ $iter -eq 60 ]; then
+              # Force gcloud to mint a fresh STS token by nuking its sqlite
+              # cache before print-access-token. Without this, gcloud returns
+              # the cached token if still within TTL — we'd write the same
+              # value back to kubeconfig and get no actual rotation. Verified
+              # empirically: with cache, T1==T2 (sha256 identical); after
+              # nuke, T3 differs from T1. Belt-and-suspenders behind the
+              # 7200s access_token_lifetime above (which alone should suffice
+              # for ~110min runs, but this guards against silent ignore).
+              rm -f "${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}/access_tokens.db" 2>/dev/null || true
+              fresh_token=$(gcloud auth print-access-token 2>&1)
+              if echo "$fresh_token" | grep -qiE "^ERROR|fail" || [ -z "$fresh_token" ]; then
+                echo "[token-refresh] iter=$iter — gcloud auth print-access-token failed (cur token still valid for now): ${fresh_token:0:80}"
+              elif kubectl config set-credentials "$KUBE_USER" --token="$fresh_token" >/dev/null 2>&1; then
+                echo "[token-refresh] iter=$iter — kubeconfig token rotated (prefix=${fresh_token:0:20}...)"
+              else
+                echo "[token-refresh] iter=$iter — kubectl config set-credentials failed (cur token still valid for now)"
+              fi
             fi
 
             # Lease heartbeat: prevents another workflow's stale-acquire path
@@ -193,22 +254,49 @@ jobs:
             kubectl patch lease ci-lossval16-pool-claim --type=merge -p \
               "{\"spec\":{\"renewTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)\"}}" >/dev/null 2>&1 || true
 
-            # All-Ready check: any pod going NotReady (e.g. livenessProbe restart,
-            # node loss) is unrecoverable mid-run; fail fast and let release tear
-            # down peers cleanly.
-            for pod in $POOL_PODS; do
-              ready=$(kubectl get pod "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-              if [ "$ready" != "True" ]; then
-                echo "::error::$pod NotReady (livenessProbe restart or node loss)"
+            # All-Ready check with retry tolerance. One labeled `kubectl get pods`
+            # call returns all 4 pods' Ready status — 4x fewer kubectl
+            # round-trips than per-pod fetches. Format:
+            # "ci-lossval16-pool-0=True ci-lossval16-pool-1=True ..."
+            ready_summary=$(kubectl get pods -l pool=ci-lossval16 \
+              -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}' \
+              2>/dev/null || true)
+            # Trailing `|| true`: when ready_summary is empty (kubectl errored),
+            # `grep -o '=True'` finds nothing and exits 1. Combined with
+            # pipefail + `set -e` (from `bash -e {0}` shell wrapper), a 1-exit
+            # pipeline kills the whole script silently — bypassing the
+            # RETRY_THRESHOLD logic below. Hit this in run 25146361086 when
+            # the token expired mid-run.
+            ready_count=$(echo "$ready_summary" | grep -o '=True' | wc -l | tr -d ' ' || true)
+            not_ready_detail=""
+            if [ "$ready_count" != "4" ]; then
+              # Find first non-Ready pod for the [warn] message. If kubectl
+              # returned empty (transient error), surface that explicitly.
+              not_ready_detail=$(echo "$ready_summary" | tr ' ' '\n' | grep -v '=True$' | grep -v '^$' | head -1)
+              [ -z "$not_ready_detail" ] && not_ready_detail="(kubectl get pods returned empty)"
+            fi
+            if [ -n "$not_ready_detail" ]; then
+              not_ready_count=$((not_ready_count + 1))
+              echo "[warn] NotReady observed: $not_ready_detail ($not_ready_count/$RETRY_THRESHOLD before fail)"
+              if [ $not_ready_count -ge $RETRY_THRESHOLD ]; then
+                echo "::error::$not_ready_detail NotReady for $not_ready_count consecutive checks"
                 exit 1
               fi
-            done
+            else
+              not_ready_count=0
+            fi
 
-            # Lease ownership: shouldn't change unless force-released.
+            # Lease ownership with retry tolerance.
             holder=$(kubectl get lease ci-lossval16-pool-claim -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
             if [ "$holder" != "$JOB_NAME" ]; then
-              echo "::error::Lease lost — holder is now '$holder' (expected '$JOB_NAME')"
-              exit 1
+              holder_mismatch_count=$((holder_mismatch_count + 1))
+              echo "[warn] Lease holder='${holder:-empty}' != '$JOB_NAME' ($holder_mismatch_count/$RETRY_THRESHOLD before fail)"
+              if [ $holder_mismatch_count -ge $RETRY_THRESHOLD ]; then
+                echo "::error::Lease lost — holder='${holder:-empty}' for $holder_mismatch_count consecutive checks"
+                exit 1
+              fi
+            else
+              holder_mismatch_count=0
             fi
 
             # Per-pod exit_code (written by run-loss-validation-16.sh on completion).
@@ -236,7 +324,7 @@ jobs:
               last_step="$step"
             fi
 
-            sleep 30
+            sleep $POLL_INTERVAL
           done
 
       - name: Stream pod-0 final log (always)
