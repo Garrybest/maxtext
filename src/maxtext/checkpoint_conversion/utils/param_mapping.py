@@ -2843,15 +2843,16 @@ def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
     return input_tensor.T
 
   def reshape_depthwise_conv(input_tensor, target_shape=None):
-    """Depthwise Conv1d weight reshape.
+    """Depthwise Conv1d weight reshape between MaxText `nnx.Conv` and HF.
 
-    PR #76 `ShortConvolution.kernel` is custom 2D `[kernel_size, features]`;
-    HF `nn.Conv1d(groups=channels)` weight is `[channels, 1, kernel_size]`.
+    Both flax `nnx.Conv` and HF/PyTorch `nn.Conv1d` use cross-correlation, so no
+    kernel-axis flip is needed — only an axis transpose:
+      MaxText `kernel` shape: [kernel_size, 1, features]
+      HF `weight`    shape:   [features, 1, kernel_size]
+    The transpose is its own inverse, so the same op handles both directions.
     """
     del target_shape
-    if saving_to_hf:
-      return np.expand_dims(np.transpose(input_tensor, (1, 0)), axis=1)
-    return np.transpose(np.squeeze(input_tensor, axis=1), (1, 0))
+    return np.transpose(input_tensor, (2, 1, 0))
 
   num_layers = int(config["num_hidden_layers"])
   first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))

@@ -44,6 +44,7 @@ mla_gated_attention_type: "head_wise"                  # MLA output gate (head_w
 ## QK-Clip (MuonClip) - training stability; mirrors Megatron's enable_qkclip / attention_max_qkscores
 use_qk_clip: true
 qk_clip_threshold: 100
+use_tokamax_splash: true              # required for QK-Clip (record_max_logits)
 
 # Hybrid attention (MLA + KDA)
 # Every inhomogeneous_layer_cycle_interval layers, the last layer uses MLA (full attention),

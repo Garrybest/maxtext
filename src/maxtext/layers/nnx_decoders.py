@@ -670,6 +670,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.LLAMA4,
         DecoderBlockType.OLMO3,
         DecoderBlockType.LING2,
+        DecoderBlockType.LING3,
     ):
       return functools.partial(RMSNorm, num_features=num_features, shard_mode=self.config.shard_mode, rngs=rngs)
     elif self.config.decoder_block == DecoderBlockType.GPT3:

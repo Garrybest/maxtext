@@ -492,7 +492,7 @@ def calculate_routed_and_shared_ffn_tflops_per_device(config):
 
 def get_dense_moe_layers(config):
   """Helper function to calculate number of dense and moe layers"""
-  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2):
+  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
     num_dense_layers = config.first_num_dense_layers
     num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
     return num_dense_layers, num_moe_layers
@@ -503,7 +503,7 @@ def get_dense_moe_layers(config):
     num_moe_layers = config.num_decoder_layers
     num_dense_layers = 0
   else:
-    raise ValueError("Currently we only support DeepSeek, Ling2, Llama4, and Qwen3-Next calculation.")
+    raise ValueError("Currently we only support DeepSeek, Ling2, Ling3, Llama4, and Qwen3-Next calculation.")
 
   return num_dense_layers, num_moe_layers
 

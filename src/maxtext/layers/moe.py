@@ -554,6 +554,7 @@ class RoutedMoE(nnx.Module):
         in (
             ctypes.DecoderBlockType.DEEPSEEK,
             ctypes.DecoderBlockType.LING2,
+            ctypes.DecoderBlockType.LING3,
         )
         and self.config.n_routing_groups != -1
         and self.config.topk_routing_group != -1
@@ -591,6 +592,7 @@ class RoutedMoE(nnx.Module):
     if self.config.decoder_block in (
         ctypes.DecoderBlockType.DEEPSEEK,
         ctypes.DecoderBlockType.LING2,
+        ctypes.DecoderBlockType.LING3,
     ):
       top_k_weights = self.deepseek_scale_weights(top_k_weights)
     elif self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
@@ -681,8 +683,8 @@ class RoutedMoE(nnx.Module):
     """Applies FFN activation function."""
     with jax.named_scope("ffn_act"):
       if self.config.decoder_block == ctypes.DecoderBlockType.GPT_OSS:
-        layer_w0 = jnp.clip(layer_w0, a_min=None, a_max=self.config.mlp_activations_limit)
-        layer_w1 = jnp.clip(layer_w1, a_min=-self.config.mlp_activations_limit, a_max=self.config.mlp_activations_limit)
+        layer_w0 = jnp.clip(layer_w0, min=None, max=self.config.mlp_activations_limit)
+        layer_w1 = jnp.clip(layer_w1, min=-self.config.mlp_activations_limit, max=self.config.mlp_activations_limit)
         layer_act = self.activation_fn(layer_w0 * 1.702)
         glu = jnp.multiply(layer_w0, layer_act)
         intermediate_layer = jnp.multiply(glu, (layer_w1 + 1))

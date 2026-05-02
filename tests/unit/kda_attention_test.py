@@ -1,7 +1,6 @@
 """Unit tests for KDA (Kimi Delta Attention) module.
 
 Tests cover:
-  - ShortConvolution: shape, causality, naive comparison
   - KimiDeltaAttention: initialization, forward pass, padding, determinism
   - chunk_kda kernel: basic operation, chunk vs recurrent comparison
   - Naive KDA: recurrent Delta Rule reference impl vs kernel precision
@@ -120,71 +119,11 @@ class _MockKdaConfig:
     # KDA-specific
     self.linear_conv_kernel_dim = 4
     self.use_qk_norm = True
-    self.use_kda_safe_gate = False
+    self.use_kda_safe_gate = True
     self.kda_lower_bound = -5.0
 
     for k, v in overrides.items():
       setattr(self, k, v)
-
-
-# ---------------------------------------------------------------------------
-# ShortConvolution tests
-# ---------------------------------------------------------------------------
-
-
-class TestShortConvolution:
-  """Tests for ShortConvolution module."""
-
-  def test_output_shape(self):
-    rngs = nnx.Rngs(0)
-    conv = attention_kda.ShortConvolution(
-        kernel_size=4,
-        features=32,
-        rngs=rngs,
-    )
-    x = jax.random.normal(jax.random.PRNGKey(0), (2, 16, 32))
-    out = conv(x)
-    assert out.shape == (2, 16, 32)
-
-  def test_causality(self):
-    """Position i should only depend on positions <= i."""
-    rngs = nnx.Rngs(0)
-    conv = attention_kda.ShortConvolution(kernel_size=4, features=16, rngs=rngs)
-
-    x = jnp.zeros((1, 8, 16))
-    x = x.at[:, 0, :].set(1.0)
-    out = conv(x)
-
-    assert not jnp.allclose(out[:, 0, :], 0), "Position 0 should have output"
-    # Positions beyond kernel reach should be zero
-    assert jnp.allclose(out[:, 4:, :], 0, atol=1e-6), "Positions beyond kernel_size from impulse should be zero"
-
-  def test_against_naive(self):
-    """Compare against a loop-based naive depthwise convolution."""
-    rngs = nnx.Rngs(0)
-    F = 16
-    K = 4
-    conv = attention_kda.ShortConvolution(
-        kernel_size=K,
-        features=F,
-        dtype=jnp.float32,
-        weight_dtype=jnp.float32,
-        rngs=rngs,
-    )
-
-    B, T = 1, 12
-    x = jax.random.normal(jax.random.PRNGKey(0), (B, T, F))
-    out_module = conv(x)
-
-    # Naive depthwise causal conv: kernel[k] is [F], elementwise multiply
-    out_naive = jnp.zeros_like(x)
-    for t in range(T):
-      for k in range(K):
-        if t - k >= 0:
-          out_naive = out_naive.at[:, t, :].add(x[:, t - k, :] * conv.kernel[k])
-
-    max_diff = jnp.max(jnp.abs(out_module - out_naive))
-    assert max_diff < 0.01, f"Max abs diff {max_diff:.6f} exceeds 0.01"
 
 
 # ---------------------------------------------------------------------------
@@ -657,21 +596,23 @@ class TestKdaBackward:
       )
 
   def _run_vjp(self, module, inp, mesh):
-    """Run VJP and return (grad_params, grad_input)."""
+    """Run gradient using value_and_grad instead of vjp."""
     graphdef, params, other = nnx.split(module, nnx.Param, ...)
 
     def forward_fn(params, x):
       model = nnx.merge(graphdef, params, other)
       with mesh:
         out, _ = model(x)
-      return out
+      # Return scalar loss for gradient computation
+      return jnp.sum(out)
 
-    _, vjp_fn = jax.vjp(forward_fn, params, inp)
-    upstream = jnp.ones_like(inp)
-    grad_params, grad_input = vjp_fn(upstream)
+    # Use value_and_grad instead of vjp (matching training code)
+    grad_fn = jax.value_and_grad(forward_fn, argnums=(0, 1), has_aux=False)
+    # Returns (loss, (grad_params, grad_input))
+    _, grads = grad_fn(params, inp)
+    grad_params, grad_input = grads
     return grad_params, grad_input
 
-  @pytest.mark.skipif(not TOPS_AVAILABLE, reason="tops not available")
   def test_backward_no_nan(self, mesh):
     """Activation gradient should be free of NaN/Inf and non-zero."""
     attn = self._make_attn(mesh)

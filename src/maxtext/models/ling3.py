@@ -276,13 +276,13 @@ class Ling3GenericLayer(nnx.Module):
       )
     else:
       # KDA path — same call shape as Ling2's GLA branch.
+      # KDA does not support packed sequences; drop decoder_segment_ids.
       attention_output, _ = self.attention(
           hidden_states,
           decoder_positions,
           deterministic,
           model_mode,
           layer_idx=global_layer_idx,
-          decoder_segment_ids=decoder_segment_ids,
       )
       kv_cache = None
 

@@ -173,7 +173,7 @@ def _try_update_bias(config, new_state, target_path, expert_counts, path_label):
 
 
 def _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts):
-  """Apply bias updates for DeepSeek/LING2 decoder blocks."""
+  """Apply bias updates for DeepSeek/LING2/LING3 decoder blocks."""
   if config.scan_layers:
     target_path = (
         "params",

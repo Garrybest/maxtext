@@ -25,6 +25,7 @@ The implementation wraps the optimized `tops.ops.kda.chunk_kda` kernel.
 """
 
 
+import functools
 import math
 
 from flax import nnx
@@ -39,69 +40,6 @@ from maxtext.common.common_types import Config, MODEL_MODE_AUTOREGRESSIVE
 from maxtext.layers import linears
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.utils.sharding import logical_to_mesh_axes
-
-
-class ShortConvolution(nnx.Module):
-  """Depthwise causal 1D convolution for local dependency modeling in KDA.
-
-  Each channel is convolved independently (no cross-channel mixing),
-  matching Megatron's Conv1d with groups=in_channels. Position i can
-  only attend to positions <= i (causal).
-
-  Attributes:
-    kernel_size: Size of the convolution kernel (typically 4).
-    features: Number of input/output features (channels).
-    dtype: Computation data type.
-  """
-
-  def __init__(
-      self,
-      kernel_size: int,
-      features: int,
-      *,
-      dtype: jnp.dtype = jnp.bfloat16,
-      weight_dtype: jnp.dtype = jnp.bfloat16,
-      rngs: nnx.Rngs,
-  ):
-    self.kernel_size = kernel_size
-    self.features = features
-    self.dtype = dtype
-
-    # Depthwise conv: kernel shape is [kernel_size, features]
-    # Each channel has its own scalar weight per kernel position
-    self.kernel = nnx.Param(
-        nnx.initializers.lecun_normal()(
-            rngs.params(),
-            (kernel_size, features),
-            weight_dtype,
-        )
-    )
-
-  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-    """Apply depthwise causal 1D convolution.
-
-    Args:
-      x: Input tensor of shape [B, T, F] where F is the feature dim.
-
-    Returns:
-      Output tensor of shape [B, T, F].
-    """
-    B, T, F = x.shape
-    assert F == self.features, f"Input features {F} != {self.features}"
-
-    # Pad at the beginning for causal convolution
-    pad_width = [(0, 0), (self.kernel_size - 1, 0), (0, 0)]
-    x_padded = jnp.pad(x, pad_width, mode="constant", constant_values=0)
-
-    # Depthwise conv: elementwise multiply + sum over kernel positions
-    output = jnp.zeros((B, T, F), dtype=x.dtype)
-    for k in range(self.kernel_size):
-      offset = self.kernel_size - 1 - k
-      x_slice = x_padded[:, offset : offset + T, :]  # [B, T, F]
-      # Elementwise: [B, T, F] * [F] -> [B, T, F]
-      output = output + x_slice * self.kernel[k]
-
-    return output.astype(self.dtype)
 
 
 class KimiDeltaAttention(nnx.Module):
@@ -145,27 +83,38 @@ class KimiDeltaAttention(nnx.Module):
 
     # Short convolution for local dependency modeling
     if cfg.linear_conv_kernel_dim > 0:
-      # Q, K, V each have their own conv layer
-      self.q_conv = ShortConvolution(
-          kernel_size=cfg.linear_conv_kernel_dim,
-          features=self.num_query_heads * self.key_head_dim,
-          dtype=cfg.dtype,
-          weight_dtype=cfg.weight_dtype,
-          rngs=rngs,
+      # Q, K, V each have their own depthwise causal 1D conv layer.
+      # nnx.Conv kernel shape: [K, in_features // feature_group_count, out_features].
+      # With feature_group_count == features, this is depthwise (one channel per group),
+      # matching Megatron's Conv1d(groups=features).
+      q_features = self.num_query_heads * self.key_head_dim
+      k_features = self.num_key_heads * self.key_head_dim
+      v_features = self.num_value_heads * self.value_head_dim
+      conv_kwargs = {
+          "kernel_size": (cfg.linear_conv_kernel_dim,),
+          "padding": "CAUSAL",
+          "use_bias": False,
+          "dtype": cfg.dtype,
+          "param_dtype": cfg.weight_dtype,
+          "rngs": rngs,
+      }
+      self.q_conv = nnx.Conv(
+          in_features=q_features,
+          out_features=q_features,
+          feature_group_count=q_features,
+          **conv_kwargs,
       )
-      self.k_conv = ShortConvolution(
-          kernel_size=cfg.linear_conv_kernel_dim,
-          features=self.num_key_heads * self.key_head_dim,
-          dtype=cfg.dtype,
-          weight_dtype=cfg.weight_dtype,
-          rngs=rngs,
+      self.k_conv = nnx.Conv(
+          in_features=k_features,
+          out_features=k_features,
+          feature_group_count=k_features,
+          **conv_kwargs,
       )
-      self.v_conv = ShortConvolution(
-          kernel_size=cfg.linear_conv_kernel_dim,
-          features=self.num_value_heads * self.value_head_dim,
-          dtype=cfg.dtype,
-          weight_dtype=cfg.weight_dtype,
-          rngs=rngs,
+      self.v_conv = nnx.Conv(
+          in_features=v_features,
+          out_features=v_features,
+          feature_group_count=v_features,
+          **conv_kwargs,
       )
     else:
       self.q_conv = None
@@ -321,6 +270,10 @@ class KimiDeltaAttention(nnx.Module):
     inv_dt = dt + jnp.log(-jnp.expm1(-dt))
     self.dt_bias = nnx.Param(inv_dt)
 
+    # Axis names for shard_map (Pallas kernels cannot be auto-partitioned).
+    self.qkv_axis_names = ("activation_batch", "activation_norm_length", "activation_heads", "activation_kv")
+    self.beta_axis_names = ("activation_batch", "activation_norm_length", "activation_heads")
+
   def _logical_to_mesh_axes(self, logical_name):
     return logical_to_mesh_axes(logical_name, mesh=self.mesh, rules=self.config.logical_axis_rules)
 
@@ -425,25 +378,45 @@ class KimiDeltaAttention(nnx.Module):
     safe_gate = cfg.use_kda_safe_gate
     lower_bound = cfg.kda_lower_bound if safe_gate else None
 
-    # Call KDA kernel (L2 norm already applied above; kernel always gets False)
+    # Call KDA kernel via shard_map (Pallas/Mosaic kernels cannot be auto-partitioned).
     with jax.named_scope("kda_kernel"):
-      o, _ = chunk_kda(
-          q=q,
-          k=k,
-          v=v,
-          g=g,
-          beta=beta,
-          A_log=self.A_log.value,
-          dt_bias=self.dt_bias.value,
-          scale=scale,
-          chunk_size=chunk_size,
-          initial_state=None,
-          output_final_state=False,
-          use_qk_l2norm_in_kernel=False,
-          use_gate_in_kernel=True,
-          safe_gate=safe_gate,
-          lower_bound=lower_bound,
+      qkv_pspec = self._logical_to_mesh_axes(self.qkv_axis_names)
+      beta_pspec = self._logical_to_mesh_axes(self.beta_axis_names)
+      a_log_pspec = self._logical_to_mesh_axes(("activation_heads",))
+      dt_bias_2d_pspec = self._logical_to_mesh_axes(("activation_heads", "activation_kv"))
+
+      # Reshape dt_bias from [H*K] to [H, K] for proper head-dim sharding.
+      dt_bias_2d = self.dt_bias.value.reshape(self.num_key_heads, self.key_head_dim)
+
+      @functools.partial(
+          jax.shard_map,
+          mesh=self.mesh,
+          in_specs=(qkv_pspec, qkv_pspec, qkv_pspec, qkv_pspec, beta_pspec, a_log_pspec, dt_bias_2d_pspec),
+          out_specs=qkv_pspec,
+          check_vma=False,
       )
+      def _shard_map_chunk_kda(q, k, v, g, beta, A_log, dt_bias_2d):
+        dt_bias_flat = dt_bias_2d.reshape(-1)
+        o, _ = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias_flat,
+            scale=scale,
+            chunk_size=chunk_size,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            use_gate_in_kernel=True,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+        )
+        return o
+
+      o = _shard_map_chunk_kda(q, k, v, g, beta, self.A_log.value, dt_bias_2d)
 
     # Output gated norm (matching Megatron _apply_gated_norm)
     # 1. Per-head RMSNorm on KDA output
