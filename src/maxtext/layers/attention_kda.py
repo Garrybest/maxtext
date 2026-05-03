@@ -34,12 +34,17 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh
 from maxtext.kernels.kda import chunk_kda
-from tops.cpu.ops.common.l2norm import l2norm_fwd
 
 from maxtext.common.common_types import Config, MODEL_MODE_AUTOREGRESSIVE
 from maxtext.layers import linears
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.utils.sharding import logical_to_mesh_axes
+
+
+def _l2_normalize(x, axis=-1, eps=1e-6):
+  x_f = x.astype(jnp.float32)
+  rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=axis, keepdims=True) + eps)
+  return (x_f * rstd).astype(x.dtype)
 
 
 class KimiDeltaAttention(nnx.Module):
@@ -357,8 +362,8 @@ class KimiDeltaAttention(nnx.Module):
 
     # Apply L2 normalization to Q/K outside the kernel (matching Megatron kda.py:824-828)
     if cfg.use_qk_norm:
-      q, _ = l2norm_fwd(q)
-      k, _ = l2norm_fwd(k)
+      q = _l2_normalize(q)
+      k = _l2_normalize(k)
 
     # Generate gate g (raw projection, gate transform done inside kernel)
     with jax.named_scope("gate_proj"):
