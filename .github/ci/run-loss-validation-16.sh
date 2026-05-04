@@ -82,6 +82,22 @@ cd /workspace/maxtext
   # maxtext + repo-local TPU deps).
   /opt/tools/uv venv --python 3.12 --seed --system-site-packages /opt/ci-env
   . /opt/ci-env/bin/activate
+
+  # Cold-start auth for `uv pip install`'s transitive private git deps
+  # (`tops @ git+primatrix/pallas-kernel`, `tokamax @ git+primatrix/tokamax`).
+  # Warm runs short-circuit via /tmp/ramdisk/.cache/uv git cache and never
+  # hit the network; cold-start paths (pod restart, livenessProbe failover,
+  # manual pool wipe) clear tmpfs and reach this fetch — failing 401 without
+  # auth. GITHUB_TOKEN comes from $RUN_DIR/run.env (CROSS_REPO_TOKEN with
+  # github.token fallback). GIT_CONFIG_GLOBAL=tmpfile + trap mirrors the
+  # workflow's Stage step so the token-bearing `insteadOf` rule does not
+  # persist in /root/.gitconfig.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    export GIT_CONFIG_GLOBAL=$(mktemp)
+    trap 'rm -f "${GIT_CONFIG_GLOBAL:-}"' EXIT
+    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+  fi
+
   /opt/tools/uv pip install -e '.[tpu]' --resolution=lowest
 
   # optax from source (matches the existing CI Job yaml).
