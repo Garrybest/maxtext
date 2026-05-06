@@ -1,5 +1,8 @@
 name: TPU Loss Validation (64 chips, 100 steps)
 
+# DISABLED: lingbo cluster does not yet have a 64-chip (4x4x4) TPU pool.
+# Re-enable by removing `if: false` from the job below.
+
 on:
   # Manual-only trigger for now (64-chip CI is gated on cluster reservation
   # availability; running it nightly is wasteful when 16-chip already covers
@@ -18,6 +21,7 @@ concurrency:
 
 jobs:
   tpu_loss_validation:
+    if: false  # DISABLED: see header comment.
     name: "100-step loss validation on 64 TPU chips (gbs=5120)"
     runs-on: ubuntu-latest
     permissions:

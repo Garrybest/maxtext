@@ -1,5 +1,7 @@
 name: TPU Pretrain 1K Steps
 
+# DISABLED: lingbo cluster does not yet have a 64-chip (4x4x4) TPU pool.
+# Re-enable by removing `if: false` from the job below.
 on:
   workflow_dispatch:
     inputs:
@@ -19,6 +21,7 @@ concurrency:
 
 jobs:
   tpu_1k_steps:
+    if: false  # DISABLED: see header comment.
     name: "1000-step pretrain on 4 TPU chips"
     runs-on: ubuntu-latest
     permissions:

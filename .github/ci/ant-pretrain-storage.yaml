@@ -1,0 +1,63 @@
+# GCS-Fuse CSI prereqs for the CI TPU pool: PV + PVC for gs://ant-pretrain
+# plus the Workload Identity KSA the pod template references.
+# Applied to each cluster before deploying the CI pools (see manage_tpu_pool.yml pool=storage).
+#
+# The ServiceAccount annotation below pins the impersonated GCP service
+# account; the value is cluster-specific (matches the project the cluster
+# lives in). For lingbo-tpu-test (tpu-for-lingbo project) it is the
+# jax-tpu-gsa SA. On a fresh cluster, also bind that GSA with
+# roles/iam.workloadIdentityUser for principalSet
+# `<project>.svc.id.goog[default/gcs-account]`.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ant-pretrain-pv
+spec:
+  accessModes:
+    - ReadWriteMany
+  capacity:
+    storage: 64Gi
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: ant-pretrain-pvc
+    namespace: default
+  csi:
+    driver: gcsfuse.csi.storage.gke.io
+    volumeAttributes:
+      gcsfuseMetadataPrefetchOnMount: "true"
+      skipCSIBucketAccessCheck: "true"
+    volumeHandle: ant-pretrain
+  mountOptions:
+    - implicit-dirs
+    - profile:aiml-training
+    - metadata-cache:negative-ttl-secs:0
+    - metadata-cache:ttl-secs:-1
+    - metadata-cache:stat-cache-max-size-mb:-1
+    - metadata-cache:type-cache-max-size-mb:-1
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: example-storage-class
+  volumeMode: Filesystem
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ant-pretrain-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 64Gi
+  storageClassName: example-storage-class
+  volumeMode: Filesystem
+  volumeName: ant-pretrain-pv
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gcs-account
+  namespace: default
+  annotations:
+    iam.gke.io/gcp-service-account: jax-tpu-gsa@tpu-for-lingbo.iam.gserviceaccount.com

@@ -3,6 +3,12 @@ name: Manage TPU Pool
 on:
   workflow_dispatch:
     inputs:
+      target_cluster:
+        description: "Cluster target (default = repo secrets, lingbo = pre-cutover validation)"
+        required: false
+        type: choice
+        default: default
+        options: [default, lingbo]
       pool:
         description: "Which pool to manage"
         required: true
@@ -11,6 +17,7 @@ on:
         options:
           - unit-tests
           - lossval16
+          - storage
       action:
         description: "Preview or apply the pool manifest"
         required: true
@@ -44,17 +51,35 @@ jobs:
           echo "SHA: $GITHUB_SHA"
           echo "Action: ${{ github.event.inputs.action }}"
 
+      - name: Verify *_LINGBO secrets are populated
+        if: inputs.target_cluster == 'lingbo'
+        env:
+          WIF_LINGBO: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO }}
+          SA_LINGBO: ${{ secrets.GCP_SERVICE_ACCOUNT_LINGBO }}
+          CLUSTER_LINGBO: ${{ secrets.GKE_CLUSTER_LINGBO }}
+          LOCATION_LINGBO: ${{ secrets.GKE_LOCATION_LINGBO }}
+        run: |
+          missing=()
+          [ -z "$WIF_LINGBO" ] && missing+=(GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO)
+          [ -z "$SA_LINGBO" ] && missing+=(GCP_SERVICE_ACCOUNT_LINGBO)
+          [ -z "$CLUSTER_LINGBO" ] && missing+=(GKE_CLUSTER_LINGBO)
+          [ -z "$LOCATION_LINGBO" ] && missing+=(GKE_LOCATION_LINGBO)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::target_cluster=lingbo but these secrets are empty: ${missing[*]} - refusing to silently fall back to the default cluster."
+            exit 1
+          fi
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ secrets.GKE_CLUSTER }}
-          location: ${{ secrets.GKE_LOCATION }}
+          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
+          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
 
       - name: Resolve pool manifest + rollout target
         id: pool
@@ -69,6 +94,15 @@ jobs:
               echo "manifest=.github/ci/tpu-lossval16-pool.yaml" >> "$GITHUB_OUTPUT"
               echo "rollout=statefulset/ci-lossval16-pool" >> "$GITHUB_OUTPUT"
               echo "label=pool=ci-lossval16" >> "$GITHUB_OUTPUT"
+              ;;
+            storage)
+              if [ "${{ inputs.target_cluster }}" != "lingbo" ]; then
+                echo "::error::pool=storage requires target_cluster=lingbo — the manifest hardcodes the lingbo GSA email; applying it on the default cluster would corrupt its gcs-account KSA->GSA binding."
+                exit 1
+              fi
+              echo "manifest=.github/ci/ant-pretrain-storage.yaml" >> "$GITHUB_OUTPUT"
+              echo "rollout=" >> "$GITHUB_OUTPUT"
+              echo "label=" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "::error::unknown pool: ${{ github.event.inputs.pool }}"; exit 1 ;;
@@ -95,11 +129,15 @@ jobs:
         run: kubectl apply -f "${{ steps.pool.outputs.manifest }}"
 
       - name: Wait for pool rollout
-        if: github.event.inputs.action == 'apply'
+        if: github.event.inputs.action == 'apply' && steps.pool.outputs.rollout != ''
         run: kubectl rollout status "${{ steps.pool.outputs.rollout }}" --timeout=15m
 
       - name: Show pool status
         if: always()
         run: |
-          kubectl get "${{ steps.pool.outputs.rollout }}" -o wide || true
-          kubectl get pods -l "${{ steps.pool.outputs.label }}" -o wide || true
+          if [ -n "${{ steps.pool.outputs.rollout }}" ]; then
+            kubectl get "${{ steps.pool.outputs.rollout }}" -o wide || true
+          fi
+          if [ -n "${{ steps.pool.outputs.label }}" ]; then
+            kubectl get pods -l "${{ steps.pool.outputs.label }}" -o wide || true
+          fi

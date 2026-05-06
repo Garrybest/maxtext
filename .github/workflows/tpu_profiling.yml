@@ -1,5 +1,7 @@
 name: TPU Profiling (64 chips)
 
+# DISABLED: lingbo cluster does not yet have a 64-chip (4x4x4) TPU pool.
+# Re-enable by removing `if: false` from the job below.
 on:
   workflow_dispatch:
     inputs:
@@ -83,6 +85,7 @@ concurrency:
 
 jobs:
   tpu_profiling:
+    if: false  # DISABLED: see header comment.
     name: "Profiling on 64 TPU chips (16 pods x 4 chips)"
     runs-on: ubuntu-latest
     permissions:

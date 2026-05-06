@@ -18,6 +18,13 @@ on:
       - '.github/CODEOWNERS'
       - '**/*.md'
   workflow_dispatch:
+    inputs:
+      target_cluster:
+        description: "Cluster target (default = repo secrets, lingbo = pre-cutover validation)"
+        required: false
+        type: choice
+        default: default
+        options: [default, lingbo]
 
 concurrency:
   group: ci-tpu-smoke-${{ github.head_ref || github.ref_name }}
@@ -56,17 +63,35 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.checkout_ref }}
 
+      - name: Verify *_LINGBO secrets are populated
+        if: inputs.target_cluster == 'lingbo'
+        env:
+          WIF_LINGBO: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO }}
+          SA_LINGBO: ${{ secrets.GCP_SERVICE_ACCOUNT_LINGBO }}
+          CLUSTER_LINGBO: ${{ secrets.GKE_CLUSTER_LINGBO }}
+          LOCATION_LINGBO: ${{ secrets.GKE_LOCATION_LINGBO }}
+        run: |
+          missing=()
+          [ -z "$WIF_LINGBO" ] && missing+=(GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO)
+          [ -z "$SA_LINGBO" ] && missing+=(GCP_SERVICE_ACCOUNT_LINGBO)
+          [ -z "$CLUSTER_LINGBO" ] && missing+=(GKE_CLUSTER_LINGBO)
+          [ -z "$LOCATION_LINGBO" ] && missing+=(GKE_LOCATION_LINGBO)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::target_cluster=lingbo but these secrets are empty: ${missing[*]} - refusing to silently fall back to the default cluster."
+            exit 1
+          fi
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ secrets.GKE_CLUSTER }}
-          location: ${{ secrets.GKE_LOCATION }}
+          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
+          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
 
       - name: Generate unique job name
         id: job
