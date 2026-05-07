@@ -219,6 +219,7 @@ jobs:
           POOL_PODS="ci-lossval16-pool-0 ci-lossval16-pool-1 ci-lossval16-pool-2 ci-lossval16-pool-3"
           deadline=$(( $(date +%s) + 7800 ))   # 130min hard timeout (~110min train + buffer)
           last_step=-1
+          last_err_sig=""
           # Polling cadence: 90s. For a 110min run this drops the kubectl call
           # count from ~2400 (30s polling) to ~800; combined with the labeled
           # `kubectl get pods` below (1 call vs 4), per-iter cost falls from
@@ -331,6 +332,14 @@ jobs:
                 done_count=$((done_count + 1))
                 if [ "$rc" != "0" ]; then
                   echo "::error::$pod exited rc=$rc"
+                  # Dump the failing pod's trainer log inline so the stack is
+                  # visible next to the error annotation without having to
+                  # download the artifact zip. The `if: always()` step below
+                  # only dumps pod-0; without this, a non-pod-0 failure leaves
+                  # the workflow log without any trainer output.
+                  echo "=== $pod log tail (last 300 lines) ==="
+                  kubectl exec "$pod" -c jax-tpu -- bash -c "tail -n 300 /tmp/ramdisk/runs/$RUN_ID/log 2>/dev/null" 2>/dev/null || true
+                  echo "=== end $pod log tail ==="
                   exit 1
                 fi
               fi
@@ -346,6 +355,25 @@ jobs:
             if [ -n "$step" ] && [ "$step" != "$last_step" ]; then
               echo "[progress] step=$step  (done_count=$done_count/4)"
               last_step="$step"
+            fi
+
+            # Surface trainer error/exception lines from pod-0 tail so transient
+            # warnings or non-fatal exceptions are visible live in the workflow
+            # log instead of only in the artifact zip. Pattern matches typed
+            # exception messages (`XlaRuntimeError:`, `ValueError:`, ...) and
+            # ERROR/FATAL/abseil-prefixed log lines; skips bare `Traceback `
+            # headers since chained tracebacks would otherwise re-fire each
+            # iteration. Dedup signature is the md5 of the matched lines, so a
+            # block only prints when it changes (new error appears or old one
+            # scrolls out of the 60-line window).
+            err_lines=$(echo "$log_tail" | grep -E '^([A-Za-z][A-Za-z0-9_.]*(Error|Exception): |ERROR\b|FATAL\b|E[0-9]{4} )' || true)
+            if [ -n "$err_lines" ]; then
+              err_sig=$(printf '%s' "$err_lines" | md5sum 2>/dev/null | awk '{print $1}' || true)
+              if [ -n "$err_sig" ] && [ "$err_sig" != "$last_err_sig" ]; then
+                echo "[trainer-err] new error lines from ci-lossval16-pool-0:"
+                printf '%s\n' "$err_lines" | sed 's/^/  /'
+                last_err_sig="$err_sig"
+              fi
             fi
 
             sleep $POLL_INTERVAL
