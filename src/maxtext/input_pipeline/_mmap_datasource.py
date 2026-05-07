@@ -64,14 +64,10 @@ class MMapIndexedDataset:
   Args:
       path_prefix: Path prefix for the dataset files. The reader expects
           ``{path_prefix}.idx`` and ``{path_prefix}.bin`` to exist.
-      validate_bin_size: When True, verify that all pointers in the index
-          fall within the ``.bin`` file. Disabled by default to avoid an
-          O(N) scan at startup on large datasets.
   """
 
-  def __init__(self, path_prefix: str, validate_bin_size: bool = False):
+  def __init__(self, path_prefix: str):
     self._path_prefix = path_prefix
-    self._validate_bin_size = validate_bin_size
     self._idx_path = path_prefix + ".idx"
     self._bin_path = path_prefix + ".bin"
     self._dtype = None
@@ -177,41 +173,7 @@ class MMapIndexedDataset:
     self._pointers = np.frombuffer(self._idx_buffer, dtype=np.int64, count=self._num_sequences, offset=pointers_offset)
     self._doc_idx = np.frombuffer(self._idx_buffer, dtype=np.int64, count=doc_idx_entries, offset=doc_idx_offset)
 
-    _full_validation = os.environ.get("MMAP_IDX_FULL_VALIDATION", "").lower() in ("1", "true", "yes")
-    _sample_size = 256
-
-    def _idx_sample(n):
-      if n <= 0:
-        return np.empty(0, dtype=np.int64)
-      if _full_validation or n <= _sample_size + 2:
-        return np.arange(n, dtype=np.int64)
-      head_tail = np.array([0, n - 1], dtype=np.int64)
-      rng = np.random.default_rng(seed=0xC0FFEE)
-      sampled = rng.integers(low=0, high=n, size=_sample_size, dtype=np.int64)
-      return np.concatenate([head_tail, sampled])
-
-    if self._num_sequences > 0:
-      sample_idx = _idx_sample(self._num_sequences)
-      sampled_sizes = self._sizes[sample_idx]
-      neg_mask = sampled_sizes < 0
-      if neg_mask.any():
-        bad_pos = sample_idx[neg_mask][:5].tolist()
-        raise ValueError(
-            f"Negative sizes in {self._idx_path}: "
-            f"sequence(s) {bad_pos} have negative sizes "
-            f"{sampled_sizes[neg_mask][:5].tolist()}"
-        )
-
-      sampled_ptrs = self._pointers[sample_idx]
-      neg_mask = sampled_ptrs < 0
-      if neg_mask.any():
-        bad_pos = sample_idx[neg_mask][:5].tolist()
-        raise ValueError(
-            f"Negative pointers in {self._idx_path}: "
-            f"sequence(s) {bad_pos} have negative byte offsets "
-            f"{sampled_ptrs[neg_mask][:5].tolist()}"
-        )
-
+    # O(1) boundary checks — always run.
     if self._num_documents > 0:
       if self._doc_idx[0] != 0:
         raise ValueError(f"Invalid doc_idx in {self._idx_path}: " f"first entry must be 0, got {self._doc_idx[0]}")
@@ -221,39 +183,61 @@ class MMapIndexedDataset:
             f"last entry must equal num_sequences "
             f"({self._num_sequences}), got {self._doc_idx[-1]}"
         )
-      if len(self._doc_idx) > 1:
-        n = len(self._doc_idx) - 1
-        pair_idx = _idx_sample(n)
-        a = self._doc_idx[pair_idx]
-        b = self._doc_idx[pair_idx + 1]
-        bad = b < a
-        if bad.any():
-          raise ValueError(
-              f"Non-monotonic doc_idx in {self._idx_path}: " f"decreases at position(s) {pair_idx[bad][:5].tolist()}"
-          )
+
+    # Extended validation behind MMAP_IDX_FULL_VALIDATION=1 for
+    # debugging corrupt .idx files. Disabled by default because
+    # the sampled mmap page faults cost ~23s on cold GCS Fuse.
+    if os.environ.get("MMAP_IDX_FULL_VALIDATION", "").lower() in ("1", "true", "yes"):
+      self._validate_idx_arrays()
+
+  def _validate_idx_arrays(self):
+    """Full O(N) validation of .idx arrays. Gated behind MMAP_IDX_FULL_VALIDATION=1."""
+    if self._num_sequences > 0:
+      neg_mask = self._sizes < 0
+      if neg_mask.any():
+        bad_pos = np.flatnonzero(neg_mask)[:5].tolist()
+        raise ValueError(
+            f"Negative sizes in {self._idx_path}: "
+            f"sequence(s) {bad_pos} have negative sizes "
+            f"{self._sizes[bad_pos].tolist()}"
+        )
+
+      neg_mask = self._pointers < 0
+      if neg_mask.any():
+        bad_pos = np.flatnonzero(neg_mask)[:5].tolist()
+        raise ValueError(
+            f"Negative pointers in {self._idx_path}: "
+            f"sequence(s) {bad_pos} have negative byte offsets "
+            f"{self._pointers[bad_pos].tolist()}"
+        )
+
+    if self._num_documents > 0 and len(self._doc_idx) > 1:
+      a = self._doc_idx[:-1]
+      b = self._doc_idx[1:]
+      bad = b < a
+      if bad.any():
+        bad_pos = np.flatnonzero(bad)[:5].tolist()
+        raise ValueError(f"Non-monotonic doc_idx in {self._idx_path}: " f"decreases at position(s) {bad_pos}")
 
     element_size = np.dtype(self._dtype).itemsize
     if element_size > 1 and self._num_sequences > 0:
-      sample_idx = _idx_sample(self._num_sequences)
-      sampled_ptrs = self._pointers[sample_idx]
-      misaligned_mask = (sampled_ptrs % element_size) != 0
+      misaligned_mask = (self._pointers % element_size) != 0
       if misaligned_mask.any():
-        bad_pos = sample_idx[misaligned_mask][:5].tolist()
+        bad_pos = np.flatnonzero(misaligned_mask)[:5].tolist()
         raise ValueError(
             f"Misaligned pointers in {self._idx_path}: "
             f"sequence(s) {bad_pos} have byte offsets "
             f"not aligned to dtype itemsize ({element_size})"
         )
 
-    if self._validate_bin_size and self._num_sequences > 0:
-      bin_size = os.path.getsize(self._bin_path)
-      sample_idx = _idx_sample(self._num_sequences)
-      ends = self._pointers[sample_idx].astype(np.int64) + self._sizes[sample_idx].astype(np.int64) * element_size
+    bin_size = os.path.getsize(self._bin_path)
+    if self._num_sequences > 0:
+      ends = self._pointers.astype(np.int64) + self._sizes.astype(np.int64) * element_size
       max_end = int(np.max(ends))
       if max_end > bin_size:
         raise ValueError(
             f"Binary file {self._bin_path} is too small ({bin_size} bytes) "
-            f"for the indexed data (sampled requirement: {max_end} bytes)"
+            f"for the indexed data (requirement: {max_end} bytes)"
         )
 
   def _open_bin(self):
@@ -360,11 +344,11 @@ class MMapIndexedDataset:
 
   def __getstate__(self):
     """Support pickling for Grain multi-process workers."""
-    return {"path_prefix": self._path_prefix, "validate_bin_size": self._validate_bin_size}
+    return {"path_prefix": self._path_prefix}
 
   def __setstate__(self, state):
     """Restore from pickle."""
-    self.__init__(state["path_prefix"], state.get("validate_bin_size", False))
+    self.__init__(state["path_prefix"])
 
 
 class MMapIndexedDataSource(grain.RandomAccessDataSource):
@@ -1180,15 +1164,12 @@ def _ensure_npy_indices(
     all_prefixes.extend(_mmap_index_utils.resolve_shard_prefixes(bp))
   all_prefixes = sorted(all_prefixes)
 
-  doc_sizes = _mmap_index_utils.get_document_sizes(all_prefixes)
-  num_docs = len(doc_sizes)
-
-  start_doc = 0
   if split is not None:
+    num_docs = _mmap_index_utils.get_num_documents(all_prefixes)
     start_doc, end_doc = _mmap_index_utils.parse_split_range(split, split_index, num_docs)
-    num_docs = end_doc - start_doc
-
-  tokens_per_epoch = int(doc_sizes[start_doc : start_doc + num_docs].sum())
+    tokens_per_epoch = _mmap_index_utils.get_split_tokens(all_prefixes, start_doc, end_doc)
+  else:
+    tokens_per_epoch = _mmap_index_utils.get_total_tokens(all_prefixes)
   if num_samples is None:
     samples_per_epoch = (tokens_per_epoch - add_extra_token) // seq_length
     num_samples = samples_per_epoch * max(1, num_epoch)

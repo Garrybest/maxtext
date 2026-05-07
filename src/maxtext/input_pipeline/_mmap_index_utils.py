@@ -8,12 +8,14 @@ All pure-computation helpers are deterministic given the same inputs
 and random seed, matching Megatron-LM's ``gpt_dataset.py`` RNG flow.
 """
 
+import functools
 import glob as _glob
 import hashlib
 import json
 import logging
 import math
 import os
+import struct
 
 import numpy as np
 
@@ -58,17 +60,24 @@ def resolve_shard_prefixes(paths):
     derive prefixes by stripping the ``.idx`` extension.
   - Otherwise raise ``FileNotFoundError``.
 
+  Results are cached per unique input to avoid repeated GCS Fuse
+  directory scans during multi-dataset initialization.
+
   Returns:
       Sorted list of path prefixes (without ``.idx``/``.bin`` extension).
 
   Raises:
       FileNotFoundError: If no ``.idx`` files can be found.
   """
-  if isinstance(paths, str):
-    paths = [paths]
+  key = (paths,) if isinstance(paths, str) else tuple(paths)
+  return list(_resolve_shard_prefixes_cached(key))
 
+
+@functools.lru_cache(maxsize=64)
+def _resolve_shard_prefixes_cached(paths_tuple):
+  """Cached implementation of shard prefix resolution."""
   prefixes = []
-  for p in paths:
+  for p in paths_tuple:
     if os.path.isfile(p + ".idx"):
       prefixes.append(p)
     elif os.path.isdir(p):
@@ -86,31 +95,176 @@ def resolve_shard_prefixes(paths):
 
 
 # ---------------------------------------------------------------------------
+# .idx header parsing (lightweight — no array reads)
+# ---------------------------------------------------------------------------
+
+_IDX_MAGIC = b"MMIDIDX\x00\x00"
+# magic(9) + version(8) + dtype_code(1) + num_sequences(8) + num_documents(8)
+_IDX_HEADER_SIZE = 34
+_IDX_DTYPE_CODES = {
+    1: np.uint8,
+    2: np.int8,
+    3: np.int16,
+    4: np.int32,
+    5: np.int64,
+    6: np.float64,
+    7: np.float32,
+    8: np.uint16,
+}
+
+
+def _read_idx_header(prefix: str):
+  """Read .idx header. Returns (num_sequences, num_documents, numpy dtype, doc_idx_entries).
+
+  Detects convention A (num_documents_raw = doc count, doc_idx has raw+1
+  entries) vs convention B (num_documents_raw = len(doc_idx), actual doc
+  count = raw-1) by checking the file size.
+  """
+  idx_path = prefix + ".idx"
+  file_size = os.path.getsize(idx_path)
+  with open(idx_path, "rb") as f:
+    magic = f.read(9)
+    if magic != _IDX_MAGIC:
+      raise ValueError(f"Invalid magic in {idx_path}")
+    f.read(8)  # version
+    dtype_code = struct.unpack("<B", f.read(1))[0]
+    num_sequences = struct.unpack("<Q", f.read(8))[0]
+    num_documents_raw = struct.unpack("<Q", f.read(8))[0]
+
+  body_a = num_sequences * 4 + num_sequences * 8 + (num_documents_raw + 1) * 8
+  body_b = num_sequences * 4 + num_sequences * 8 + num_documents_raw * 8
+
+  if file_size >= _IDX_HEADER_SIZE + body_a:
+    num_documents = num_documents_raw
+    doc_idx_entries = num_documents_raw + 1
+  elif file_size >= _IDX_HEADER_SIZE + body_b:
+    num_documents = num_documents_raw - 1
+    doc_idx_entries = num_documents_raw
+  else:
+    raise ValueError(f"Index file {idx_path} is truncated")
+
+  return num_sequences, num_documents, _IDX_DTYPE_CODES[dtype_code], doc_idx_entries
+
+
+# ---------------------------------------------------------------------------
+# O(1) token counting (no array reads)
+# ---------------------------------------------------------------------------
+
+
+def get_total_tokens(path_prefixes: list[str]) -> int:
+  """Total token count derived from .bin file sizes — O(1) per shard, no array reads."""
+  total = 0
+  for prefix in path_prefixes:
+    _, _, dtype, _ = _read_idx_header(prefix)
+    element_size = np.dtype(dtype).itemsize
+    total += os.path.getsize(prefix + ".bin") // element_size
+  return total
+
+
+def get_split_tokens(path_prefixes: list[str], start_doc: int, end_doc: int) -> int:
+  """Token count for a document range using pointer arithmetic — O(1) per shard.
+
+  Reads only .idx headers + a few bytes via pread to compute the token
+  sum for docs [start_doc, end_doc) across concatenated shards, instead
+  of reading the full sizes/doc_idx arrays.
+  """
+  global_doc = 0
+  total_tokens = 0
+
+  for prefix in path_prefixes:
+    num_seq, num_docs, dtype, _ = _read_idx_header(prefix)
+    shard_end = global_doc + num_docs
+    if start_doc >= shard_end or end_doc <= global_doc:
+      global_doc = shard_end
+      continue
+
+    local_start = max(0, start_doc - global_doc)
+    local_end = min(num_docs, end_doc - global_doc)
+    element_size = np.dtype(dtype).itemsize
+
+    if local_start == 0 and local_end == num_docs:
+      total_tokens += os.path.getsize(prefix + ".bin") // element_size
+    else:
+      total_tokens += _pread_split_tokens(prefix, num_seq, num_docs, element_size, local_start, local_end)
+
+    global_doc = shard_end
+
+  return total_tokens
+
+
+def _pread_split_tokens(prefix, num_seq, num_docs, element_size, local_start, local_end):
+  """Read token count for a doc range within a single shard via pread."""
+  idx_path = prefix + ".idx"
+  pointers_offset = _IDX_HEADER_SIZE + num_seq * 4
+  doc_idx_offset = pointers_offset + num_seq * 8
+
+  fd = os.open(idx_path, os.O_RDONLY)
+  try:
+    buf = os.pread(fd, 8, doc_idx_offset + local_start * 8)
+    seq_start = struct.unpack("<q", buf)[0]
+
+    if local_end >= num_docs:
+      seq_end = num_seq
+    else:
+      buf = os.pread(fd, 8, doc_idx_offset + local_end * 8)
+      seq_end = struct.unpack("<q", buf)[0]
+
+    if seq_start == seq_end:
+      return 0
+
+    buf = os.pread(fd, 8, pointers_offset + seq_start * 8)
+    ptr_start = struct.unpack("<q", buf)[0]
+
+    if seq_end >= num_seq:
+      ptr_end = os.path.getsize(prefix + ".bin")
+    else:
+      buf = os.pread(fd, 8, pointers_offset + seq_end * 8)
+      ptr_end = struct.unpack("<q", buf)[0]
+  finally:
+    os.close(fd)
+
+  return (ptr_end - ptr_start) // element_size
+
+
+def get_num_documents(path_prefixes: list[str]) -> int:
+  """Total document count from .idx headers — O(1) per shard."""
+  return sum(_read_idx_header(p)[1] for p in path_prefixes)
+
+
+# ---------------------------------------------------------------------------
 # Document sizes
 # ---------------------------------------------------------------------------
 
 
 def get_document_sizes(path_prefixes: list[str]) -> np.ndarray:
-  """Extract per-document token counts from one or more shards."""
-  from maxtext.input_pipeline._mmap_datasource import MMapIndexedDataset  # pylint: disable=import-outside-toplevel
+  """Extract per-document token counts from one or more shards.
 
-  all_sizes = []
-  for prefix in path_prefixes:
-    ds = MMapIndexedDataset(prefix)
-    try:
-      doc_idx = ds.doc_idx
-      sizes = ds.sizes
-      num_docs = len(doc_idx) - 1
-      if num_docs == 0:
-        continue
-      starts = doc_idx[:num_docs].astype(np.intp)
-      counts = np.add.reduceat(sizes.astype(np.int64), starts)
-      all_sizes.append(counts)
-    finally:
-      ds.close()
+  Per-shard results are cached individually so that different dataset
+  specs sharing some of the same shards avoid redundant GCS Fuse I/O.
+  """
+  all_sizes = [_get_single_shard_doc_sizes(p) for p in path_prefixes]
+  all_sizes = [s for s in all_sizes if len(s) > 0]
   if not all_sizes:
     return np.array([], dtype=np.int64)
   return np.concatenate(all_sizes)
+
+
+@functools.lru_cache(maxsize=256)
+def _get_single_shard_doc_sizes(prefix: str) -> np.ndarray:
+  """Return per-document token counts for a single shard (cached)."""
+  from maxtext.input_pipeline._mmap_datasource import MMapIndexedDataset  # pylint: disable=import-outside-toplevel
+
+  ds = MMapIndexedDataset(prefix)
+  try:
+    doc_idx = ds.doc_idx
+    sizes = ds.sizes
+    num_docs = len(doc_idx) - 1
+    if num_docs == 0:
+      return np.array([], dtype=np.int64)
+    starts = doc_idx[:num_docs].astype(np.intp)
+    return np.add.reduceat(sizes.astype(np.int64), starts)
+  finally:
+    ds.close()
 
 
 def parse_split_range(split_str, split_index, num_docs):

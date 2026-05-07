@@ -252,17 +252,6 @@ class TestMMapIndexedDataset:
     with pytest.raises(ValueError, match="truncated"):
       MMapIndexedDataset(prefix)
 
-  def test_bin_too_small(self, tmp_dir):
-    """Pointers reference data beyond the end of .bin file."""
-    prefix = os.path.join(tmp_dir, "bin_small")
-    seqs = [np.array([1, 2, 3], dtype=np.int32)]
-    create_mmap_test_data(prefix, seqs)
-    # Truncate .bin to 4 bytes (needs 12)
-    with open(prefix + ".bin", "wb") as f:
-      f.write(b"\x00" * 4)
-    with pytest.raises(ValueError, match="too small"):
-      MMapIndexedDataset(prefix, validate_bin_size=True)
-
   def test_missing_file(self, tmp_dir):
     prefix = os.path.join(tmp_dir, "nonexistent")
     with pytest.raises(FileNotFoundError):
@@ -277,10 +266,23 @@ class TestMMapIndexedDataset:
     with pytest.raises(FileNotFoundError, match="Binary file"):
       MMapIndexedDataset(prefix)
 
-  # --- negative pointer/size validation ---
+  # --- full validation (MMAP_IDX_FULL_VALIDATION=1) ---
 
-  def test_negative_size_raises(self, tmp_dir):
-    """Negative sizes in the idx file should raise ValueError."""
+  def test_bin_too_small(self, tmp_dir, monkeypatch):
+    """Pointers reference data beyond the end of .bin file."""
+    monkeypatch.setenv("MMAP_IDX_FULL_VALIDATION", "1")
+    prefix = os.path.join(tmp_dir, "bin_small")
+    seqs = [np.array([1, 2, 3], dtype=np.int32)]
+    create_mmap_test_data(prefix, seqs)
+    # Truncate .bin to 4 bytes (needs 12)
+    with open(prefix + ".bin", "wb") as f:
+      f.write(b"\x00" * 4)
+    with pytest.raises(ValueError, match="too small"):
+      MMapIndexedDataset(prefix)
+
+  def test_negative_size_raises(self, tmp_dir, monkeypatch):
+    """Negative sizes in the idx file should raise ValueError with full validation."""
+    monkeypatch.setenv("MMAP_IDX_FULL_VALIDATION", "1")
     prefix = os.path.join(tmp_dir, "neg_size")
     with open(prefix + ".idx", "wb") as f:
       f.write(MMAP_INDEX_MAGIC)
@@ -296,8 +298,9 @@ class TestMMapIndexedDataset:
     with pytest.raises(ValueError, match="Negative sizes"):
       MMapIndexedDataset(prefix)
 
-  def test_negative_pointer_raises(self, tmp_dir):
-    """Negative pointers in the idx file should raise ValueError."""
+  def test_negative_pointer_raises(self, tmp_dir, monkeypatch):
+    """Negative pointers in the idx file should raise ValueError with full validation."""
+    monkeypatch.setenv("MMAP_IDX_FULL_VALIDATION", "1")
     prefix = os.path.join(tmp_dir, "neg_ptr")
     with open(prefix + ".idx", "wb") as f:
       f.write(MMAP_INDEX_MAGIC)
@@ -313,10 +316,30 @@ class TestMMapIndexedDataset:
     with pytest.raises(ValueError, match="Negative pointers"):
       MMapIndexedDataset(prefix)
 
+  def test_misaligned_pointer_raises(self, tmp_dir, monkeypatch):
+    """Pointer not aligned to dtype itemsize should raise ValueError with full validation."""
+    monkeypatch.setenv("MMAP_IDX_FULL_VALIDATION", "1")
+    prefix = os.path.join(tmp_dir, "misaligned")
+    # int32 has itemsize=4, so pointer=3 is misaligned
+    with open(prefix + ".idx", "wb") as f:
+      f.write(MMAP_INDEX_MAGIC)
+      f.write(struct.pack("<Q", MMAP_INDEX_VERSION))
+      f.write(struct.pack("<B", 4))  # int32
+      f.write(struct.pack("<Q", 1))  # 1 sequence
+      f.write(struct.pack("<Q", 1))  # 1 document
+      f.write(np.array([1], dtype=np.int32).tobytes())  # size=1
+      f.write(np.array([3], dtype=np.int64).tobytes())  # pointer=3 (misaligned for int32)
+      f.write(np.array([0, 1], dtype=np.int64).tobytes())
+    with open(prefix + ".bin", "wb") as f:
+      f.write(b"\x00" * 8)  # enough bytes
+    with pytest.raises(ValueError, match="Misaligned pointers"):
+      MMapIndexedDataset(prefix)
+
   # --- doc_idx validation ---
 
-  def test_non_monotonic_doc_idx_raises(self, tmp_dir):
-    """doc_idx that decreases should raise ValueError."""
+  def test_non_monotonic_doc_idx_raises(self, tmp_dir, monkeypatch):
+    """doc_idx that decreases should raise ValueError with full validation."""
+    monkeypatch.setenv("MMAP_IDX_FULL_VALIDATION", "1")
     prefix = os.path.join(tmp_dir, "bad_docidx")
     seqs = [
         np.array([1, 2], dtype=np.int32),
@@ -388,26 +411,6 @@ class TestMMapIndexedDataset:
     with open(prefix + ".bin", "wb") as f:
       f.write(np.array([1, 2, 3, 4, 5, 6], dtype=np.int32).tobytes())
     with pytest.raises(ValueError, match="must equal num_sequences"):
-      MMapIndexedDataset(prefix)
-
-  # --- pointer alignment ---
-
-  def test_misaligned_pointer_raises(self, tmp_dir):
-    """Pointer not aligned to dtype itemsize should raise ValueError."""
-    prefix = os.path.join(tmp_dir, "misaligned")
-    # int32 has itemsize=4, so pointer=3 is misaligned
-    with open(prefix + ".idx", "wb") as f:
-      f.write(MMAP_INDEX_MAGIC)
-      f.write(struct.pack("<Q", MMAP_INDEX_VERSION))
-      f.write(struct.pack("<B", 4))  # int32
-      f.write(struct.pack("<Q", 1))  # 1 sequence
-      f.write(struct.pack("<Q", 1))  # 1 document
-      f.write(np.array([1], dtype=np.int32).tobytes())  # size=1
-      f.write(np.array([3], dtype=np.int64).tobytes())  # pointer=3 (misaligned for int32)
-      f.write(np.array([0, 1], dtype=np.int64).tobytes())
-    with open(prefix + ".bin", "wb") as f:
-      f.write(b"\x00" * 8)  # enough bytes
-    with pytest.raises(ValueError, match="Misaligned pointers"):
       MMapIndexedDataset(prefix)
 
   def test_trailing_garbage_bytes_raises(self, tmp_dir):
