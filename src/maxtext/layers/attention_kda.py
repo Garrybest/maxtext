@@ -41,10 +41,76 @@ from maxtext.layers.normalizations import RMSNorm
 from maxtext.utils.sharding import logical_to_mesh_axes
 
 
+# tops chunk_kda kernel only supports chunk_size=64.
+_TOPS_CHUNK_SIZE = 64
+
+
 def _l2_normalize(x, axis=-1, eps=1e-6):
   x_f = x.astype(jnp.float32)
   rstd = jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=axis, keepdims=True) + eps)
   return (x_f * rstd).astype(x.dtype)
+
+
+class ShortConvolution(nnx.Module):
+  """Depthwise causal 1D convolution for local dependency modeling in KDA.
+
+  Each channel is convolved independently (no cross-channel mixing),
+  matching Megatron's Conv1d with groups=in_channels. Position i can
+  only attend to positions <= i (causal). When segment_ids is provided,
+  cross-segment contributions are masked to prevent leakage across
+  document boundaries (matches Megatron causal_conv1d_fn seq_idx).
+  """
+
+  def __init__(
+      self,
+      kernel_size: int,
+      features: int,
+      *,
+      dtype: jnp.dtype = jnp.bfloat16,
+      weight_dtype: jnp.dtype = jnp.bfloat16,
+      rngs: nnx.Rngs,
+  ):
+    self.kernel_size = kernel_size
+    self.features = features
+    self.dtype = dtype
+
+    self.kernel = nnx.Param(
+        nnx.initializers.lecun_normal()(
+            rngs.params(),
+            (kernel_size, features),
+            weight_dtype,
+        )
+    )
+
+  def __call__(self, x: jnp.ndarray, segment_ids: jnp.ndarray | None = None) -> jnp.ndarray:
+    B, T, F = x.shape
+    assert F == self.features, f"Input features {F} != {self.features}"
+
+    pad_width = [(0, 0), (self.kernel_size - 1, 0), (0, 0)]
+    x_padded = jnp.pad(x, pad_width, mode="constant", constant_values=0)
+
+    if segment_ids is not None:
+      seg_padded = jnp.pad(
+          segment_ids,
+          [(0, 0), (self.kernel_size - 1, 0)],
+          constant_values=0,
+      )
+      # Stack per-tap masks once so the loop body has no tap-dependent
+      # broadcasts beyond the slice itself.
+      masks = [
+          (seg_padded[:, k : k + T] == segment_ids).astype(x.dtype)[:, :, None]
+          for k in range(self.kernel_size - 1, -1, -1)
+      ]
+
+    output = jnp.zeros((B, T, F), dtype=x.dtype)
+    for k in range(self.kernel_size):
+      offset = self.kernel_size - 1 - k
+      x_slice = x_padded[:, offset : offset + T, :]
+      if segment_ids is not None:
+        x_slice = x_slice * masks[k]
+      output = output + x_slice * self.kernel[k]
+
+    return output.astype(self.dtype)
 
 
 class KimiDeltaAttention(nnx.Module):
@@ -88,38 +154,26 @@ class KimiDeltaAttention(nnx.Module):
 
     # Short convolution for local dependency modeling
     if cfg.linear_conv_kernel_dim > 0:
-      # Q, K, V each have their own depthwise causal 1D conv layer.
-      # nnx.Conv kernel shape: [K, in_features // feature_group_count, out_features].
-      # With feature_group_count == features, this is depthwise (one channel per group),
-      # matching Megatron's Conv1d(groups=features).
-      q_features = self.num_query_heads * self.key_head_dim
-      k_features = self.num_key_heads * self.key_head_dim
-      v_features = self.num_value_heads * self.value_head_dim
-      conv_kwargs = {
-          "kernel_size": (cfg.linear_conv_kernel_dim,),
-          "padding": "CAUSAL",
-          "use_bias": False,
-          "dtype": cfg.dtype,
-          "param_dtype": cfg.weight_dtype,
-          "rngs": rngs,
-      }
-      self.q_conv = nnx.Conv(
-          in_features=q_features,
-          out_features=q_features,
-          feature_group_count=q_features,
-          **conv_kwargs,
+      self.q_conv = ShortConvolution(
+          kernel_size=cfg.linear_conv_kernel_dim,
+          features=self.num_query_heads * self.key_head_dim,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          rngs=rngs,
       )
-      self.k_conv = nnx.Conv(
-          in_features=k_features,
-          out_features=k_features,
-          feature_group_count=k_features,
-          **conv_kwargs,
+      self.k_conv = ShortConvolution(
+          kernel_size=cfg.linear_conv_kernel_dim,
+          features=self.num_key_heads * self.key_head_dim,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          rngs=rngs,
       )
-      self.v_conv = nnx.Conv(
-          in_features=v_features,
-          out_features=v_features,
-          feature_group_count=v_features,
-          **conv_kwargs,
+      self.v_conv = ShortConvolution(
+          kernel_size=cfg.linear_conv_kernel_dim,
+          features=self.num_value_heads * self.value_head_dim,
+          dtype=cfg.dtype,
+          weight_dtype=cfg.weight_dtype,
+          rngs=rngs,
       )
     else:
       self.q_conv = None
@@ -311,23 +365,18 @@ class KimiDeltaAttention(nnx.Module):
 
     cfg = self.config
 
-    if decoder_segment_ids is not None:
-      raise NotImplementedError("KDA does not yet support packed sequences.")
-
     if model_mode == MODEL_MODE_AUTOREGRESSIVE:
       raise NotImplementedError("KDA autoregressive mode not yet implemented.")
 
-    B, T, _ = hidden_states.shape
+    B, T_orig, _ = hidden_states.shape
+    T = T_orig
 
-    # tops chunk_kda kernel only supports chunk_size=64
-    chunk_size = 64
-    if T % chunk_size != 0:
-      pad_len = chunk_size - (T % chunk_size)
+    if T % _TOPS_CHUNK_SIZE != 0:
+      pad_len = _TOPS_CHUNK_SIZE - (T % _TOPS_CHUNK_SIZE)
       hidden_states = jnp.pad(hidden_states, ((0, 0), (0, pad_len), (0, 0)))
+      if decoder_segment_ids is not None:
+        decoder_segment_ids = jnp.pad(decoder_segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
       T = hidden_states.shape[1]
-      needs_unpad = True
-    else:
-      needs_unpad = False
 
     # QKV projections
     with jax.named_scope("qkv_proj"):
@@ -347,9 +396,9 @@ class KimiDeltaAttention(nnx.Module):
         k_flat = k.reshape(B, T, -1)
         v_flat = v.reshape(B, T, -1)
 
-        q_flat = self.q_conv(q_flat)
-        k_flat = self.k_conv(k_flat)
-        v_flat = self.v_conv(v_flat)
+        q_flat = self.q_conv(q_flat, segment_ids=decoder_segment_ids)
+        k_flat = self.k_conv(k_flat, segment_ids=decoder_segment_ids)
+        v_flat = self.v_conv(v_flat, segment_ids=decoder_segment_ids)
 
         q = q_flat.reshape(B, T, self.num_query_heads, self.key_head_dim)
         k = k_flat.reshape(B, T, self.num_key_heads, self.key_head_dim)
@@ -393,57 +442,92 @@ class KimiDeltaAttention(nnx.Module):
       # Reshape dt_bias from [H*K] to [H, K] for proper head-dim sharding.
       dt_bias_2d = self.dt_bias.value.reshape(self.num_key_heads, self.key_head_dim)
 
-      @functools.partial(
-          jax.shard_map,
-          mesh=self.mesh,
-          in_specs=(qkv_pspec, qkv_pspec, qkv_pspec, qkv_pspec, beta_pspec, a_log_pspec, dt_bias_2d_pspec),
-          out_specs=qkv_pspec,
-          check_vma=False,
-      )
-      def _shard_map_chunk_kda(q, k, v, g, beta, A_log, dt_bias_2d):
-        dt_bias_flat = dt_bias_2d.reshape(-1)
-        o, _ = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias_flat,
-            scale=scale,
-            chunk_size=chunk_size,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            use_gate_in_kernel=True,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
+      if decoder_segment_ids is not None:
+        # Varlen path: pass segment_ids directly to chunk_kda
+        # The wrapper uses jax.vmap to provide row-level isolation
+        seg_pspec = self._logical_to_mesh_axes(("activation_batch", "activation_norm_length"))
+
+        @functools.partial(
+            jax.shard_map,
+            mesh=self.mesh,
+            in_specs=(
+                qkv_pspec,
+                qkv_pspec,
+                qkv_pspec,
+                qkv_pspec,
+                beta_pspec,
+                a_log_pspec,
+                dt_bias_2d_pspec,
+                seg_pspec,
+            ),
+            out_specs=qkv_pspec,
+            check_vma=False,
         )
-        return o
+        def _shard_map_chunk_kda_varlen(q, k, v, g, beta, A_log, dt_bias_2d, seg):
+          dt_bias_flat = dt_bias_2d.reshape(-1)
+          o, _ = chunk_kda(
+              q=q,
+              k=k,
+              v=v,
+              g=g,
+              beta=beta,
+              A_log=A_log,
+              dt_bias=dt_bias_flat,
+              segment_ids=seg,
+              scale=scale,
+              chunk_size=_TOPS_CHUNK_SIZE,
+              initial_state=None,
+              output_final_state=False,
+              use_qk_l2norm_in_kernel=False,
+              use_gate_in_kernel=True,
+              safe_gate=safe_gate,
+              lower_bound=lower_bound,
+          )
+          return o
 
-      o = _shard_map_chunk_kda(q, k, v, g, beta, self.A_log.value, dt_bias_2d)
+        o = _shard_map_chunk_kda_varlen(q, k, v, g, beta, self.A_log.value, dt_bias_2d, decoder_segment_ids)
+      else:
+        # Non-varlen path (original)
+        @functools.partial(
+            jax.shard_map,
+            mesh=self.mesh,
+            in_specs=(qkv_pspec, qkv_pspec, qkv_pspec, qkv_pspec, beta_pspec, a_log_pspec, dt_bias_2d_pspec),
+            out_specs=qkv_pspec,
+            check_vma=False,
+        )
+        def _shard_map_chunk_kda(q, k, v, g, beta, A_log, dt_bias_2d):
+          dt_bias_flat = dt_bias_2d.reshape(-1)
+          o, _ = chunk_kda(
+              q=q,
+              k=k,
+              v=v,
+              g=g,
+              beta=beta,
+              A_log=A_log,
+              dt_bias=dt_bias_flat,
+              scale=scale,
+              chunk_size=_TOPS_CHUNK_SIZE,
+              initial_state=None,
+              output_final_state=False,
+              use_qk_l2norm_in_kernel=False,
+              use_gate_in_kernel=True,
+              safe_gate=safe_gate,
+              lower_bound=lower_bound,
+          )
+          return o
 
-    # Output gated norm (matching Megatron _apply_gated_norm)
-    # 1. Per-head RMSNorm on KDA output
-    # 2. Sigmoid gate on normalized output
+        o = _shard_map_chunk_kda(q, k, v, g, beta, self.A_log.value, dt_bias_2d)
+
+    # Output gated norm (matching Megatron _apply_gated_norm):
+    # per-head RMSNorm over the value dim, then sigmoid gate.
     with jax.named_scope("output_gated_norm"):
-      # o: [B, T, H, V] → reshape to [..., V] for per-head norm
-      o_shape = o.shape
       o_dtype = o.dtype
-      o_flat = o.reshape(-1, self.value_head_dim)
-      o_normed = self.out_norm(o_flat)
-      # gate: [B, T, H, V] → reshape to [..., V]
-      gate_flat = output_gate.reshape(-1, self.value_head_dim)
-      o_gated = o_normed * jax.nn.sigmoid(gate_flat.astype(jnp.float32))
-      o = o_gated.astype(o_dtype).reshape(o_shape)
+      o_normed = self.out_norm(o)
+      o = (o_normed * jax.nn.sigmoid(output_gate.astype(jnp.float32))).astype(o_dtype)
 
     # Output projection
     with jax.named_scope("o_proj"):
       output = self.o_proj(o)
       output = checkpoint_name(output, "o_proj")
 
-    # Unpad if needed
-    if needs_unpad:
-      output = output[:, : hidden_states.shape[1] - pad_len, :]
-
-    return output, None
+    return output[:, :T_orig, :], None

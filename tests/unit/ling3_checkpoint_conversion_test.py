@@ -265,12 +265,12 @@ class Ling3CheckpointConversionTest(unittest.TestCase):
     self.assertIsNot(self.hooks_to_hf[other_kernel_key], conv_hook)
 
   def test_reshape_depthwise_conv_roundtrip(self):
-    """Depthwise conv weight MT [K, 1, C] ↔ HF [C, 1, K] is self-inverse bit-exact."""
+    """Depthwise conv weight MT [K, C] ↔ HF [C, 1, K] is a self-inverse roundtrip."""
     rng = np.random.RandomState(0)
     mt_key = "params-decoder-moe_layers_0-attention-q_conv-kernel"
-    # MT shape [K_conv, 1, H*head_dim] = [4, 1, 16 * 128] = [4, 1, 2048]
+    # MT shape [K_conv, H*head_dim] = [4, 16 * 128] = [4, 2048]
     # HF shape [H*head_dim, 1, K_conv] = [2048, 1, 4]
-    mt_shape = (4, 1, 2048)
+    mt_shape = (4, 2048)
     hf_shape = (2048, 1, 4)
     mt_tensor = rng.randn(*mt_shape).astype(np.float32)
     hf_tensor = self.hooks_to_hf[mt_key](mt_tensor)
@@ -280,15 +280,21 @@ class Ling3CheckpointConversionTest(unittest.TestCase):
     np.testing.assert_array_equal(mt_tensor, restored)
 
   def test_reshape_depthwise_conv_transposes_kernel(self):
-    """Conv hook is a (2, 1, 0) transpose: both flax nnx.Conv and HF Conv1d are cross-correlation."""
+    """Conv hook flips kernel axis + transposes between MT [K, C] and HF [C, 1, K].
+
+    MaxText `ShortConvolution` uses convolution convention (kernel[k] is the
+    coefficient at lag k); HF/PyTorch `nn.Conv1d` uses cross-correlation
+    convention (weight[k] is the coefficient at lag K-1-k). Hence the flip.
+    """
     mt_key = "params-decoder-moe_layers_0-attention-q_conv-kernel"
     K, C = 4, 8
-    mt_tensor = np.arange(K * 1 * C, dtype=np.float32).reshape(K, 1, C)
+    mt_tensor = np.arange(K * C, dtype=np.float32).reshape(K, C)
     hf_tensor = self.hooks_to_hf[mt_key](mt_tensor)
-    # hf_tensor[c, 0, k] should equal mt_tensor[k, 0, c] (plain transpose, no flip)
+    self.assertEqual(tuple(hf_tensor.shape), (C, 1, K))
+    # hf_tensor[c, 0, k] should equal mt_tensor[K-1-k, c] (flipped along K)
     for k in range(K):
       for c in range(C):
-        self.assertEqual(hf_tensor[c, 0, k], mt_tensor[k, 0, c])
+        self.assertEqual(hf_tensor[c, 0, k], mt_tensor[K - 1 - k, c])
 
   def test_reshape_kernel_roundtrip_from_shape_map(self):
     """reshape_kernel MT->HF->MT roundtrip, using HF_SHAPE as source of truth."""
@@ -566,8 +572,8 @@ class Ling3ProcessMaxtextParamEndToEndTest(unittest.TestCase):
         ("params-decoder-decoder_norm-scale", (hidden,)),
         # KDA Q projection (2D kernel, MT=(hidden, H*K))
         ("params-decoder-moe_layers_0-attention-q_proj-kernel", (hidden, kda_proj)),
-        # KDA depthwise conv (nnx.Conv MT [K_conv, 1, H*K] ↔ HF [H*K, 1, K_conv]).
-        ("params-decoder-moe_layers_0-attention-q_conv-kernel", (k_conv, 1, kda_proj)),
+        # KDA depthwise conv (ShortConvolution MT [K_conv, H*K] ↔ HF [H*K, 1, K_conv]).
+        ("params-decoder-moe_layers_0-attention-q_conv-kernel", (k_conv, kda_proj)),
         # KDA A_log (1D pass-through)
         ("params-decoder-moe_layers_0-attention-A_log", (num_heads,)),
         # KDA dt_bias (1D pass-through)

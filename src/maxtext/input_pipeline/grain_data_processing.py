@@ -402,6 +402,7 @@ def _mmap_pretrain_pipeline(
             eod_id=eod_id,
             reset_attention_mask=config.reset_attention_mask,
             eod_mask_loss=config.eod_mask_loss,
+            min_segment_length=input_pipeline_utils.megatron_min_segment_length(config),
         )
     )
   else:
@@ -415,6 +416,7 @@ def _mmap_pretrain_pipeline(
             eod_id=eod_id,
             reset_attention_mask=config.reset_attention_mask,
             eod_mask_loss=config.eod_mask_loss,
+            min_segment_length=input_pipeline_utils.megatron_min_segment_length(config),
         )
     )
 

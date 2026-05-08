@@ -91,7 +91,16 @@ class Ling3LayerConstructionTest(unittest.TestCase):
 
   @classmethod
   def setUpClass(cls):
-    cls.cfg = initialize_pydantic(["", _BASE_CONFIG_PATH, "model_name=ling3-tiny", "scan_layers=False"])
+    cls.cfg = initialize_pydantic(
+        [
+            "",
+            _BASE_CONFIG_PATH,
+            "model_name=ling3-tiny",
+            "scan_layers=False",
+            "ici_fsdp_parallelism=1",
+            "ici_data_parallelism=1",
+        ]
+    )
 
   def test_ling3_kda_position_constructs(self):
     """KDA-position layer (layer_idx=0) constructs KimiDeltaAttention."""
@@ -101,7 +110,7 @@ class Ling3LayerConstructionTest(unittest.TestCase):
     from maxtext.utils import maxtext_utils  # pylint: disable=import-outside-toplevel
     from maxtext.models import ling3  # pylint: disable=import-outside-toplevel
 
-    devices_array = maxtext_utils.create_device_mesh(self.cfg)
+    devices_array = maxtext_utils.create_device_mesh(self.cfg, devices=jax.devices()[:1])
     mesh = jax.sharding.Mesh(devices_array, self.cfg.mesh_axes)
 
     # layer_idx=0 with cycle interval 4 → KDA position (only idx % 4 == 3 is MLA)
@@ -122,7 +131,7 @@ class Ling3LayerConstructionTest(unittest.TestCase):
     from maxtext.utils import maxtext_utils  # pylint: disable=import-outside-toplevel
     from maxtext.models import ling3  # pylint: disable=import-outside-toplevel
 
-    devices_array = maxtext_utils.create_device_mesh(self.cfg)
+    devices_array = maxtext_utils.create_device_mesh(self.cfg, devices=jax.devices()[:1])
     mesh = jax.sharding.Mesh(devices_array, self.cfg.mesh_axes)
 
     # layer_idx=3 with cycle interval 4 → MLA position ((3+1) % 4 == 0)
@@ -134,6 +143,94 @@ class Ling3LayerConstructionTest(unittest.TestCase):
         rngs=nnx.Rngs(jax.random.PRNGKey(0)),
     )
     self.assertIsInstance(layer.attention, attention_mla.MLA)
+
+  def test_kda_branch_receives_segment_ids(self):
+    """KDA branch should receive decoder_segment_ids (not drop it).
+
+    This test verifies RFC §3.5: ling3.py KDA branch forwards decoder_segment_ids
+    to self.attention(), rather than dropping it (pre-RFC behavior).
+    """
+    from unittest import mock  # pylint: disable=import-outside-toplevel
+    from flax import nnx  # pylint: disable=import-outside-toplevel
+    import jax  # pylint: disable=import-outside-toplevel
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from maxtext.utils import maxtext_utils  # pylint: disable=import-outside-toplevel
+    from maxtext.models import ling3  # pylint: disable=import-outside-toplevel
+
+    devices_array = maxtext_utils.create_device_mesh(self.cfg, devices=jax.devices()[:1])
+    mesh = jax.sharding.Mesh(devices_array, self.cfg.mesh_axes)
+
+    layer = ling3.Ling3MoEDecoderLayer(
+        config=self.cfg,
+        mesh=mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        layer_idx=0,  # KDA position
+        rngs=nnx.Rngs(jax.random.PRNGKey(0)),
+    )
+
+    # Patch the class-level __call__ to intercept self.attention(...).
+    # Python dispatches obj() via type(obj).__call__(obj), so patching
+    # instance.__call__ never intercepts nnx module calls.
+    with mock.patch.object(type(layer.attention), "__call__") as mock_attn:
+      mock_attn.return_value = (jnp.zeros((1, 64, 1536)), None)
+
+      hidden = jax.random.normal(jax.random.PRNGKey(0), (1, 64, 1536))
+      positions = jnp.arange(64)[None, :]
+      seg_ids = jnp.array([[1, 1, 1, 2, 2, 2, 3, 3] + [0] * (64 - 8)], dtype=jnp.int32)
+
+      layer(
+          hidden,
+          seg_ids,
+          positions,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+
+      # Verify attention was called with decoder_segment_ids
+      mock_attn.assert_called_once()
+      _, kwargs = mock_attn.call_args
+      self.assertIn("decoder_segment_ids", kwargs)
+      self.assertIsNotNone(kwargs["decoder_segment_ids"])
+
+  def test_ling3_full_layer_with_segment_ids(self):
+    """Full Ling3 layer end-to-end with segment_ids produces valid output.
+
+    Validates that the entire Ling3MoEDecoderLayer runs without error when
+    decoder_segment_ids is provided, and produces non-NaN output.
+    """
+    from flax import nnx  # pylint: disable=import-outside-toplevel
+    import jax  # pylint: disable=import-outside-toplevel
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from maxtext.utils import maxtext_utils  # pylint: disable=import-outside-toplevel
+    from maxtext.models import ling3  # pylint: disable=import-outside-toplevel
+
+    devices_array = maxtext_utils.create_device_mesh(self.cfg, devices=jax.devices()[:1])
+    mesh = jax.sharding.Mesh(devices_array, self.cfg.mesh_axes)
+
+    layer = ling3.Ling3MoEDecoderLayer(
+        config=self.cfg,
+        mesh=mesh,
+        model_mode=MODEL_MODE_TRAIN,
+        layer_idx=0,
+        rngs=nnx.Rngs(jax.random.PRNGKey(0)),
+    )
+
+    B, T = 1, 64
+    hidden = jax.random.normal(jax.random.PRNGKey(0), (B, T, self.cfg.emb_dim))
+    positions = jnp.arange(T)[None, :]
+    seg_ids = jnp.array([[1, 1, 1, 2, 2, 2, 3, 3] + [0] * (T - 8)], dtype=jnp.int32)
+
+    with mesh:
+      output, _ = layer(
+          hidden,
+          seg_ids,
+          positions,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+
+    self.assertEqual(output.shape, (B, T, self.cfg.emb_dim))
+    self.assertTrue(jnp.isfinite(output).all(), "Output contains NaN or Inf")
 
 
 class Ling3ScannableBlockTest(unittest.TestCase):

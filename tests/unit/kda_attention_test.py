@@ -209,12 +209,73 @@ class TestKimiDeltaAttention:
       o2, _ = attn(x)
     assert jnp.allclose(o1, o2, atol=1e-5)
 
-  def test_packed_sequences_not_supported(self, mesh):
+  def test_packed_sequences_supported(self, mesh):
+    """Test that KDA supports packed sequences with segment_ids."""
+    attn = self._make_attn(mesh)
+    B, T, hidden_dim = 2, 64, 128
+    x = jax.random.normal(jax.random.PRNGKey(0), (B, T, hidden_dim))
+    # 1-based segment_ids, 0 = padding
+    seg_ids = jnp.array(
+        [[1, 1, 1, 2, 2, 2, 3, 3] + [0] * (T - 8), [1, 1, 2, 2, 2, 2, 3, 3] + [0] * (T - 8)], dtype=jnp.int32
+    )
+    with mesh:
+      o, _ = attn(x, decoder_segment_ids=seg_ids)
+    # Output shape should match input
+    assert o.shape == (B, T, hidden_dim)
+    # No NaN or Inf
+    assert jnp.isfinite(o).all()
+
+  def test_segment_ids_padding_alignment(self, mesh):
+    """When T % 64 != 0, segment_ids should be padded along with hidden_states."""
+    attn = self._make_attn(mesh)
+    B, T, hidden_dim = 1, 100, 128  # 100 not divisible by chunk_size=64
+    x = jax.random.normal(jax.random.PRNGKey(0), (B, T, hidden_dim))
+    # segment_ids shorter than padded length (100 -> 128 after pad)
+    seg_ids = jnp.array([[1, 1, 1, 2, 2, 2, 3, 3] + [0] * (T - 8)], dtype=jnp.int32)
+    with mesh:
+      o, _ = attn(x, decoder_segment_ids=seg_ids)
+    # Output shape should match input (unpadded back from 128 to 100)
+    assert o.shape == (B, T, hidden_dim)
+    # First 8 positions should have segment info, rest may be affected by padding
+    # but output should still be finite
+    assert jnp.isfinite(o).all()
+
+  def test_segment_ids_none_fallback(self, mesh):
+    """Test that segment_ids=None falls back to legacy behavior."""
     attn = self._make_attn(mesh)
     x = jax.random.normal(jax.random.PRNGKey(0), (1, 64, 128))
-    seg_ids = jnp.ones((1, 64), dtype=jnp.int32)
-    with pytest.raises(NotImplementedError, match="packed sequences"):
-      attn(x, decoder_segment_ids=seg_ids)
+    with mesh:
+      o1, _ = attn(x, decoder_segment_ids=None)
+      o2, _ = attn(x)  # Default None
+    assert jnp.allclose(o1, o2, atol=1e-5)
+
+  @pytest.mark.skipif(not TOPS_AVAILABLE, reason="tops not available")
+  def test_row_independence_under_vmap(self, mesh):
+    """硬验证：row0和row1使用不同输入，只改row1的seg，断言row0输出不变。
+
+    构造 batch=[row_a, row_b]，只改 row_b 的 segment_ids，
+    断言 row_a 的输出 bit-exact 不变。证明 vmap 提供的结构性隔离生效。
+    """
+    attn = self._make_attn(mesh)
+    T, hidden_dim = 64, 128
+
+    # 关键：两行使用不同的输入（防止XLA缓存优化）
+    x0 = jax.random.normal(jax.random.PRNGKey(0), (1, T, hidden_dim))
+    x1 = jax.random.normal(jax.random.PRNGKey(1), (1, T, hidden_dim))
+    x = jnp.concatenate([x0, x1], axis=0)  # [2, T, hidden_dim]
+
+    # row0: 固定segment; row1: 变化segment（保留padding部分0相同）
+    seg_base = jnp.array([[1] * T, [1, 1, 2, 2, 2, 3, 3, 3] + [0] * (T - 8)], dtype=jnp.int32)
+    seg_modified = jnp.array([[1] * T, [1, 1, 2, 2, 2, 4, 4, 4] + [0] * (T - 8)], dtype=jnp.int32)
+
+    with mesh:
+      o1, _ = attn(x, decoder_segment_ids=seg_base)
+      o2, _ = attn(x, decoder_segment_ids=seg_modified)
+
+    # 硬验证：row0的输出bit-exact不变（atol=0表示严格相等）
+    assert jnp.allclose(o1[0], o2[0], atol=0.0), (
+        "Row 0 changed when only row 1's segment changed; " "this indicates vmap structural isolation violation"
+    )
 
   def test_autoregressive_not_supported(self, mesh):
     attn = self._make_attn(mesh)
@@ -247,6 +308,27 @@ class TestChunkKda:
     o, _ = chunk_kda(q, k, v, g, beta, scale=K**-0.5, chunk_size=64)
     assert o.shape == (B, T, H, V)
     assert not jnp.any(jnp.isnan(o))
+
+  @pytest.mark.skipif(not TOPS_AVAILABLE, reason="tops not available")
+  def test_output_final_state(self):
+    """Test output_final_state=True returns valid final state [B, H, K, V]."""
+    B, T, H, K, V = 1, 64, 4, 32, 32
+    key = jax.random.PRNGKey(42)
+    keys = jax.random.split(key, 5)
+    q = jax.nn.silu(jax.random.normal(keys[0], (B, T, H, K), dtype=jnp.float32))
+    k = jax.nn.silu(jax.random.normal(keys[1], (B, T, H, K), dtype=jnp.float32))
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
+    v = jax.random.normal(keys[2], (B, T, H, V), dtype=jnp.float32)
+    g = jax.nn.log_sigmoid(jax.random.normal(keys[3], (B, T, H, K))) * 0.3
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (B, T, H)))
+
+    o, final_state = chunk_kda(q, k, v, g, beta, scale=K**-0.5, chunk_size=64, output_final_state=True)
+    assert o.shape == (B, T, H, V)
+    assert final_state is not None
+    assert final_state.shape == (B, H, K, V)
+    assert not jnp.any(jnp.isnan(final_state))
+    assert not jnp.any(jnp.isinf(final_state))
 
   @pytest.mark.skipif(not TOPS_AVAILABLE, reason="tops not available")
   def test_chunk_vs_recurrent(self):

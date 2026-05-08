@@ -225,6 +225,7 @@ def _build_pipeline(config, source, global_mesh, process_indices, files_str=""):
           reset_attention_mask=config.reset_attention_mask,
           eod_mask_loss=config.eod_mask_loss,
           no_attnmask_dataset_ids=no_attnmask_ids if no_attnmask_ids else None,
+          min_segment_length=input_pipeline_utils.megatron_min_segment_length(config),
       )
   )
 

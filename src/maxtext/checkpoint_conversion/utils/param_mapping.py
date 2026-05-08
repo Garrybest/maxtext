@@ -2843,16 +2843,22 @@ def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
     return input_tensor.T
 
   def reshape_depthwise_conv(input_tensor, target_shape=None):
-    """Depthwise Conv1d weight reshape between MaxText `nnx.Conv` and HF.
+    """Depthwise Conv1d weight reshape with kernel flip.
 
-    Both flax `nnx.Conv` and HF/PyTorch `nn.Conv1d` use cross-correlation, so no
-    kernel-axis flip is needed — only an axis transpose:
-      MaxText `kernel` shape: [kernel_size, 1, features]
-      HF `weight`    shape:   [features, 1, kernel_size]
-    The transpose is its own inverse, so the same op handles both directions.
+    MaxText `ShortConvolution.kernel` is `[kernel_size, features]` using
+    convolution convention (kernel[k] = coefficient for lag k).
+    HF/PyTorch `nn.Conv1d(groups=channels)` weight is `[channels, 1, kernel_size]`
+    using cross-correlation convention (weight[k] = coefficient for lag K-1-k).
+    We must flip the kernel axis to convert between conventions.
     """
     del target_shape
-    return np.transpose(input_tensor, (2, 1, 0))
+    if saving_to_hf:
+      # [kernel_size, features] → flip kernel → transpose → [features, 1, kernel_size]
+      flipped = input_tensor[::-1, :]
+      return np.expand_dims(np.transpose(flipped, (1, 0)), axis=1)
+    # [channels, 1, kernel_size] → squeeze → transpose → flip kernel → [kernel_size, features]
+    transposed = np.transpose(np.squeeze(input_tensor, axis=1), (1, 0))
+    return transposed[::-1, :]
 
   num_layers = int(config["num_hidden_layers"])
   first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))

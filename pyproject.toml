@@ -29,7 +29,7 @@ dependencies = [
     # TODO: JAX is upgraded from the pallas-kernel repo, and then several 
     # packages have version mismatch. We need a clear way to handle it.
     "torch>=2.5.0",
-    "tops[tpu] @ git+https://github.com/primatrix/pallas-kernel.git@release/v0.5.1",
+    "tops[tpu] @ git+https://github.com/primatrix/pallas-kernel.git@v0.5.1-rc1",
     "tokamax @ git+https://github.com/primatrix/tokamax.git@main",
 ]
 

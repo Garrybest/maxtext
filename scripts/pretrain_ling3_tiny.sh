@@ -70,7 +70,7 @@ MMAP_SPLIT_SENTENCES="true"  # Data was generated with --split-sentences
 MMAP_NPY_SPLIT=${MMAP_NPY_SPLIT:-"999,1,0"}  # Megatron-style split: 99.9% train, 0.1% eval, 0% test
 # MTP Plan C: Allow cross-document attention with packing for efficiency
 PACKING="true"  # Enable sequence packing for better GPU/TPU utilization
-RESET_ATTENTION_MASK="false"  # Allow cross-document attention (Megatron default mode)
+RESET_ATTENTION_MASK="true"  # Reset attention at document boundaries (enables KDA varlen mode)
 EOD_MASK_LOSS="true"  # Exclude EOD tokens from loss (matching Megatron --eod-mask-loss)
 
 # ============================================================================
@@ -279,7 +279,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     peak_tflops_per_device=$PEAK_TFLOPS_PER_DEVICE \
     save_config_to_gcs=false \
     jax_cache_dir=$JAX_CACHE_DIR \
-    load_parameters_path=/models/pretrain/ling3/maxtext_ckpt/ling3-tiny-conv/0/items/ \
+    load_parameters_path=/models/pretrain/ling3/maxtext_ckpt/ling3-tiny/0/items/ \
     log_period=10 \
     \
     `# --- Vertex AI TensorBoard (optional, controlled by ENV) ---` \

@@ -894,6 +894,57 @@ class ComputeQwen3OmniPositions(grain.MapTransform):
     return element
 
 
+def megatron_min_segment_length(config) -> int:
+  """Return Megatron's short-segment merge threshold for *config*.
+
+  Megatron's ``_build_packed_seq_params`` uses ``seq_len // 25`` and only
+  applies it when the attention mask is reset per document.
+  """
+  return (config.max_target_length // 25) if config.reset_attention_mask else 0
+
+
+def _merge_short_segments_np(
+    segmentation: np.ndarray,
+    position: np.ndarray,
+    min_seg_len: int,
+) -> None:
+  """Merge segments shorter than *min_seg_len* (greedy forward scan, in-place).
+
+  Matches Megatron ``_build_packed_seq_params``: a boundary is kept only when
+  the distance from the last kept boundary is ``>= min_seg_len``.  When a
+  boundary is dropped, the short segment is absorbed into the preceding one --
+  its tokens continue the previous segment's ID and position counter.
+
+  Args:
+    segmentation: ``[seq_len]`` segment IDs (1-indexed).
+    position:     ``[seq_len]`` per-document position IDs.
+    min_seg_len:  Minimum token count for a segment to survive as independent.
+  """
+  seq_len = len(segmentation)
+  if min_seg_len <= 1 or seq_len == 0:
+    return
+
+  boundaries = np.flatnonzero(np.diff(segmentation)) + 1
+  seg_starts = [0, *boundaries.tolist()]
+
+  if len(seg_starts) <= 1:
+    return
+
+  kept = [0]
+  for start in seg_starts[1:]:
+    if start - kept[-1] > min_seg_len:
+      kept.append(start)
+
+  if len(kept) == len(seg_starts):
+    return
+
+  kept.append(seq_len)
+  for seg_idx in range(len(kept) - 1):
+    s, e = kept[seg_idx], kept[seg_idx + 1]
+    segmentation[s:e] = seg_idx + 1
+    position[s:e] = np.arange(e - s, dtype=position.dtype)
+
+
 @dataclasses.dataclass
 class GenerateDocSegmentIds(grain.MapTransform):
   """Generate segmentation and position arrays from EOD tokens within samples.
@@ -935,10 +986,13 @@ class GenerateDocSegmentIds(grain.MapTransform):
       Only applies when reset_attention_mask=False.
   """
 
-  def __init__(self, eod_id: int, reset_attention_mask: bool = True, eod_mask_loss: bool = False):
+  def __init__(
+      self, eod_id: int, reset_attention_mask: bool = True, eod_mask_loss: bool = False, min_segment_length: int = 0
+  ):
     self.eod_id = eod_id
     self.reset_attention_mask = reset_attention_mask
     self.eod_mask_loss = eod_mask_loss
+    self.min_segment_length = min_segment_length
 
   def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Apply EOD-based segmentation and loss masking to each column."""
@@ -966,6 +1020,8 @@ class GenerateDocSegmentIds(grain.MapTransform):
             segmentation[i] = seg_id
             position[i] = pos_in_doc
             pos_in_doc += 1
+        if self.min_segment_length > 0:
+          _merge_short_segments_np(segmentation, position, self.min_segment_length)
       else:
         if self.eod_mask_loss:
           segmentation = np.where(is_eod, np.int32(0), np.int32(1))
@@ -1019,12 +1075,14 @@ class MegatronSplitInputsTargets(grain.MapTransform):
       reset_attention_mask: bool = True,
       eod_mask_loss: bool = False,
       no_attnmask_dataset_ids: set[int] | None = None,
+      min_segment_length: int = 0,
   ):
     self.eod_id = eod_id
     self.reset_attention_mask = reset_attention_mask
     self.eod_mask_loss = eod_mask_loss
     self.no_attnmask_dataset_ids = no_attnmask_dataset_ids or set()
     self._has_no_attnmask = bool(self.no_attnmask_dataset_ids)
+    self.min_segment_length = min_segment_length
 
   def map(self, element: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Split tokens into input/target pairs with EOD-based segmentation."""
@@ -1061,6 +1119,8 @@ class MegatronSplitInputsTargets(grain.MapTransform):
           input_segmentation[i] = seg_id
           position[i] = pos_in_doc
           pos_in_doc += 1
+      if self.min_segment_length > 0:
+        _merge_short_segments_np(input_segmentation, position, self.min_segment_length)
     else:
       input_segmentation = np.ones(seq_len, dtype=np.int32)
       position = np.arange(seq_len, dtype=np.int32)

@@ -275,14 +275,14 @@ class Ling3GenericLayer(nnx.Module):
           attention_metadata=attention_metadata,
       )
     else:
-      # KDA path — same call shape as Ling2's GLA branch.
-      # KDA does not support packed sequences; drop decoder_segment_ids.
+      # KDA path — forward decoder_segment_ids for varlen support.
       attention_output, _ = self.attention(
           hidden_states,
           decoder_positions,
           deterministic,
           model_mode,
           layer_idx=global_layer_idx,
+          decoder_segment_ids=decoder_segment_ids,
       )
       kv_cache = None
 
@@ -437,10 +437,10 @@ class Ling3ScannableBlock(nnx.Module):
     for layer_id in range(cfg.inhomogeneous_layer_cycle_interval):
       y = getattr(self, f"layers_{layer_id}")(
           y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
+          decoder_segment_ids=decoder_segment_ids,
+          decoder_positions=decoder_positions,
+          deterministic=deterministic,
+          model_mode=model_mode,
           previous_chunk=previous_chunk,
           page_state=page_state,
           slot=slot,
