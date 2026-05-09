@@ -117,10 +117,21 @@ GRADIENT_CLIPPING_THRESHOLD=1.0
 LEARNING_RATE=0.000339
 MIN_LEARNING_RATE=0.000339  # Constant LR: min_lr = lr
 WARMUP_ITERS=${WARMUP_ITERS:-250}
-WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${STEPS})")
+# LEARNING_RATE_SCHEDULE_STEPS defaults to STEPS (so warmup_fraction = warmup/STEPS) but
+# can be overridden — Megatron-reference loss-validation runs set this to the
+# reference's --train-iters so the LR curve matches the reference exactly.
+# For short CI runs where STEPS < WARMUP_ITERS (e.g. profiling with STEPS=10),
+# the default would produce warmup_fraction > 1 which Pydantic rejects;
+# auto-scale LEARNING_RATE_SCHEDULE_STEPS to keep fraction valid (LR shape
+# is irrelevant when STEPS never reaches the warmup tail anyway).
+if [ -z "$LEARNING_RATE_SCHEDULE_STEPS" ] && [ "$STEPS" -le "$WARMUP_ITERS" ]; then
+  LEARNING_RATE_SCHEDULE_STEPS=$((WARMUP_ITERS * 4))
+  echo "   [auto-scale] STEPS=$STEPS <= WARMUP_ITERS=$WARMUP_ITERS, raising LEARNING_RATE_SCHEDULE_STEPS to $LEARNING_RATE_SCHEDULE_STEPS to keep warmup_steps_fraction in [0, 1]"
+fi
+LEARNING_RATE_SCHEDULE_STEPS=${LEARNING_RATE_SCHEDULE_STEPS:-$STEPS}
+WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${LEARNING_RATE_SCHEDULE_STEPS})")
 # Constant learning rate schedule (matching Megatron --lr-decay-style constant)
 LEARNING_RATE_FINAL_FRACTION=1.0  # Keep at 1.0 for constant LR
-LEARNING_RATE_SCHEDULE_STEPS=$STEPS
 DATA_SHUFFLE_SEED=42
 INIT_WEIGHTS_SEED=42
 REMAT_POLICY=${REMAT_POLICY:-"save_out_proj"}
@@ -134,6 +145,7 @@ SCAN_LAYERS="false"
 PEAK_TFLOPS_PER_DEVICE=${PEAK_TFLOPS_PER_DEVICE:-0.0}
 
 CHECKPOINT_PERIOD=${CHECKPOINT_PERIOD:-100}
+ENABLE_CHECKPOINTING=${ENABLE_CHECKPOINTING:-false}
 
 # ============================================================================
 # 5b. Vertex AI TensorBoard (optional, off by default)
@@ -247,8 +259,8 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     `# --- Performance Optimization ---` \
     remat_policy=$REMAT_POLICY \
     `# --- System Config ---` \
-    enable_checkpointing=false \
-    save_checkpoint_on_completion=false \
+    enable_checkpointing=$ENABLE_CHECKPOINTING \
+    save_checkpoint_on_completion=$ENABLE_CHECKPOINTING \
     enable_emergency_checkpoint=false \
     enable_multi_tier_checkpointing=false \
     checkpoint_period=$CHECKPOINT_PERIOD \

@@ -40,7 +40,6 @@ spec:
         completionMode: Indexed
         completions: 1
         parallelism: 1
-        activeDeadlineSeconds: 86400
         template:
           metadata:
             annotations:
@@ -78,7 +77,7 @@ spec:
                 pip uninstall optax -y 2>/dev/null || true
                 pip install git+https://github.com/google-deepmind/optax
 
-                # 4. Log persistence — sync to GCS Fuse every 5min + on exit
+                # 4. Log persistence — only on Pod 0 (sync to GCS Fuse on exit)
                 if [ "${JOB_COMPLETION_INDEX}" = "0" ]; then
                   source scripts/job_log_sync.sh "/models/pretrain/ling3/${RUN_NAME}"
                 fi
@@ -94,46 +93,26 @@ spec:
               env:
               # --- Training overrides (picked up by pretrain_ling3_tiny.sh) ---
               - name: STEPS
-                value: "${STEPS}"
+                value: "1000"
               - name: EVAL_INTERVAL
-                value: "${EVAL_INTERVAL}"
+                value: "2000"
               - name: GCS_BUCKET
                 value: "gs://data_ant/pretrain/ling3"
               - name: RUN_NAME
                 value: "${JOB_NAME}"
-              # --- Optimizer (Muon with AdamW fallback) ---
-              - name: OPT_TYPE
-                value: "${OPT_TYPE}"
               # --- Parallelism (single pod, 8 devices) ---
               - name: ICI_EXPERT_PARALLELISM
-                value: "${ICI_EXPERT_PARALLELISM}"
+                value: "1"
               - name: ICI_DATA_PARALLELISM
-                value: "${ICI_DATA_PARALLELISM}"
+                value: "1"
               - name: ICI_FSDP_PARALLELISM
-                value: "${ICI_FSDP_PARALLELISM}"
+                value: "8"
               - name: ICI_TENSOR_PARALLELISM
-                value: "${ICI_TENSOR_PARALLELISM}"
+                value: "1"
               - name: ICI_CONTEXT_PARALLELISM
-                value: "${ICI_CONTEXT_PARALLELISM}"
+                value: "1"
               - name: SHARD_EXP_ON_FSDP
-                value: "${SHARD_EXP_ON_FSDP}"
-              # --- Performance tuning ---
-              - name: PER_DEVICE_BATCH_SIZE
-                value: "${PER_DEVICE_BATCH_SIZE}"
-              - name: GRADIENT_ACCUMULATION_STEPS
-                value: "${GRADIENT_ACCUMULATION_STEPS}"
-              - name: REMAT_POLICY
-                value: "${REMAT_POLICY}"
-              # --- Profiler (optional) ---
-              - name: PROFILER
-                value: "${PROFILER}"
-              - name: SKIP_FIRST_N_STEPS_FOR_PROFILER
-                value: "${SKIP_FIRST_N_STEPS_FOR_PROFILER}"
-              - name: PROFILER_STEPS
-                value: "${PROFILER_STEPS}"
-              # --- Extra XLA flags (optional, appended to defaults) ---
-              - name: LIBTPU_INIT_ARGS
-                value: "${LIBTPU_INIT_ARGS}"
+                value: "false"
               # --- Vertex AI TensorBoard ---
               - name: USE_VERTEX_TENSORBOARD
                 value: "false"
