@@ -40,6 +40,7 @@ class CustomMeshAndRuleTest(unittest.TestCase):
             get_test_config_path(),
             "compile_topology=v4-8",
             "compile_topology_num_slices=1",
+            "ici_fsdp_parallelism=-1",
             "base_emb_dim=256",
             "base_mlp_dim=256",
             "base_num_decoder_layers=1",

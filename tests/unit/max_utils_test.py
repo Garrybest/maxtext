@@ -148,6 +148,7 @@ class UnscanTest(unittest.TestCase):
         "enable_checkpointing": False,
         "dataset_type": "synthetic",
         "model_name": "llama3.1-8b",
+        "ici_fsdp_parallelism": -1,
     } | kwargs
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],

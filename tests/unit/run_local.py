@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Lightweight local test runner for optimizer/fork tests on macOS.
 
-Usage: PYTHONCASEOK=1 python tests/unit/run_local_tests.py [test_pattern]
+Usage: PYTHONCASEOK=1 python tests/unit/run_local.py [test_pattern]
 
 Stubs heavy dependencies (tensorflow, pathwaysutils) that are unavailable
 on macOS dev machines, then runs the specified test(s).
+
+Do NOT rename this file to match pytest's `python_files` glob (e.g.
+`*_test.py` or `*_tests.py`). If pytest collects this as a test module,
+its module-body side effects (`os.environ.setdefault("DECOUPLE_GCLOUD",
+"TRUE")`, `sys.modules` stubs) leak into the whole pytest session and
+silently break real tests — notably `custom_mesh_and_rule_test.py`, which
+then picks up `decoupled_base_test.yml` with a hardcoded
+`ici_fsdp_parallelism: 1`.
 """
 import sys
 import types

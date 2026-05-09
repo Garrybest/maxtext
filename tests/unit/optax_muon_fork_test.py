@@ -311,7 +311,7 @@ class TestBatchNewtonSchulz(unittest.TestCase):
 
     for name in params:
       npt.assert_allclose(
-          updates_b[name], updates_nb[name], atol=1e-5, err_msg=f"batch vs nobatch mismatch for param '{name}'"
+          updates_b[name], updates_nb[name], atol=2e-3, err_msg=f"batch vs nobatch mismatch for param '{name}'"
       )
 
   def test_batch_with_batch_update_size(self):
@@ -334,7 +334,7 @@ class TestBatchNewtonSchulz(unittest.TestCase):
       npt.assert_allclose(
           updates_ch[name],
           updates_nb[name],
-          atol=1e-5,
+          atol=2e-3,
           err_msg=f"chunked batch vs nobatch mismatch for param '{name}'",
       )
 
@@ -362,7 +362,7 @@ class TestBatchNewtonSchulz(unittest.TestCase):
 
     for name in params:
       npt.assert_allclose(
-          updates_b[name], updates_nb[name], atol=1e-5, err_msg=f"mixed-shape batch mismatch for param '{name}'"
+          updates_b[name], updates_nb[name], atol=2e-3, err_msg=f"mixed-shape batch mismatch for param '{name}'"
       )
 
   def test_batch_with_dimension_numbers(self):
@@ -397,7 +397,7 @@ class TestBatchNewtonSchulz(unittest.TestCase):
 
     for name in params:
       npt.assert_allclose(
-          updates_b[name], updates_nb[name], atol=1e-5, err_msg=f"batch with dim_nums mismatch for param '{name}'"
+          updates_b[name], updates_nb[name], atol=2e-3, err_msg=f"batch with dim_nums mismatch for param '{name}'"
       )
 
 

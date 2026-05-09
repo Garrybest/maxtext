@@ -42,8 +42,8 @@ _DEEPSEEK2_ATTENTION = {
     "self_attention": {
         "kv_norm": {"scale": None},
         "wkv_a": {"kernel": mdn((0,), (-1,))},
-        "wkv_b": {"kernel": mdn((0,), (-1,))},
-        "out": {"kernel": mdn((-2,), (-1,))},
+        "wkv_b": {"kernel": mdn((0,), (-1,), component_splits=(128, 128))},
+        "out": {"kernel": mdn((0, -2), (-1,))},
         "query": {"kernel": mdn((0,), (-1,))},  # ds2
     },
     "post_self_attention_layer_norm": {"scale": None},
@@ -90,11 +90,11 @@ _DEEPSEEK3_ATTENTION = {
     "self_attention": {
         "kv_norm": {"scale": None},
         "wkv_a": {"kernel": mdn((0,), (-1,))},
-        "wkv_b": {"kernel": mdn((0,), (-1,))},
-        "out": {"kernel": mdn((-2,), (-1,))},
+        "wkv_b": {"kernel": mdn((0,), (-1,), component_splits=(128, 128))},
+        "out": {"kernel": mdn((0, -2), (-1,))},
         "q_norm": {"scale": None},  # ds3
         "wq_a": {"kernel": mdn((0,), (-1,))},  # ds3
-        "wq_b": {"kernel": mdn((0,), (-1,))},  # ds3
+        "wq_b": {"kernel": mdn((0,), (-1,), component_splits=(128, 64))},  # ds3
     },
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -147,7 +147,7 @@ _GEMMA3_LAYER = {
         "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
         "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
         "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
-        "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
+        "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
         "key_norm": {"scale": None},
         "query_norm": {"scale": None},
     },
@@ -182,7 +182,7 @@ LLAMA2_DIMENSION_NUMBER = {
                     "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                     "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                     "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
-                    "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
+                    "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
                 },
                 "post_self_attention_layer_norm": {"scale": None},
                 "pre_self_attention_layer_norm": {"scale": None},
@@ -210,7 +210,7 @@ QWEN3_DIMENSION_NUMBER = {
                     "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                     "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                     "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
-                    "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
+                    "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
                     "key_norm": {"scale": None},
                     "query_norm": {"scale": None},
                 },
@@ -268,7 +268,7 @@ class MuonTransformLogicTest(parameterized.TestCase):
       (
           "kda_o_proj",
           ("params", "decoder", "moe_layers", "layers_0", "attention", "o_proj", "kernel"),
-          mdn((-2,), (-1,)),
+          mdn((0, -2), (-1,)),
       ),
       (
           "kda_short_conv_kernel",
@@ -311,7 +311,7 @@ class MuonSplitHeadFanTest(parameterized.TestCase):
       ("query_4096x32x128", (4096, 32, 128), "query", 4096, 128),
       ("key_4096x8x128", (4096, 8, 128), "key", 4096, 128),
       ("value_4096x8x128", (4096, 8, 128), "value", 4096, 128),
-      ("out_32x128x4096", (32, 128, 4096), "out", 128, 4096),
+      ("out_32x128x4096", (32, 128, 4096), "out", 4096, 4096),
       ("wkv_b_512x8x128", (512, 8, 128), "wkv_b", 512, 128),
       # gate_proj: same split_head semantics as Q/K/V
       ("gate_proj_4096x32x128", (4096, 32, 128), "gate_proj", 4096, 128),
@@ -331,7 +331,7 @@ class MuonSplitHeadFanTest(parameterized.TestCase):
       ("query_4096x32x128", (4096, 32, 128), "query", 4096, 128),
       ("key_4096x8x128", (4096, 8, 128), "key", 4096, 128),
       ("value_4096x8x128", (4096, 8, 128), "value", 4096, 128),
-      ("out_32x128x4096", (32, 128, 4096), "out", 128, 4096),
+      ("out_32x128x4096", (32, 128, 4096), "out", 4096, 4096),
       # 2D standard linear: no batch dim
       ("mlp_wi_4096x11008", (4096, 11008), "wi", 4096, 11008),
   )
@@ -371,8 +371,8 @@ class MuonConsistentRmsScalingTest(parameterized.TestCase):
       # Query (4096, 32, 128): per-head fan_in=4096, fan_out=128
       # scale = sqrt(max(4096, 128)) * 0.2 = sqrt(4096) * 0.2 = 64 * 0.2 = 12.8
       ("query_crms02", (4096, 32, 128), "query", 0.2, math.sqrt(4096) * 0.2),
-      # Out (32, 128, 4096): per-head fan_in=128, fan_out=4096
-      # scale = sqrt(max(128, 4096)) * 0.2 = sqrt(4096) * 0.2 = 12.8
+      # Out (32, 128, 4096): mdn((0,-2),(-1,)) → fan_in=32*128=4096, fan_out=4096
+      # scale = sqrt(max(4096, 4096)) * 0.2 = sqrt(4096) * 0.2 = 12.8
       ("out_crms02", (32, 128, 4096), "out", 0.2, math.sqrt(4096) * 0.2),
       # 2D MLP (4096, 11008): fan_in=4096, fan_out=11008
       # scale = sqrt(max(4096, 11008)) * 0.2 = sqrt(11008) * 0.2
