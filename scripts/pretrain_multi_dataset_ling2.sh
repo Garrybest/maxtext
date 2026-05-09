@@ -257,22 +257,12 @@ echo "   Grad Accum : $GRADIENT_ACCUMULATION_STEPS"
 echo "   LR Schedule: Constant (warmup=${WARMUP_ITERS}, lr=${LEARNING_RATE})"
 echo "========================================================"
 
-LIBTPU_INIT_ARGS_DEFAULT="\
---xla_tpu_enable_async_collective_fusion=true \
---xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_overlap_compute_collective_tc=true \
---xla_enable_async_all_gather=true \
---xla_enable_async_collective_permute=true \
---xla_tpu_enable_all_experimental_scheduler_features=true \
---xla_tpu_scoped_vmem_limit_kib=65536 \
---xla_tpu_dvfs_p_state=7 \
---xla_tpu_enable_async_collective_fusion_fuse_all_gather=false \
---xla_tpu_enable_async_collective_fusion_fuse_reduce_scatter=false \
---xla_tpu_enable_async_collective_fusion_fuse_all_reduce=false \
---xla_tpu_enable_sparse_core_collective_offload_all_gather=true \
---xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=true \
---xla_tpu_enable_sparse_core_collective_offload_all_reduce=true"
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS_DEFAULT} ${LIBTPU_INIT_ARGS:-}"
+# ============================================================================
+# 6. LIBTPU Configuration
+# ============================================================================
+# Load common XLA flags from shared library
+source "$(dirname "${BASH_SOURCE[0]}")/comm/xla_flags_common.sh"
+
 echo "   LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
 
 python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
