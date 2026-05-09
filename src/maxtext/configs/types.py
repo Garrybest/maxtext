@@ -1505,12 +1505,40 @@ class Muon(BaseModel):
 
   muon_beta: float = Field(0.95, description="Decay rate for the exponentially weighted average of grads.")
   muon_weight_decay: float = Field(
-      0,
-      description="Strength of the weight decay regularization. This is multiplied with the learning rate.",
+      0.1,
+      description="Strength of the weight decay regularization. Matches Megatron --weight-decay 0.1.",
   )
   muon_consistent_rms: None | float = Field(
       None,
       description="If None, apply width scaling to updates. If float, apply consistent rms scaling (recommend 0.2).",
+  )
+  muon_weight_decay_norm_params: bool = Field(
+      False,
+      description=(
+          "Whether to apply weight decay to norm parameters (scale) in the Adam partition of Muon. "
+          "False (default) excludes norm params from decay, matching Megatron --no-weight-decay-norm-params."
+      ),
+  )
+  muon_nesterov_style: Literal["ema", "sgd"] = Field(
+      "sgd",
+      description=(
+          "Style of momentum accumulation for Muon. 'ema' uses EMA with bias correction, "
+          "'sgd' uses classic SGD-style momentum matching Megatron-LM."
+      ),
+  )
+  muon_batch_update: bool = Field(
+      False,
+      description=(
+          "Group same-shape Muon weight matrices and run Newton-Schulz on stacked batches for efficiency. "
+          "Numerically identical to unbatched mode. Megatron: --muon-batch-update."
+      ),
+  )
+  muon_batch_update_size: None | int = Field(
+      None,
+      description=(
+          "Max batch size per Newton-Schulz call when muon_batch_update is True. "
+          "If None, all same-shape matrices are stacked into one batch. Megatron: --muon-batch-update-size 16."
+      ),
   )
 
 

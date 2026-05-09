@@ -9,7 +9,7 @@ repos:
         args:
           - '-w'
           - '--skip="*.txt,pylintrc,.*,src/maxtext/assets/*,src/maxtext/input_pipeline/protos/*"'
-          - '-L ND,nd,sems,TE,ROUGE,rouge,astroid,ags,dout'
+          - '-L ND,nd,sems,TE,ROUGE,rouge,astroid,ags,dout,fro'
           - '.'
         additional_dependencies:
           - tomli
@@ -28,7 +28,7 @@ repos:
     hooks:
       - id: pylint
         args:
-          - '--disable=R0401,R0917,W0201,W0613'
+          - '--disable=R0401,R0917,W0201,W0613,W0311'
           - "--ignore-patterns='.pytype,.*pyi$'"
           - '--ignore-paths=src/maxtext/input_pipeline/protos'
           - 'benchmarks'

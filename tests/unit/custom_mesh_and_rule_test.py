@@ -56,7 +56,7 @@ class CustomMeshAndRuleTest(unittest.TestCase):
             get_test_config_path(),
             "compile_topology=v5p-32",
             "compile_topology_num_slices=1",
-            "ici_fsdp_transpose_parallelism=2",
+            "ici_fsdp_parallelism=-1",
             "ici_expert_parallelism=2",
             "model_name=deepseek3-tiny",
             "override_model_config=true",

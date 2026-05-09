@@ -92,14 +92,30 @@ GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
 
 EVAL_INTERVAL=${EVAL_INTERVAL:-1490}
 EVAL_STEPS=1
-OPT_TYPE="adamw"
+OPT_TYPE=${OPT_TYPE:-"muon"}
+# AdamW parameters (also used as AdamW fallback within Muon optimizer)
 ADAM_B1=0.9
 ADAM_B2=0.95
 ADAM_WEIGHT_DECAY=0.1
 MU_DTYPE="float32"  # Megatron uses fp32 master weights; must match to avoid multi-step divergence
+# Muon optimizer parameters (matching Megatron run_v3.sh --optimizer muon)
+# muon_consistent_rms=0.2 maps to Megatron --muon-matched-adamw-rms 0.2
+# muon_split_head / muon_split_linear_fc1 are configurable (auto-detected in muon_utils.py)
+MUON_BETA=${MUON_BETA:-0.95}
+MUON_WEIGHT_DECAY=${MUON_WEIGHT_DECAY:-0.1}
+MUON_CONSISTENT_RMS=${MUON_CONSISTENT_RMS:-0.2}
+# Megatron: --weight-decay-norm-params (applies weight decay to norm parameters in Adam partition)
+MUON_WEIGHT_DECAY_NORM_PARAMS=${MUON_WEIGHT_DECAY_NORM_PARAMS:-true}
+# muon_split_head / muon_split_linear_fc1: auto-detected by muon_utils.py transform_logic;
+# these flags are accepted for Megatron parity but the actual splitting is always on.
+MUON_SPLIT_HEAD=${MUON_SPLIT_HEAD:-true}
+MUON_SPLIT_LINEAR_FC1=${MUON_SPLIT_LINEAR_FC1:-true}
+# Megatron: --muon-batch-update --muon-batch-update-size 16
+MUON_BATCH_UPDATE=${MUON_BATCH_UPDATE:-true}
+MUON_BATCH_UPDATE_SIZE=${MUON_BATCH_UPDATE_SIZE:-16}
 GRADIENT_CLIPPING_THRESHOLD=1.0
-LEARNING_RATE=0.000336
-MIN_LEARNING_RATE=0.000336  # Constant LR: min_lr = lr
+LEARNING_RATE=0.000339
+MIN_LEARNING_RATE=0.000339  # Constant LR: min_lr = lr
 WARMUP_ITERS=${WARMUP_ITERS:-250}
 WARMUP_STEPS_FRACTION=$(python3 -c "print(${WARMUP_ITERS} / ${STEPS})")
 # Constant learning rate schedule (matching Megatron --lr-decay-style constant)
@@ -151,6 +167,7 @@ echo "   Per-Device Batch: $PER_DEVICE_BATCH_SIZE"
 echo "   Grad Accum : $GRADIENT_ACCUMULATION_STEPS"
 echo "   Scan Layers: $SCAN_LAYERS"
 echo "   LR Schedule: Constant (warmup=${WARMUP_ITERS}, lr=${LEARNING_RATE})"
+echo "   Optimizer  : $OPT_TYPE (muon_consistent_rms=$MUON_CONSISTENT_RMS, batch_update=$MUON_BATCH_UPDATE, batch_size=$MUON_BATCH_UPDATE_SIZE)"
 echo "========================================================"
 
 # ============================================================================
@@ -242,12 +259,18 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     data_shuffle_seed=$DATA_SHUFFLE_SEED \
     init_weights_seed=$INIT_WEIGHTS_SEED \
     \
-    `# --- Optimizer (adam) ---` \
+    `# --- Optimizer (muon with AdamW fallback) ---` \
     opt_type=$OPT_TYPE        \
     adam_b1=$ADAM_B1               \
     adam_b2=$ADAM_B2               \
     adam_weight_decay=$ADAM_WEIGHT_DECAY      \
     mu_dtype=$MU_DTYPE                        \
+    muon_beta=$MUON_BETA \
+    muon_weight_decay=$MUON_WEIGHT_DECAY \
+    muon_consistent_rms=$MUON_CONSISTENT_RMS \
+    muon_weight_decay_norm_params=$MUON_WEIGHT_DECAY_NORM_PARAMS \
+    muon_batch_update=$MUON_BATCH_UPDATE \
+    muon_batch_update_size=$MUON_BATCH_UPDATE_SIZE \
     `# --- learning rate ---` \
     gradient_clipping_threshold=$GRADIENT_CLIPPING_THRESHOLD \
     learning_rate=$LEARNING_RATE \

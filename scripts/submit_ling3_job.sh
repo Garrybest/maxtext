@@ -1,0 +1,100 @@
+#!/bin/bash
+# Submit Ling3 Tiny Pretrain job to GKE
+#
+# Usage:
+#   scripts/submit_ling3_job.sh                    # use current branch
+#   scripts/submit_ling3_job.sh feat/my-branch     # specify branch
+#   STEPS=1000 scripts/submit_ling3_job.sh         # override defaults
+#
+# Prerequisites:
+#   - kubectl configured with GKE cluster credentials
+#   - K8s secret 'perf-64chips-token' with a valid GitHub PAT (ghp_...)
+#
+# NOTE on envsubst: The job YAML mixes deploy-time variables (K8s metadata
+# and env value: fields) with runtime variables used in the inline bash
+# script (GITHUB_TOKEN, JOB_COMPLETION_INDEX, LOG_FILE, RUN_NAME).
+# We MUST use an explicit variable whitelist so envsubst only substitutes
+# deploy-time variables and preserves runtime ones.
+
+set -euo pipefail
+
+# ============================================================================
+# 1. Branch & Job Name
+# ============================================================================
+BRANCH="${1:-$(git rev-parse --abbrev-ref HEAD)}"
+JOB_NAME="ling3-$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 30)-$(date +%m%d%H%M)"
+JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+BRANCH_LABEL=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 63 | sed 's/^[^a-zA-Z0-9]//;s/[^a-zA-Z0-9]$//')
+USER="${USER:-$(whoami)}"
+
+# ============================================================================
+# 2. Training Parameters (override via environment)
+# ============================================================================
+export STEPS="${STEPS:-500}"
+export EVAL_INTERVAL="${EVAL_INTERVAL:-250}"
+export OPT_TYPE="${OPT_TYPE:-muon}"
+
+# Parallelism (single pod, 8 devices)
+export ICI_EXPERT_PARALLELISM="${ICI_EXPERT_PARALLELISM:-1}"
+export ICI_DATA_PARALLELISM="${ICI_DATA_PARALLELISM:-1}"
+export ICI_FSDP_PARALLELISM="${ICI_FSDP_PARALLELISM:-8}"
+export ICI_TENSOR_PARALLELISM="${ICI_TENSOR_PARALLELISM:-1}"
+export ICI_CONTEXT_PARALLELISM="${ICI_CONTEXT_PARALLELISM:-1}"
+export SHARD_EXP_ON_FSDP="${SHARD_EXP_ON_FSDP:-false}"
+
+# Performance
+export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export REMAT_POLICY="${REMAT_POLICY:-save_out_proj}"
+
+# Profiler (empty = disabled)
+export PROFILER="${PROFILER:-}"
+export SKIP_FIRST_N_STEPS_FOR_PROFILER="${SKIP_FIRST_N_STEPS_FOR_PROFILER:-}"
+export PROFILER_STEPS="${PROFILER_STEPS:-}"
+
+# Extra XLA flags (empty = use script defaults only)
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-}"
+
+export JOB_NAME BRANCH BRANCH_LABEL USER
+
+# ============================================================================
+# 3. Submit
+# ============================================================================
+TEMPLATE=".github/ci/tpu-4chips-ling3-job.yaml"
+if [ ! -f "$TEMPLATE" ]; then
+  echo "ERROR: Template not found: $TEMPLATE" >&2
+  echo "Run this script from the repo root." >&2
+  exit 1
+fi
+
+# Explicit whitelist: only substitute deploy-time variables.
+# Runtime variables (GITHUB_TOKEN, JOB_COMPLETION_INDEX, LOG_FILE, RUN_NAME)
+# are preserved for the pod's bash script to resolve at execution time.
+SUBST_VARS='$JOB_NAME $BRANCH $BRANCH_LABEL $USER'
+SUBST_VARS+=' $STEPS $EVAL_INTERVAL $OPT_TYPE'
+SUBST_VARS+=' $ICI_EXPERT_PARALLELISM $ICI_DATA_PARALLELISM $ICI_FSDP_PARALLELISM'
+SUBST_VARS+=' $ICI_TENSOR_PARALLELISM $ICI_CONTEXT_PARALLELISM $SHARD_EXP_ON_FSDP'
+SUBST_VARS+=' $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS $REMAT_POLICY'
+SUBST_VARS+=' $PROFILER $SKIP_FIRST_N_STEPS_FOR_PROFILER $PROFILER_STEPS'
+SUBST_VARS+=' $LIBTPU_INIT_ARGS'
+
+echo "=== Submitting Ling3 Job ==="
+echo "  JobSet:     $JOB_NAME"
+echo "  Branch:     $BRANCH"
+echo "  Optimizer:  $OPT_TYPE"
+echo "  Steps:      $STEPS"
+echo "  Eval:       every $EVAL_INTERVAL steps"
+echo "  Batch:      $PER_DEVICE_BATCH_SIZE per device × $GRADIENT_ACCUMULATION_STEPS accum"
+echo "  Parallelism: EP=$ICI_EXPERT_PARALLELISM DP=$ICI_DATA_PARALLELISM FSDP=$ICI_FSDP_PARALLELISM TP=$ICI_TENSOR_PARALLELISM CP=$ICI_CONTEXT_PARALLELISM"
+echo "  Remat:      $REMAT_POLICY"
+echo "=============================="
+
+envsubst "$SUBST_VARS" < "$TEMPLATE" | kubectl apply -f -
+
+echo ""
+echo "Monitor with:"
+echo "  kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$JOB_NAME -w"
+echo "  kubectl logs -f \$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$JOB_NAME -o jsonpath='{.items[0].metadata.name}') -c jax-tpu"
+echo ""
+echo "Cleanup:"
+echo "  kubectl delete jobset $JOB_NAME"

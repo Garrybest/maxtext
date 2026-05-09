@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
     "flax>=0.12.7",
     # Add torch version requirement to fix the numpy issue.
-    # TODO: JAX is upgraded from the pallas-kernel repo, and then several 
+    # TODO: JAX is upgraded from the pallas-kernel repo, and then several
     # packages have version mismatch. We need a clear way to handle it.
     "torch>=2.5.0",
     "tops[tpu] @ git+https://github.com/primatrix/pallas-kernel.git@v0.5.1-rc1",
@@ -48,7 +48,7 @@ Repository = "https://github.com/AI-Hypercomputer/maxtext.git"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/MaxText", "src/maxtext", "src/dependencies"]
+packages = ["src/MaxText", "src/maxtext", "src/dependencies", "third_party"]
 
 # TODO: Add this hook back when it handles device-type parsing
 # [tool.hatch.build.targets.wheel.hooks.custom]

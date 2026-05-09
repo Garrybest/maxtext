@@ -729,6 +729,14 @@ class RoutedMoE(nnx.Module):
     sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
         self.dtype
     )
+
+    # Sort routing weights in the same order as inputs so they can be applied
+    # before fc2 (wo) inside the expert, matching Megatron's behavior.
+    sorted_weights = None
+    if self.config.routed_score_func == "sigmoid":
+      flatten_weights = jnp.ravel(weights)[:, None]
+      sorted_weights = _sort_activations(flatten_weights, sorted_selected_experts, use_custom_sort_vjp).squeeze(-1)
+
     group_size = jnp.bincount(flatten_selected_experts, length=self.num_experts)
     # Return the experts for each sorted input.
     expert_indices = jnp.arange(self.num_experts)
@@ -745,6 +753,7 @@ class RoutedMoE(nnx.Module):
         sorted_experts,
         lb_loss,
         expert_counts,
+        sorted_weights,
     )
 
   def unpermute(
@@ -980,7 +989,14 @@ class RoutedMoE(nnx.Module):
     """Perform sparse matrix multiplication of inputs and Experts."""
 
     def gmm(
-        inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, input_buffer_count, combine_scopes
+        inputs,
+        kernel,
+        tiling,
+        group_sizes,
+        expert_assignments,
+        weight_gather_axes,
+        input_buffer_count,
+        combine_scopes,
     ):
       # TODO (b/491979205) pipeline fsdp ag per repeat fails tokamax gmm
       if self.config.using_pipeline_parallelism and self.config.pipeline_fsdp_ag_per_repeat:
@@ -1231,7 +1247,16 @@ class RoutedMoE(nnx.Module):
 
         # "Route" tokens within each shard.
         num_experts_per_shard = self.config.num_experts // num_expert_parallelism
-        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, expert_counts = self.permute(
+        (
+            x,
+            sorted_selected_experts,
+            weights,
+            group_sizes,
+            selected_experts,
+            lb_loss,
+            expert_counts,
+            sorted_weights,
+        ) = self.permute(
             x,
             logits,
             pre_bias_logits,
@@ -1246,9 +1271,16 @@ class RoutedMoE(nnx.Module):
         mask = jnp.arange(x.shape[0]) < jnp.sum(group_sizes)
         x = jnp.where(mask[:, None], x, 0)
       else:
-        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, expert_counts = self.permute(
-            x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
-        )
+        (
+            x,
+            sorted_selected_experts,
+            weights,
+            group_sizes,
+            selected_experts,
+            lb_loss,
+            expert_counts,
+            sorted_weights,
+        ) = self.permute(x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs)
 
         # All-reduce expert_counts across batch-sharding axes so that every
         # shard sees the global token distribution.  Inside shard_map we must
@@ -1277,7 +1309,8 @@ class RoutedMoE(nnx.Module):
 
             # In the worst case, all of the global input data is assigned to each expert in the current shard.
             # This would result in num_expert_shards * input_size * experts_per_shard assignments. However, if
-            # experts_per_shard > num_experts_per_tok we cannot assign more than num_experts_per_tok to all of the inputs.
+            # experts_per_shard > num_experts_per_tok we cannot assign more than
+            # num_experts_per_tok to all of the inputs.
             max_local_experts_per_tok = min(local_expert_size, self.config.num_experts_per_tok)
             buffer_size = int(num_expert_parallelism * batch_size * sequence_length * max_local_experts_per_tok)
             output_shape = jnp.zeros((buffer_size, self.config.emb_dim), dtype=x.dtype)
@@ -1291,6 +1324,17 @@ class RoutedMoE(nnx.Module):
                 recv_sizes,
                 axis_name=self._expert_parallelism_name,
             )
+            if sorted_weights is not None:
+              weights_output_shape = jnp.zeros((buffer_size, 1), dtype=sorted_weights.dtype)
+              sorted_weights = jax.lax.ragged_all_to_all(
+                  sorted_weights[:, None],
+                  weights_output_shape,
+                  input_offsets,
+                  send_sizes,
+                  output_offsets,
+                  recv_sizes,
+                  axis_name=self._expert_parallelism_name,
+              )[:, 0]
             global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name)
             x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
                 x,
@@ -1299,6 +1343,10 @@ class RoutedMoE(nnx.Module):
                 shard_index=expert_shard_id,
                 use_custom_sort_vjp=self.config.use_custom_sort_vjp,
             )
+            if sorted_weights is not None:
+              sorted_weights = _sort_activations(
+                  sorted_weights[:, None], local_sorted_indices, self.config.use_custom_sort_vjp
+              )[:, 0]
           else:
             x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
                 x,
@@ -1309,6 +1357,10 @@ class RoutedMoE(nnx.Module):
                 global_sorted_experts=selected_experts,
                 use_custom_sort_vjp=self.config.use_custom_sort_vjp,
             )
+            if sorted_weights is not None:
+              sorted_weights = _sort_activations(
+                  sorted_weights[:, None], local_sorted_indices, self.config.use_custom_sort_vjp
+              )[:, 0]
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
@@ -1403,6 +1455,9 @@ class RoutedMoE(nnx.Module):
       layer_w1 = adc.checkpoint_name(layer_w1, "mlpwi_1")
       intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
 
+      if sorted_weights is not None:
+        intermediate_layer = intermediate_layer * sorted_weights.astype(self.dtype)[:, None]
+
       intermediate_output = gmm_fn(
           intermediate_layer,
           wo,
@@ -1425,10 +1480,11 @@ class RoutedMoE(nnx.Module):
         intermediate_output = jnp.where(mask[:, None], intermediate_output, 0)
 
         # Unsort and deduplicate the outputs locally.
+        unpermute_weights = jnp.ones_like(weights) if sorted_weights is not None else weights
         output = self.unpermute(
             intermediate_output,
             sorted_selected_experts,
-            weights,
+            unpermute_weights,
             batch_size=batch_size,
             sequence_length=sequence_length,
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,
@@ -1492,10 +1548,11 @@ class RoutedMoE(nnx.Module):
                 axis_name=self._expert_parallelism_name,
             )
 
+        unpermute_weights = jnp.ones_like(weights) if sorted_weights is not None else weights
         output = self.unpermute(
             intermediate_output,
             sorted_selected_experts,
-            weights,
+            unpermute_weights,
             batch_size=batch_size,
             sequence_length=sequence_length,
             use_custom_sort_vjp=self.config.use_custom_sort_vjp,

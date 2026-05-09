@@ -821,11 +821,16 @@ mu_dtype: "" # data type to store "mu" of AdamW tracking the first moment. Inher
 
 # Muon optimizer parameters
 # https://github.com/google-deepmind/optax/blob/main/optax/contrib/_muon.py
-# "mu_dtype", "adam_eps" are shared by AdamW
+# "mu_dtype" is shared by AdamW
+# "adam_eps" is passed separately to the AdamW partition inside Muon (default 1e-8, matching Megatron)
 # "nesterov", "ns_coeffs", "ns_steps", "weight_decay_mask", "adaptive" use default
 muon_beta: 0.95 # Decay rate for the exponentially weighted average of grads.
-muon_weight_decay: 0 # Strength of the weight decay regularization. This is multiplied with the learning rate.
+muon_weight_decay: 0.1 # Strength of the weight decay regularization. Matches Megatron --weight-decay 0.1.
 muon_consistent_rms: None # If None, apply width scaling to updates. If float, apply consistent rms scaling (recommend 0.2).
+muon_weight_decay_norm_params: False # Apply weight decay to norm params (scale) in Adam partition. Megatron: --weight-decay-norm-params.
+muon_nesterov_style: "sgd" # Style of momentum accumulation. 'ema' uses EMA with bias correction, 'sgd' uses classic SGD-style momentum.
+muon_batch_update: False # Group same-shape Muon weight matrices and batch Newton-Schulz for efficiency. Megatron: --muon-batch-update.
+muon_batch_update_size: None # Max batch size per NS call when muon_batch_update is True. Megatron: --muon-batch-update-size 16.
 
 # Stack trace parameters
 collect_stack_trace: False

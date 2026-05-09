@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 
 import optax
-from optax.contrib._muon import muon
+from third_party.optax_muon import muon
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
 
 
@@ -46,6 +46,37 @@ def _get_path_mask_fn(patterns, match_returns_true=True):
 def get_adamw_mask(config):
   """Create a mask function for AdamW optimizer to exclude certain parameters from weight decay."""
   return _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
+
+
+def get_adam_wd_mask(config):
+  """Create a weight decay mask for the Adam partition in Muon optimizer.
+
+  Aligns with Megatron's _get_param_groups (optimizer/__init__.py:181-189):
+    - bias → no decay (always excluded, matching name.endswith(".bias"))
+    - scale (norm params) → controlled by muon_weight_decay_norm_params
+    - everything else (embedding, logits_dense, etc.) → decay (wd_mult=1.0)
+
+  Unlike get_adamw_mask (which returns None when no patterns are configured),
+  this always returns a callable because bias/scale masking is always active.
+  """
+  weight_decay_norm = getattr(config, "muon_weight_decay_norm_params", False)
+
+  def mask_fn(params):
+    def _should_decay(path, _):
+      path_str = jax.tree_util.keystr(path, simple=True, separator="/")
+      leaf_name = path_str.rsplit("/", 1)[-1] if "/" in path_str else path_str
+      # bias: always exclude from weight decay
+      if leaf_name == "bias":
+        return False
+      # scale (norm params): configurable via muon_weight_decay_norm_params
+      if leaf_name == "scale":
+        return weight_decay_norm
+      # everything else: apply weight decay
+      return True
+
+    return jax.tree_util.tree_map_with_path(_should_decay, params)
+
+  return mask_fn
 
 
 def get_optimizer(config, learning_rate_schedule, model=None):
@@ -81,20 +112,26 @@ def get_optimizer(config, learning_rate_schedule, model=None):
     else:
       raise ValueError("Please specify model to extract muon dimension number.")
     muon_kwargs = {
-        # Shared parameters: "nesterov" uses default
+        # Shared parameters
         "learning_rate": learning_rate_schedule,
-        "eps": config.adam_eps,
+        # "eps" (NS normalization epsilon) uses the muon() default (1e-7)
+        # to match Megatron-LM's hardcoded NS epsilon.
         "mu_dtype": config.mu_dtype,
-        # Muon-specific parameters: "ns_coeffs", "ns_steps", "weight_decay_mask", "adaptive" uses default
+        # Muon-specific parameters: "ns_coeffs", "ns_steps", "adaptive" uses default
         "beta": config.muon_beta,
+        "nesterov_style": config.muon_nesterov_style,
         "weight_decay": config.muon_weight_decay,
         "muon_weight_dimension_numbers": muon_weight_dimension_numbers,
         "consistent_rms": config.muon_consistent_rms,
+        "batch_update": config.muon_batch_update,
+        "batch_update_size": config.muon_batch_update_size,
         # AdamW-specific parameters
         "adam_b1": config.adam_b1,
         "adam_b2": config.adam_b2,
+        "adam_eps": config.adam_eps,
         "adam_eps_root": config.adam_eps_root,
         "adam_weight_decay": config.adam_weight_decay,
+        "adam_weight_decay_mask": get_adam_wd_mask(config),
     }
     base_opt = muon(**muon_kwargs)
   else:

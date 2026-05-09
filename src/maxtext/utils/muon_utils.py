@@ -36,7 +36,7 @@ from maxtext.utils.globals import MAXTEXT_PKG_DIR
 from maxtext.layers import quantizations
 from maxtext.models import models
 from maxtext.utils import maxtext_utils
-from optax.contrib._muon import MuonDimensionNumbers as mdn
+from third_party.optax_muon import MuonDimensionNumbers as mdn
 
 
 Transformer = models.transformer_as_linen
@@ -46,7 +46,7 @@ def _is_path_contain_any(tuples, path):
   return any(x in path for x in tuples)
 
 
-def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
+def transform_logic(path: Tuple[str, ...], config=None) -> Optional[mdn]:
   """
   Determines Muon dimension numbers based on the parameter's hierarchical path.
 
@@ -65,6 +65,8 @@ def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
 
   Args:
     path: A tuple of strings representing the hierarchical path of the parameter.
+    config: Optional model config. When provided, enables MLA-specific
+      component_splits for wq_b/wkv_b to match Megatron's per-component NS.
 
   Returns:
     An instance of `MuonDimensionNumbers` if a specific mapping is found,
@@ -85,23 +87,39 @@ def transform_logic(path: Tuple[str, ...]) -> Optional[mdn]:
     if param_name in ("wi_0", "wi_1", "wo"):
       return mdn((-2,), (-1,))
 
-  # 2.2 Special weights: Attention projections. These include standard attention,
-  # MLA, and Ling3's KDA attention, which all materialize heads in the kernel.
+  # 2.2 Special weights: Attention projections.
+  # Output projections: heads merged into reduction → full-matrix NS, matching
+  # Megatron where linear_proj gets ParamTypeInMuonStrategy.none (full matrix).
   if param_name in ("out", "o_proj"):
     return mdn((0, -2), (-1,))
-  if param_name in ("query", "key", "value", "wq_b", "wkv_b", "q_proj", "k_proj", "v_proj", "g_proj", "gate_proj"):
-    return mdn((0,), (-2, -1))
+
+  # MLA projections with per-component splitting: split the output axis into
+  # semantic components (nope/rope for wq_b, nope/value for wkv_b) and merge
+  # heads into each component before NS, matching Megatron's split_head logic.
+  if param_name == "wq_b":
+    if config is not None and getattr(config, "qk_rope_head_dim", 0) > 0 and getattr(config, "qk_nope_head_dim", 0) > 0:
+      return mdn((0,), (-1,), component_splits=(config.qk_nope_head_dim, config.qk_rope_head_dim))
+    return mdn((0,), (-1,))
+
+  if param_name == "wkv_b":
+    if config is not None and getattr(config, "qk_nope_head_dim", 0) > 0 and getattr(config, "v_head_dim", 0) > 0:
+      return mdn((0,), (-1,), component_splits=(config.qk_nope_head_dim, config.v_head_dim))
+    return mdn((0,), (-1,))
+
+  # Standard attention input projections and KDA projections: per-head NS.
+  if param_name in ("query", "key", "value", "q_proj", "k_proj", "v_proj", "g_proj", "gate_proj"):
+    return mdn((0,), (-1,))
 
   # 3 Standard weights, [0, L, -1]
   return mdn((0,), (-1,))
 
 
-def get_transform_tree(tree, path=()):
+def get_transform_tree(tree, path=(), config=None):
   """Extraction utility via recursion."""
   if isinstance(tree, dict):
-    return {k: get_transform_tree(v, path + (k,)) for k, v in tree.items()}
+    return {k: get_transform_tree(v, path + (k,), config=config) for k, v in tree.items()}
   else:
-    return transform_logic(path)
+    return transform_logic(path, config=config)
 
 
 def get_muon_weight_dimension_numbers(model, config, verbose=False):
@@ -109,7 +127,7 @@ def get_muon_weight_dimension_numbers(model, config, verbose=False):
   # quickly get param structure without materialization
   abstract_param = maxtext_utils.get_abstract_param(model, config)
   # get muon dimension number from param
-  muon_weight_dimension_numbers = get_transform_tree(abstract_param)
+  muon_weight_dimension_numbers = get_transform_tree(abstract_param, config=config)
   if verbose:
     _print_structure_debug(abstract_param, muon_weight_dimension_numbers)
   return muon_weight_dimension_numbers

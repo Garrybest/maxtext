@@ -386,6 +386,11 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       total_z_loss = jnp.sum(z_loss)
 
   total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  # Total positions including padding (B * S). Used for MoE aux loss scaling in GA
+  # raw-sum mode to match Megatron's `logits.shape[0]` scaling (see router.py
+  # apply_load_balancing_loss / apply_z_loss). CE and non-MoE aux losses still
+  # use total_weights (valid tokens only).
+  total_positions = data["targets_segmentation"].size
   # GA loss convention:
   # - use_ga_raw_sum=True: loss_fn returns raw CE sum, GA divides by total_weights
   #   or gradient_accumulation_steps later. Aux losses need * total_weights compensation.
@@ -444,13 +449,15 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   if config.num_experts > 1:
     moe_lb_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_lb_loss")
     if use_ga_raw_sum:
-      loss += moe_lb_loss * total_weights
+      # Scale by total_positions (B*S incl. padding) to match Megatron's
+      # MoEAuxLossAutoScaler which uses `activation.shape[0]` (= T_total).
+      loss += moe_lb_loss * total_positions
     else:
       loss += moe_lb_loss
     if config.moe_z_loss_weight > 0.0:
       moe_z_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_z_loss")
       if use_ga_raw_sum:
-        loss += moe_z_loss * total_weights
+        loss += moe_z_loss * total_positions
       else:
         loss += moe_z_loss
 

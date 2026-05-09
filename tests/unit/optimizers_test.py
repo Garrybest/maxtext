@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" Unit tests for all optimizers. """
+"""Unit tests for all optimizers."""
+import math
 import re
 import unittest
 from unittest.mock import patch
 import jax
+import jax.numpy as jnp
 
 import pytest
 from absl.testing import parameterized
-from optax.contrib import MuonDimensionNumbers as mdn
-from optax.contrib._muon import muon
+from third_party.optax_muon import MuonDimensionNumbers as mdn
+from third_party.optax_muon import muon
+from third_party.optax_muon._muon import _get_shape_products
+from third_party.optax_muon._muon import _scale_update_for_consistent_rms
 
 from maxtext.configs import pyconfig
 from maxtext.optimizers import optimizers
@@ -38,9 +42,9 @@ _DEEPSEEK2_ATTENTION = {
     "self_attention": {
         "kv_norm": {"scale": None},
         "wkv_a": {"kernel": mdn((0,), (-1,))},
-        "wkv_b": {"kernel": mdn((0,), (-2, -1))},
-        "out": {"kernel": mdn((0, -2), (-1,))},
-        "query": {"kernel": mdn((0,), (-2, -1))},  # ds2
+        "wkv_b": {"kernel": mdn((0,), (-1,))},
+        "out": {"kernel": mdn((-2,), (-1,))},
+        "query": {"kernel": mdn((0,), (-1,))},  # ds2
     },
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -86,11 +90,11 @@ _DEEPSEEK3_ATTENTION = {
     "self_attention": {
         "kv_norm": {"scale": None},
         "wkv_a": {"kernel": mdn((0,), (-1,))},
-        "wkv_b": {"kernel": mdn((0,), (-2, -1))},
-        "out": {"kernel": mdn((0, -2), (-1,))},
+        "wkv_b": {"kernel": mdn((0,), (-1,))},
+        "out": {"kernel": mdn((-2,), (-1,))},
         "q_norm": {"scale": None},  # ds3
         "wq_a": {"kernel": mdn((0,), (-1,))},  # ds3
-        "wq_b": {"kernel": mdn((0,), (-2, -1))},  # ds3
+        "wq_b": {"kernel": mdn((0,), (-1,))},  # ds3
     },
     "post_self_attention_layer_norm": {"scale": None},
     "pre_self_attention_layer_norm": {"scale": None},
@@ -140,10 +144,10 @@ _GEMMA3_LAYER = {
     "post_ffw_norm": {"scale": None},
     "pre_ffw_norm": {"scale": None},
     "self_attention": {
-        "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-        "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-        "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-        "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
+        "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+        "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+        "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+        "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
         "key_norm": {"scale": None},
         "query_norm": {"scale": None},
     },
@@ -175,10 +179,10 @@ LLAMA2_DIMENSION_NUMBER = {
                     "wo": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                 },
                 "self_attention": {
-                    "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
+                    "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
                 },
                 "post_self_attention_layer_norm": {"scale": None},
                 "pre_self_attention_layer_norm": {"scale": None},
@@ -203,10 +207,10 @@ QWEN3_DIMENSION_NUMBER = {
                     "wo": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
                 },
                 "self_attention": {
-                    "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-2, -1))},
-                    "out": {"kernel": mdn(reduction_axis=(0, -2), output_axis=(-1,))},
+                    "query": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "key": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "value": {"kernel": mdn(reduction_axis=(0,), output_axis=(-1,))},
+                    "out": {"kernel": mdn(reduction_axis=(-2,), output_axis=(-1,))},
                     "key_norm": {"scale": None},
                     "query_norm": {"scale": None},
                 },
@@ -254,17 +258,17 @@ class MuonTransformLogicTest(parameterized.TestCase):
       (
           "kda_q_proj",
           ("params", "decoder", "moe_layers", "layers_0", "attention", "q_proj", "kernel"),
-          mdn((0,), (-2, -1)),
+          mdn((0,), (-1,)),
       ),
       (
           "kda_gate_proj",
           ("params", "decoder", "moe_layers", "layers_0", "attention", "gate_proj", "kernel"),
-          mdn((0,), (-2, -1)),
+          mdn((0,), (-1,)),
       ),
       (
           "kda_o_proj",
           ("params", "decoder", "moe_layers", "layers_0", "attention", "o_proj", "kernel"),
-          mdn((0, -2), (-1,)),
+          mdn((-2,), (-1,)),
       ),
       (
           "kda_short_conv_kernel",
@@ -289,6 +293,108 @@ class MuonTransformLogicTest(parameterized.TestCase):
     argv = ["", get_test_config_path(), "run_name=test", "model_name=ling3-tiny", "opt_type=muon"]
     config = pyconfig.initialize(argv)
     self.assertEqual(config.opt_type.value, "muon")
+
+
+class MuonSplitHeadFanTest(parameterized.TestCase):
+  """Verify fan_in/fan_out match Megatron split_head=True per-head semantics."""
+
+  @staticmethod
+  def _fan(shape, dim_nums):
+    """Compute fan_in/fan_out from shape and MuonDimensionNumbers."""
+    reduction_axes = tuple(ax % len(shape) for ax in dim_nums.reduction_axis)
+    output_axes = tuple(ax % len(shape) for ax in dim_nums.output_axis)
+    fan_in = math.prod(shape[ax] for ax in reduction_axes)
+    fan_out = math.prod(shape[ax] for ax in output_axes)
+    return fan_in, fan_out
+
+  @parameterized.named_parameters(
+      ("query_4096x32x128", (4096, 32, 128), "query", 4096, 128),
+      ("key_4096x8x128", (4096, 8, 128), "key", 4096, 128),
+      ("value_4096x8x128", (4096, 8, 128), "value", 4096, 128),
+      ("out_32x128x4096", (32, 128, 4096), "out", 128, 4096),
+      ("wkv_b_512x8x128", (512, 8, 128), "wkv_b", 512, 128),
+      # gate_proj: same split_head semantics as Q/K/V
+      ("gate_proj_4096x32x128", (4096, 32, 128), "gate_proj", 4096, 128),
+  )
+  def test_split_head_fan_values(self, shape, param_name, expected_fan_in, expected_fan_out):
+    """Per-head fan: fan_out=head_dim for Q/K/V, fan_in=head_dim for out."""
+    path = ("params", "decoder", "self_attention", param_name, "kernel")
+    dim_nums = transform_logic(path)
+    fan_in, fan_out = self._fan(shape, dim_nums)
+    self.assertEqual(fan_in, expected_fan_in, f"{param_name} fan_in mismatch: got {fan_in}, expected {expected_fan_in}")
+    self.assertEqual(
+        fan_out, expected_fan_out, f"{param_name} fan_out mismatch: got {fan_out}, expected {expected_fan_out}"
+    )
+
+  @parameterized.named_parameters(
+      # Attention: heads are batch dim → fan excludes heads
+      ("query_4096x32x128", (4096, 32, 128), "query", 4096, 128),
+      ("key_4096x8x128", (4096, 8, 128), "key", 4096, 128),
+      ("value_4096x8x128", (4096, 8, 128), "value", 4096, 128),
+      ("out_32x128x4096", (32, 128, 4096), "out", 128, 4096),
+      # 2D standard linear: no batch dim
+      ("mlp_wi_4096x11008", (4096, 11008), "wi", 4096, 11008),
+  )
+  def test_fork_get_shape_products(self, shape, param_name, expected_fan_in, expected_fan_out):
+    """Verify the actual fork _get_shape_products matches Megatron expected fan values."""
+    path = ("params", "decoder", "self_attention", param_name, "kernel")
+    dim_nums = transform_logic(path)
+    x = jnp.zeros(shape)
+    fan_in, fan_out = _get_shape_products(x, dim_nums)
+    self.assertEqual(fan_in, expected_fan_in, f"{param_name} fork fan_in: got {fan_in}, expected {expected_fan_in}")
+    self.assertEqual(fan_out, expected_fan_out, f"{param_name} fork fan_out: got {fan_out}, expected {expected_fan_out}")
+
+  @parameterized.named_parameters(
+      # MoE wi_0: (num_experts, hidden, ffn_dim) → batch=experts, fan_in=hidden, fan_out=ffn_dim
+      ("moe_wi0_8x4096x11008", (8, 4096, 11008), "wi_0", 4096, 11008),
+      ("moe_wi1_8x4096x11008", (8, 4096, 11008), "wi_1", 4096, 11008),
+      ("moe_wo_8x11008x4096", (8, 11008, 4096), "wo", 11008, 4096),
+  )
+  def test_moe_fan_values(self, shape, param_name, expected_fan_in, expected_fan_out):
+    """MoE weights: expert dim is batch, fan computed from per-expert 2D shape."""
+    path = ("params", "decoder", "MoeBlock_0", param_name, "kernel")
+    dim_nums = transform_logic(path)
+    x = jnp.zeros(shape)
+    fan_in, fan_out = _get_shape_products(x, dim_nums)
+    self.assertEqual(fan_in, expected_fan_in, f"MoE {param_name} fan_in: got {fan_in}, expected {expected_fan_in}")
+    self.assertEqual(fan_out, expected_fan_out, f"MoE {param_name} fan_out: got {fan_out}, expected {expected_fan_out}")
+
+
+class MuonConsistentRmsScalingTest(parameterized.TestCase):
+  """Verify consistent_rms scaling factor matches Megatron adjust_lr_wd_for_muon.
+
+  Megatron formula: scale = sqrt(max(fan_in, fan_out)) * consistent_rms
+  where fan_in/fan_out are computed from per-head shape when split_head=True.
+  """
+
+  @parameterized.named_parameters(
+      # Query (4096, 32, 128): per-head fan_in=4096, fan_out=128
+      # scale = sqrt(max(4096, 128)) * 0.2 = sqrt(4096) * 0.2 = 64 * 0.2 = 12.8
+      ("query_crms02", (4096, 32, 128), "query", 0.2, math.sqrt(4096) * 0.2),
+      # Out (32, 128, 4096): per-head fan_in=128, fan_out=4096
+      # scale = sqrt(max(128, 4096)) * 0.2 = sqrt(4096) * 0.2 = 12.8
+      ("out_crms02", (32, 128, 4096), "out", 0.2, math.sqrt(4096) * 0.2),
+      # 2D MLP (4096, 11008): fan_in=4096, fan_out=11008
+      # scale = sqrt(max(4096, 11008)) * 0.2 = sqrt(11008) * 0.2
+      ("mlp_2d_crms02", (4096, 11008), "wi", 0.2, math.sqrt(11008) * 0.2),
+      # Different consistent_rms value
+      ("query_crms01", (4096, 32, 128), "query", 0.1, math.sqrt(4096) * 0.1),
+  )
+  def test_consistent_rms_scaling_factor(self, shape, param_name, crms, expected_scale):
+    """Verify _scale_update_for_consistent_rms produces correct scaling factor."""
+    path = ("params", "decoder", "self_attention", param_name, "kernel")
+    dim_nums = transform_logic(path)
+    # Use ones so the output directly shows the scale factor
+    x = jnp.ones(shape)
+    scaled = _scale_update_for_consistent_rms(x, dim_nums, crms)
+    # Every element should be multiplied by expected_scale
+    actual_scale = float(scaled.ravel()[0])
+    self.assertAlmostEqual(
+        actual_scale,
+        expected_scale,
+        places=5,
+        msg=f"{param_name} scale: got {actual_scale}, expected {expected_scale}",
+    )
 
 
 class _DummyState:
@@ -350,7 +456,11 @@ class AdamWMaskTest(parameterized.TestCase):
     mask_fn = optimizers.get_adamw_mask(config)
     self.assertTrue(callable(mask_fn))
 
-    params = {"layer1": {"kernel": 1, "bias": 2}, "layer2": {"layer_norm": {"scale": 3}}, "layer3": {"ln": {"scale": 4}}}
+    params = {
+        "layer1": {"kernel": 1, "bias": 2},
+        "layer2": {"layer_norm": {"scale": 3}},
+        "layer3": {"ln": {"scale": 4}},
+    }
     mask = mask_fn(params)
     self.assertTrue(mask["layer1"]["kernel"])
     self.assertFalse(mask["layer1"]["bias"])
@@ -446,6 +556,115 @@ class AdamWMaskTest(parameterized.TestCase):
       mock_opt.assert_called_once()
       _, kwargs = mock_opt.call_args
       self.assertIsNone(kwargs["mask"])
+
+
+class MuonNesterovStyleTest(unittest.TestCase):
+  """Verify that optimizers.py wires nesterov_style='sgd' for Megatron parity."""
+
+  def test_muon_optimizer_passes_sgd_nesterov_style(self):
+    """get_optimizer(opt_type='muon') must pass nesterov_style='sgd' to muon()."""
+    argv = ["", get_test_config_path(), "run_name=test", "opt_type=muon"]
+    config = pyconfig.initialize(argv)
+    learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
+
+    with (
+        patch("maxtext.optimizers.optimizers.muon") as mock_muon,
+        patch("maxtext.optimizers.optimizers.get_muon_weight_dimension_numbers") as mock_mdn,
+    ):
+      mock_mdn.return_value = mdn()
+      mock_model = type("Model", (), {})()
+      optimizers.get_optimizer(config, learning_rate_schedule, model=mock_model)
+
+      mock_muon.assert_called_once()
+      _, kwargs = mock_muon.call_args
+      self.assertEqual(
+          kwargs.get("nesterov_style"),
+          "sgd",
+          "muon() must be called with nesterov_style='sgd' for Megatron parity",
+      )
+
+
+class MuonAdamWeightDecayMaskTest(unittest.TestCase):
+  """Tests for get_adam_wd_mask: per-param weight decay masking in Adam partition."""
+
+  def _make_config(self, norm_params=False):
+    return type("Config", (), {"muon_weight_decay_norm_params": norm_params})()
+
+  def test_bias_always_excluded(self):
+    """bias params must always be excluded from weight decay."""
+    mask_fn = optimizers.get_adam_wd_mask(self._make_config(norm_params=False))
+    params = {"layer": {"kernel": jax.numpy.ones((2, 2)), "bias": jax.numpy.ones((2,))}}
+    mask = mask_fn(params)
+    self.assertTrue(mask["layer"]["kernel"])
+    self.assertFalse(mask["layer"]["bias"])
+
+  def test_scale_excluded_when_norm_params_false(self):
+    """scale (norm) params excluded when muon_weight_decay_norm_params=False."""
+    mask_fn = optimizers.get_adam_wd_mask(self._make_config(norm_params=False))
+    params = {"norm": {"scale": jax.numpy.ones((4,))}, "other": jax.numpy.ones((4,))}
+    mask = mask_fn(params)
+    self.assertFalse(mask["norm"]["scale"])
+    self.assertTrue(mask["other"])
+
+  def test_scale_included_when_norm_params_true(self):
+    """scale (norm) params included when muon_weight_decay_norm_params=True."""
+    mask_fn = optimizers.get_adam_wd_mask(self._make_config(norm_params=True))
+    params = {"norm": {"scale": jax.numpy.ones((4,))}}
+    mask = mask_fn(params)
+    self.assertTrue(mask["norm"]["scale"])
+
+  def test_embedding_and_logits_always_decayed(self):
+    """embedding and logits_dense should always have weight decay (wd_mult=1.0)."""
+    mask_fn = optimizers.get_adam_wd_mask(self._make_config(norm_params=False))
+    params = {
+        "token_embedder": {"embedding": jax.numpy.ones((100, 8))},
+        "decoder": {"logits_dense": {"kernel": jax.numpy.ones((8, 100))}},
+    }
+    mask = mask_fn(params)
+    self.assertTrue(mask["token_embedder"]["embedding"])
+    self.assertTrue(mask["decoder"]["logits_dense"]["kernel"])
+
+  def test_get_optimizer_passes_adam_weight_decay_mask(self):
+    """get_optimizer(opt_type='muon') must pass adam_weight_decay_mask to muon()."""
+    argv = [
+        "",
+        get_test_config_path(),
+        "run_name=test",
+        "opt_type=muon",
+        "model_name=llama2-7b",
+        "skip_jax_distributed_system=True",
+    ]
+    config = pyconfig.initialize(argv)
+    learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
+
+    with (
+        patch("maxtext.optimizers.optimizers.muon") as mock_muon,
+        patch("maxtext.optimizers.optimizers.get_muon_weight_dimension_numbers") as mock_mdn,
+    ):
+      mock_mdn.return_value = mdn()
+      mock_model = type("Model", (), {})()
+      optimizers.get_optimizer(config, learning_rate_schedule, model=mock_model)
+
+      mock_muon.assert_called_once()
+      _, kwargs = mock_muon.call_args
+      self.assertIn("adam_weight_decay_mask", kwargs, "muon() must be called with adam_weight_decay_mask")
+      self.assertTrue(callable(kwargs["adam_weight_decay_mask"]), "adam_weight_decay_mask must be a callable")
+
+
+class MuonWeightDecayNormParamsConfigTest(unittest.TestCase):
+  """Verify muon_weight_decay_norm_params config field exists and defaults to False."""
+
+  def test_muon_weight_decay_norm_params_defaults_false(self):
+    """muon_weight_decay_norm_params should exist and default to False."""
+    argv = ["", get_test_config_path(), "run_name=test", "opt_type=muon"]
+    config = pyconfig.initialize(argv)
+    self.assertFalse(config.muon_weight_decay_norm_params)
+
+  def test_muon_weight_decay_norm_params_can_be_set_true(self):
+    """muon_weight_decay_norm_params should be settable to True."""
+    argv = ["", get_test_config_path(), "run_name=test", "opt_type=muon", "muon_weight_decay_norm_params=True"]
+    config = pyconfig.initialize(argv)
+    self.assertTrue(config.muon_weight_decay_norm_params)
 
 
 class TrainableParametersMaskTest(parameterized.TestCase):

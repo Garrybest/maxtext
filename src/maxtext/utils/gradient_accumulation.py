@@ -133,9 +133,6 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["raw_mtp_loss"] += aux["raw_mtp_loss"]
     acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
     acc_grad_and_loss["total_weights"] += aux["total_weights"]
-    # Megatron mode: accumulate per-microbatch per-token loss for equal-weight averaging
-    if not config.calculate_per_token_loss:
-      acc_grad_and_loss["lm_loss_per_token"] += aux["total_loss"] / (aux["total_weights"] + EPS)
     return acc_grad_and_loss, aux
 
   def reshape_to_microbatch_accumulations(batch_arr):
@@ -160,7 +157,6 @@ def gradient_accumulation_loss_and_grad(
       "indexer_loss": 0.0,
       "mtp_loss": 0.0,
       "raw_mtp_loss": 0.0,
-      "lm_loss_per_token": 0.0,
       "ga_params": ga_params,
   }
 
@@ -177,10 +173,11 @@ def gradient_accumulation_loss_and_grad(
   total_weights = grad_and_loss["total_weights"]
   grad_divisor = total_weights + EPS if config.calculate_per_token_loss else config.gradient_accumulation_steps
   # Compute pure LM loss (cross-entropy only, no auxiliary losses).
-  if config.calculate_per_token_loss:
-    lm_loss = grad_and_loss["loss"] / (total_weights + EPS)
-  else:
-    lm_loss = grad_and_loss["lm_loss_per_token"] / config.gradient_accumulation_steps
+  # Both modes use global sum/count for the *reported* lm_loss, matching
+  # Megatron's aggregation in training.py (numerator += val[0]; denominator += val[1]).
+  # The gradient path still differs: calculate_per_token_loss=True divides grads
+  # by total_weights; False divides by gradient_accumulation_steps.
+  lm_loss = grad_and_loss["loss"] / (total_weights + EPS)
   # Mixed loss preserves upstream semantics: LM + all auxiliary losses.
   loss = (
       lm_loss
