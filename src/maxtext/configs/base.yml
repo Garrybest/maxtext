@@ -799,6 +799,7 @@ gradient_clipping_threshold: 1.0
 # Instead of updating the weights every step, you may effectively use a larger
 # batch by accumulating the gradient over a set of steps.
 gradient_accumulation_steps: 1
+enable_ga_prevent_weight_hoist: false
 
 opt_type: "adamw"  # one of "adamw", "adam_pax", "sgd", or "muon"
 # List of parameter names/patterns to train.

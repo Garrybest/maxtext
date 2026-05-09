@@ -23,6 +23,29 @@ from maxtext.utils.globals import EPS
 from maxtext.utils.sharding import maybe_shard_with_name
 
 
+def _inject_loop_variant_dep(ga_params, data):
+  """Make ga_params appear loop-variant to prevent XLA LICM hoisting.
+
+  Overwrites one element per leaf with a data-derived token, barriers the
+  result, then restores the original value.  The net effect is identity at
+  runtime, but the compiler sees a loop-variant tensor because the barrier
+  output depends on the microbatch data (which differs every scan iteration).
+  """
+  # TODO: assumes data's first tree leaf is loop-variant (e.g. input_ids).
+  # Consider using scan loop counter for a more robust variant source.
+  token = jax.tree_util.tree_leaves(data)[0].reshape(-1)[0]
+
+  def _touch_leaf(param):
+    flat = param.reshape(-1)
+    orig = flat[0]
+    flat = flat.at[0].set(token.astype(flat.dtype))
+    flat = jax.lax.optimization_barrier(flat)
+    flat = flat.at[0].set(orig)
+    return flat.reshape(param.shape)
+
+  return jax.tree_util.tree_map(_touch_leaf, ga_params)
+
+
 def gradient_accumulation_loss_and_grad(
     _loss_fn,
     config,
@@ -99,6 +122,8 @@ def gradient_accumulation_loss_and_grad(
 
   def accumulate_gradient(acc_grad_and_loss, data):
     ga_params = acc_grad_and_loss["ga_params"]
+    if config.enable_ga_prevent_weight_hoist and config.gradient_accumulation_steps > 1:
+      ga_params = _inject_loop_variant_dep(ga_params, data)
     (_, aux), cur_batch_gradient = grad_func(model, config, data, dropout_rng, ga_params, *extra_dpo_args, is_train=True)
     acc_grad_and_loss["loss"] += aux["total_loss"]
     acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]

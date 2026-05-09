@@ -266,6 +266,7 @@ ModelName = Literal[
     "olmo3-32b",
     "ling2",
     "ling3-tiny",
+    "ling3-flash",
 ]
 
 
@@ -1405,6 +1406,16 @@ class Optimizer(BaseModel):
   opt_type: OptimizerType = Field(OptimizerType.ADAMW, description="The type of optimizer to use.")
   gradient_accumulation_steps: PositiveInt = Field(
       1, description="Number of steps to accumulate gradients before updating."
+  )
+  enable_ga_prevent_weight_hoist: bool = Field(
+      False,
+      description=(
+          "Inject loop-variant dependency in GA scan body to prevent XLA LICM from hoisting "
+          "weight all-gathers out of the while loop. Without this, XLA keeps all expert weights "
+          "materialized for the entire step (~32 GB for MoE). With this, per-layer remat "
+          "gathers/frees weights on demand. "
+          "Only effective with per-layer remat (prevent_cse=True) and gradient_accumulation_steps > 1."
+      ),
   )
   use_tunix_gradient_accumulation: bool = Field(
       False,
