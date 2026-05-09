@@ -227,6 +227,7 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     \
     `# --- Performance Optimization ---` \
     remat_policy=$REMAT_POLICY \
+    enable_ga_prevent_weight_hoist=${ENABLE_GA_PREVENT_WEIGHT_HOIST:-false} \
     `# --- System Config ---` \
     enable_checkpointing=false \
     save_checkpoint_on_completion=false \

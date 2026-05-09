@@ -1214,5 +1214,166 @@ class ZeroMeanStateParamTest(unittest.TestCase):
     )
 
 
+class FuseGateUpProjTest(unittest.TestCase):
+  """fuse_gate_up_proj=True must reduce wi GMM calls from 2 to 1."""
+
+  def _build_cfg(self, fuse: bool):
+    extra_args = get_decoupled_parallelism_overrides()
+    return pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name=f"fuse_gate_up_proj_{fuse}_test",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        dtype="bfloat16",
+        megablox=True,
+        sparse_matmul=True,
+        per_device_batch_size=1,
+        max_target_length=128,
+        fuse_gate_up_proj=fuse,
+        **extra_args,
+    )
+
+  def _build_inputs_and_variables(self, cfg, mesh):
+    """Initialize a RoutedMoE the same way RoutedMoeTest.get_moe_output does."""
+    rng = jax.random.PRNGKey(1234)
+    rng_model, rng_hidden_states = jax.random.split(rng)
+    device_count = jax.device_count()
+    hidden_states = jax.random.uniform(
+        rng_hidden_states,
+        (int(cfg.per_device_batch_size) * device_count, cfg.max_target_length, cfg.base_emb_dim),
+        dtype=cfg.dtype,
+    )
+
+    # Use MoeLoopBlock to seed initial parameters, mirroring RoutedMoeTest.
+    loop_model = get_moe_loop(
+        config=cfg,
+        mesh=mesh,
+        inputs_shape=hidden_states.shape,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+    )
+    variables = loop_model.init(
+        {"params": rng_model, "dropout": rng_model},
+        jax.random.normal(rng_model, (int(cfg.per_device_batch_size), cfg.max_target_length, cfg.base_emb_dim)),
+    )
+
+    routed_moe = moe.get_routed_moe(
+        name="MoeBlock",
+        config=cfg,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        mesh=mesh,
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        intermediate_dim=cfg.mlp_dim,
+        dtype=cfg.dtype,
+    )
+
+    kernel = variables["params"]["gate"]["kernel"].value.astype(cfg.weight_dtype)
+    exp_wi_0, exp_wi_1, exp_wo = [], [], []
+    for i in range(cfg.num_experts):
+      tmp_wi_0 = variables["params"][f"mlp_{i}"]["wi_0"]["kernel"].value
+      tmp_wi_0 = jnp.reshape(tmp_wi_0, (1, cfg.base_emb_dim, cfg.base_mlp_dim))
+      tmp_wi_1 = variables["params"][f"mlp_{i}"]["wi_1"]["kernel"].value
+      tmp_wi_1 = jnp.reshape(tmp_wi_1, (1, cfg.base_emb_dim, cfg.base_mlp_dim))
+      tmp_wo = variables["params"][f"mlp_{i}"]["wo"]["kernel"].value
+      tmp_wo = jnp.reshape(tmp_wo, (1, cfg.base_mlp_dim, cfg.base_emb_dim))
+      exp_wi_0.append(tmp_wi_0)
+      exp_wi_1.append(tmp_wi_1)
+      exp_wo.append(tmp_wo)
+    wi_0 = jnp.concatenate(exp_wi_0, axis=0, dtype=cfg.weight_dtype)
+    wi_1 = jnp.concatenate(exp_wi_1, axis=0, dtype=cfg.weight_dtype)
+    wo = jnp.concatenate(exp_wo, axis=0, dtype=cfg.weight_dtype)
+    moe_variables = {"params": {"gate": {"kernel": kernel}, "wi_0": wi_0, "wi_1": wi_1, "wo": wo}}
+    return routed_moe, moe_variables, hidden_states
+
+  @pytest.mark.tpu_only
+  def test_fuse_reduces_gmm_call_count(self):
+    """With fuse_gate_up_proj=True the wi gmm path should call mblx.gmm once instead of twice.
+
+    Also runs an unfused-control branch to prove the patch actually intercepts:
+    if the patch did not work, both branches would observe call_count == 0 (or
+    the same nonzero number), not 2 vs. 3.
+    """
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+    from maxtext.kernels import megablox as mblx_mod  # pylint: disable=import-outside-toplevel
+
+    original_gmm = mblx_mod.gmm
+    call_count = [0]
+
+    def counting(*args, **kwargs):
+      call_count[0] += 1
+      return original_gmm(*args, **kwargs)
+
+    # --- fused branch: wi=1 + wo=1 = 2 ---
+    cfg_fused = self._build_cfg(fuse=True)
+    devices_array = maxtext_utils.create_device_mesh(cfg_fused)
+    mesh_fused = Mesh(devices_array, cfg_fused.mesh_axes)
+    routed_moe_fused, moe_vars_fused, hs_fused = self._build_inputs_and_variables(cfg_fused, mesh_fused)
+
+    call_count[0] = 0
+    with patch("maxtext.kernels.megablox.gmm", side_effect=counting):
+      _ = jax.jit(routed_moe_fused.apply)(moe_vars_fused, hs_fused)  # pylint: disable=not-callable
+    fused_calls = call_count[0]
+
+    # --- unfused control: wi=2 + wo=1 = 3 ---
+    cfg_unfused = self._build_cfg(fuse=False)
+    devices_array = maxtext_utils.create_device_mesh(cfg_unfused)
+    mesh_unfused = Mesh(devices_array, cfg_unfused.mesh_axes)
+    routed_moe_unfused, moe_vars_unfused, hs_unfused = self._build_inputs_and_variables(cfg_unfused, mesh_unfused)
+
+    call_count[0] = 0
+    with patch("maxtext.kernels.megablox.gmm", side_effect=counting):
+      _ = jax.jit(routed_moe_unfused.apply)(moe_vars_unfused, hs_unfused)  # pylint: disable=not-callable
+    unfused_calls = call_count[0]
+
+    self.assertEqual(
+        unfused_calls,
+        3,
+        f"Expected 3 gmm calls with fuse_gate_up_proj=False (control), got {unfused_calls}. "
+        "If 0, the mock.patch target is not intercepting mblx.gmm.",
+    )
+    self.assertEqual(
+        fused_calls,
+        2,
+        f"Expected 2 gmm calls with fuse_gate_up_proj=True, got {fused_calls}",
+    )
+
+  @pytest.mark.tpu_only
+  def test_fuse_numerical_equivalence(self):
+    """Fused (concat W_gate,W_up -> gmm -> split) must match unfused (two gmms) numerically.
+
+    Catches regressions in n_half (split offset), slice direction, or concat axis.
+    Uses identical PRNG seeding so weights/inputs are bitwise-identical between the two runs.
+    """
+    cfg_fused = self._build_cfg(fuse=True)
+    devices_array = maxtext_utils.create_device_mesh(cfg_fused)
+    mesh_fused = Mesh(devices_array, cfg_fused.mesh_axes)
+    routed_moe_fused, moe_vars_fused, hs_fused = self._build_inputs_and_variables(cfg_fused, mesh_fused)
+    out_fused = jax.jit(routed_moe_fused.apply)(moe_vars_fused, hs_fused)  # pylint: disable=not-callable
+
+    cfg_unfused = self._build_cfg(fuse=False)
+    devices_array = maxtext_utils.create_device_mesh(cfg_unfused)
+    mesh_unfused = Mesh(devices_array, cfg_unfused.mesh_axes)
+    routed_moe_unfused, moe_vars_unfused, hs_unfused = self._build_inputs_and_variables(cfg_unfused, mesh_unfused)
+    out_unfused = jax.jit(routed_moe_unfused.apply)(moe_vars_unfused, hs_unfused)  # pylint: disable=not-callable
+
+    # `_build_inputs_and_variables` reseeds with PRNGKey(1234) on every call, so the
+    # MoE weights and hidden_states are identical across the two runs by construction.
+    # bf16 numerics: match the tolerance RoutedMoeTest uses for end-to-end MoE outputs.
+    def _arr(o):
+      return o[0] if isinstance(o, tuple) else o
+
+    self.assertTrue(
+        jnp.allclose(_arr(out_fused), _arr(out_unfused), rtol=1e-02, atol=1e-02, equal_nan=False),
+        "Fused gate+up output diverges from unfused output beyond bf16 tolerance; "
+        "check n_half, split direction, and concat axis in moe.py fused branch.",
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

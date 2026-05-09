@@ -220,6 +220,8 @@ wo_tile_fwd_buffer_count: 2
 wo_tile_dlhs_buffer_count: 2
 wo_tile_drhs_buffer_count: 2
 
+fuse_gate_up_proj: false
+
 wi_combine_scopes: False
 wo_combine_scopes: False
 

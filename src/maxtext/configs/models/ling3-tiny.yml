@@ -101,3 +101,6 @@ calculate_per_token_loss: false       # micro-batch independent averaging for GA
 mtp_final_layernorm: true             # apply final LayerNorm in MTP
 mtp_per_layer_loss_norm: true         # normalize loss per MTP layer
 mtp_loss_scaling_factor: 0.1          # MTP loss weight
+
+# Performance: fuse W_gate and W_up into single GMM call (PR1)
+fuse_gate_up_proj: true

@@ -799,6 +799,8 @@ class MoEKernels(BaseModel):
   wo_tile_dlhs_buffer_count: int = Field(2, description="bwd pass dlhs tiling buffer count in GMM for wo.")
   wo_tile_drhs_buffer_count: int = Field(2, description="bwd pass drhs tiling buffer count in GMM for wo.")
 
+  fuse_gate_up_proj: bool = Field(False, description="Fuse gate and up projections into a single GMM call.")
+
   wi_combine_scopes: bool = Field(False, description="whether to use combine_scopes features for tgmm for wi.")
   wo_combine_scopes: bool = Field(False, description="whether to use combine_scopes features for tgmm for wo.")
 

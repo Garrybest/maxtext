@@ -91,3 +91,6 @@ calculate_per_token_loss: false  # [NEW] micro-batch independent averaging for G
 mtp_final_layernorm: true
 mtp_per_layer_loss_norm: true
 mtp_loss_scaling_factor: 0.1
+
+# Performance: fuse W_gate and W_up into single GMM call (PR1)
+fuse_gate_up_proj: true

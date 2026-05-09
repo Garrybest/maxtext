@@ -1426,32 +1426,59 @@ class RoutedMoE(nnx.Module):
 
       wi_combine_scopes = self.config.wi_combine_scopes
       wo_combine_scopes = self.config.wo_combine_scopes
-      layer_w0 = gmm_fn(
-          x,
-          w0,
-          tiling=wi_tile_size,
-          weight_gather_axes=wi_gather_axes,
-          input_buffer_count=wi_input_buffer_count,
-          combine_scopes=wi_combine_scopes,
+      can_fuse = (
+          self.config.fuse_gate_up_proj
+          and not isinstance(w0, aqt.QTensor)
+          and not isinstance(w1, aqt.QTensor)
+          and not wi_gather_axes
       )
-      if self.get_tensor_transpose_parallelism_size() > 1:
-        layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
-      if self.config.mlp_bias:
-        layer_w0 = layer_w0 + w0_bias
-      layer_w0 = adc.checkpoint_name(layer_w0, "mlpwi_0")
+      if can_fuse:
+        # Concatenate W_gate and W_up along the MLP/hidden dim and run a single GMM.
+        wi_01 = jnp.concatenate([w0, w1], axis=2)
+        gate_up = gmm_fn(
+            x,
+            wi_01,
+            tiling=wi_tile_size,
+            weight_gather_axes=wi_gather_axes,
+            input_buffer_count=wi_input_buffer_count,
+            combine_scopes=wi_combine_scopes,
+        )
+        if self.get_tensor_transpose_parallelism_size() > 1:
+          gate_up = jax.lax.psum(gate_up, "tensor_transpose")
+        n_half = w0.shape[2]
+        layer_w0 = gate_up[:, :n_half]
+        layer_w1 = gate_up[:, n_half:]
+        if self.config.mlp_bias:
+          layer_w0 = layer_w0 + w0_bias
+          layer_w1 = layer_w1 + w1_bias
+      else:
+        layer_w0 = gmm_fn(
+            x,
+            w0,
+            tiling=wi_tile_size,
+            weight_gather_axes=wi_gather_axes,
+            input_buffer_count=wi_input_buffer_count,
+            combine_scopes=wi_combine_scopes,
+        )
+        if self.get_tensor_transpose_parallelism_size() > 1:
+          layer_w0 = jax.lax.psum(layer_w0, "tensor_transpose")
+        if self.config.mlp_bias:
+          layer_w0 = layer_w0 + w0_bias
 
-      layer_w1 = gmm_fn(
-          x,
-          w1,
-          tiling=wi_tile_size,
-          weight_gather_axes=wi_gather_axes,
-          input_buffer_count=wi_input_buffer_count,
-          combine_scopes=wi_combine_scopes,
-      )
-      if self.get_tensor_transpose_parallelism_size() > 1:
-        layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
-      if self.config.mlp_bias:
-        layer_w1 = layer_w1 + w1_bias
+        layer_w1 = gmm_fn(
+            x,
+            w1,
+            tiling=wi_tile_size,
+            weight_gather_axes=wi_gather_axes,
+            input_buffer_count=wi_input_buffer_count,
+            combine_scopes=wi_combine_scopes,
+        )
+        if self.get_tensor_transpose_parallelism_size() > 1:
+          layer_w1 = jax.lax.psum(layer_w1, "tensor_transpose")
+        if self.config.mlp_bias:
+          layer_w1 = layer_w1 + w1_bias
+
+      layer_w0 = adc.checkpoint_name(layer_w0, "mlpwi_0")
       layer_w1 = adc.checkpoint_name(layer_w1, "mlpwi_1")
       intermediate_layer = self.apply_ffn_activation(layer_w0, layer_w1)
 

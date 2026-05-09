@@ -148,6 +148,8 @@ spec:
                 value: "true"
               - name: REMAT_POLICY
                 value: "custom"
+              - name: ENABLE_GA_PREVENT_WEIGHT_HOIST
+                value: "true"
               # --- Disable Vertex TB / Goodput in CI to keep runs lightweight ---
               - name: USE_VERTEX_TENSORBOARD
                 value: "false"
