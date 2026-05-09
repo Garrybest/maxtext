@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       target_cluster:
-        description: "Cluster target (default = repo secrets, lingbo = pre-cutover validation)"
+        description: "Cluster target (default = repo secrets, lingbo = PR #156 lingbo, tpu_training = on-demand JobSet on tpu_training cluster)"
         required: false
         type: choice
         default: default
-        options: [default, lingbo]
+        options: [default, lingbo, tpu_training]
       branch:
         description: "Branch to run on (defaults to the branch you triggered from)"
         required: false
@@ -54,17 +54,35 @@ jobs:
             exit 1
           fi
 
+      - name: Verify *_TPU_TRAINING secrets are populated
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          WIF_TPU_TRAINING: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING }}
+          SA_TPU_TRAINING: ${{ secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING }}
+          CLUSTER_TPU_TRAINING: ${{ secrets.GKE_CLUSTER_TPU_TRAINING }}
+          LOCATION_TPU_TRAINING: ${{ secrets.GKE_LOCATION_TPU_TRAINING }}
+        run: |
+          missing=()
+          [ -z "$WIF_TPU_TRAINING" ] && missing+=(GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING)
+          [ -z "$SA_TPU_TRAINING" ] && missing+=(GCP_SERVICE_ACCOUNT_TPU_TRAINING)
+          [ -z "$CLUSTER_TPU_TRAINING" ] && missing+=(GKE_CLUSTER_TPU_TRAINING)
+          [ -z "$LOCATION_TPU_TRAINING" ] && missing+=(GKE_LOCATION_TPU_TRAINING)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets for target_cluster=tpu_training: ${missing[*]}"
+            exit 1
+          fi
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER) }}
+          service_account: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT) }}
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
-          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
+          cluster_name: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_CLUSTER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER) }}
+          location: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_LOCATION_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION) }}
 
       - name: Generate unique job name
         id: job

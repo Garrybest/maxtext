@@ -71,6 +71,72 @@ jobs:
 
           echo "Cleanup done. Deleted $FOUND stale resources."
 
+  cleanup_legacy_tpu_training:
+    name: "Delete stale CI K8s resources (tpu_training cluster)"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_TPU_TRAINING }}
+          location: ${{ secrets.GKE_LOCATION_TPU_TRAINING }}
+
+      - name: Delete stale CI resources (tpu_training subset)
+        env:
+          WIF_TPU_TRAINING: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING }}
+          CLUSTER_TPU_TRAINING: ${{ secrets.GKE_CLUSTER_TPU_TRAINING }}
+        run: |
+          # Fail-loud guard: if tpu_training secrets are unset, the get-gke-credentials
+          # step above silently fell back to the DEFAULT cluster, which would cause this
+          # job to double-clean resources on the wrong cluster every 5 minutes.
+          if [ -z "$WIF_TPU_TRAINING" ] || [ -z "$CLUSTER_TPU_TRAINING" ]; then
+            echo "::error::TPU_TRAINING secrets are unset; refusing to run cleanup against fallback default cluster."
+            exit 1
+          fi
+
+          FOUND=0
+
+          cleanup_group() {
+            local APP_LABEL=$1
+            local THRESHOLD_HOURS=$2
+            local KINDS=$3
+            local THRESHOLD
+            THRESHOLD=$(date -u -d "${THRESHOLD_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)
+            echo "Checking $APP_LABEL resources created before $THRESHOLD (${THRESHOLD_HOURS}h threshold)"
+            for KIND in $KINDS; do
+              ITEMS=$(kubectl get "$KIND" -l "app=$APP_LABEL" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' \
+                2>/dev/null || true)
+              while IFS=$'\t' read -r NAME CREATED; do
+                [ -z "$NAME" ] && continue
+                if [[ "$CREATED" < "$THRESHOLD" ]]; then
+                  echo "  Deleting $KIND/$NAME (created: $CREATED)"
+                  kubectl delete "$KIND" "$NAME" --ignore-not-found
+                  FOUND=$((FOUND + 1))
+                fi
+              done <<< "$ITEMS"
+            done
+          }
+
+          # JobSet labels emitted by in-scope workflows on tpu_training cluster.
+          # Pool-only labels (ci-smoke-test, ci-unit-tests) absent — those workflows
+          # are out of scope on this cluster. cleanup_group on a label that has no
+          # matching resources is a no-op, so over-listing is safe.
+          cleanup_group tpu-32chips-ling2-job 26 "jobset"
+          cleanup_group ci-loss-validation     6 "jobset"
+          cleanup_group ci-profiling-16chip    3 "jobset"
+          cleanup_group ci-profiling           5 "jobset"
+
+          echo "Cleanup done (tpu_training). Deleted $FOUND stale resources."
+
   watchdog:
     name: "Reset stuck TPU pool pods"
     runs-on: ubuntu-latest

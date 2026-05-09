@@ -26,18 +26,23 @@ on:
   workflow_dispatch:
     inputs:
       target_cluster:
-        description: "Cluster target (default = repo secrets, lingbo = pre-cutover validation)"
+        description: "Cluster target (default = repo secrets, lingbo = PR #156 lingbo, tpu_training = on-demand JobSet on tpu_training cluster)"
         required: false
         type: choice
         default: default
-        options: [default, lingbo]
+        options: [default, lingbo, tpu_training]
       branch:
         description: "Branch to run on (defaults to main)"
         required: false
         type: string
 
 concurrency:
-  group: tpu-loss-validation-16chips-pool
+  # Per-target_cluster group so JobSet path (target=tpu_training) doesn't
+  # serialize with pool path (target in default/lingbo). Schedule trigger
+  # has no inputs.target_cluster (resolves to fallback default), which keeps
+  # default-cluster runs in the same queue as lingbo dispatches that share
+  # the same physical cluster.
+  group: tpu-loss-validation-16chips-${{ inputs.target_cluster || 'default' }}
   cancel-in-progress: false
 
 permissions:
@@ -72,11 +77,29 @@ jobs:
             exit 1
           fi
 
+      - name: Verify *_TPU_TRAINING secrets are populated
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          WIF_TPU_TRAINING: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING }}
+          SA_TPU_TRAINING: ${{ secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING }}
+          CLUSTER_TPU_TRAINING: ${{ secrets.GKE_CLUSTER_TPU_TRAINING }}
+          LOCATION_TPU_TRAINING: ${{ secrets.GKE_LOCATION_TPU_TRAINING }}
+        run: |
+          missing=()
+          [ -z "$WIF_TPU_TRAINING" ] && missing+=(GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING)
+          [ -z "$SA_TPU_TRAINING" ] && missing+=(GCP_SERVICE_ACCOUNT_TPU_TRAINING)
+          [ -z "$CLUSTER_TPU_TRAINING" ] && missing+=(GKE_CLUSTER_TPU_TRAINING)
+          [ -z "$LOCATION_TPU_TRAINING" ] && missing+=(GKE_LOCATION_TPU_TRAINING)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required secrets for target_cluster=tpu_training: ${missing[*]}"
+            exit 1
+          fi
+
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER) }}
+          service_account: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT) }}
           # Default 3600s expires mid-run for ~110min runs; bump to 7200s
           # (max without org-policy allowlist) so a single token covers the
           # whole run. If the SA is NOT on the
@@ -88,16 +111,138 @@ jobs:
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
-          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
+          cluster_name: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_CLUSTER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER) }}
+          location: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_LOCATION_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION) }}
 
       - name: Generate JOB_NAME
         id: job
         run: |
           JOB_NAME="lossval16-pool-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          BRANCH="${{ inputs.branch || 'main' }}"
+          BRANCH_LABEL=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-63)
           echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "JOB_NAME=$JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "BRANCH_LABEL=$BRANCH_LABEL" >> "$GITHUB_OUTPUT"
+
+      # ────────────────────────────────────────────────────────────
+      # JobSet driver (target_cluster=tpu_training, no pool available)
+      # ────────────────────────────────────────────────────────────
+      - name: "[JobSet] Cleanup previous JobSets for this branch"
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          BRANCH_LABEL: ${{ steps.job.outputs.BRANCH_LABEL }}
+        run: |
+          echo "Cleaning up leftover lossval-16 JobSets for branch=$BRANCH_LABEL..."
+          kubectl delete jobsets \
+            -l "app=ci-loss-validation,repo-branch=$BRANCH_LABEL" \
+            --ignore-not-found
+
+      - name: "[JobSet] Deploy 16-chip lossval JobSet"
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          JOB_NAME: ${{ steps.job.outputs.JOB_NAME }}
+          BRANCH: ${{ steps.job.outputs.BRANCH }}
+          BRANCH_LABEL: ${{ steps.job.outputs.BRANCH_LABEL }}
+          USER: github-actions
+        run: |
+          echo "Submitting JobSet $JOB_NAME on tpu_training cluster"
+          envsubst '$JOB_NAME $BRANCH $BRANCH_LABEL $USER' \
+            < .github/ci/tpu-loss-validation-16chips-jobset.yaml \
+            | kubectl apply -f -
+
+      - name: "[JobSet] Wait for 4 worker pods Running"
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          JOB_NAME: ${{ steps.job.outputs.JOB_NAME }}
+        run: |
+          echo "Waiting for 4 worker pods of JobSet $JOB_NAME..."
+          for i in $(seq 1 180); do
+            READY=$(kubectl get pods \
+              -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" \
+              --field-selector=status.phase=Running \
+              -o name 2>/dev/null | wc -l)
+            if [ "$READY" -ge 4 ]; then
+              echo "All 4 pods Running."
+              break
+            fi
+            sleep 10
+          done
+          if [ "$READY" -lt 4 ]; then
+            echo "ERROR: only $READY/4 pods Running after 30 min"
+            kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+            exit 1
+          fi
+
+      - name: "[JobSet] Stream coordinator pod logs"
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          JOB_NAME: ${{ steps.job.outputs.JOB_NAME }}
+        run: |
+          POD_0=$(kubectl get pods \
+            -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME,batch.kubernetes.io/job-completion-index=0" \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD_0" ]; then
+            echo "ERROR: could not locate coordinator pod (completion index 0) for JobSet $JOB_NAME"
+            kubectl get jobset "$JOB_NAME" -o wide || true
+            kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o wide || true
+            exit 1
+          fi
+          echo "Tailing logs from coordinator pod $POD_0..."
+          kubectl logs -f "$POD_0" -c jax-tpu || true
+
+      # Refresh GCP + GKE creds before Confirm: stream-logs above can run >60 min
+      # (training ~110 min on 16 chips), exceeding default access-token TTL (3600s)
+      # when the SA isn't in the iam.allowServiceAccountCredentialLifetimeExtension
+      # org-policy allowlist. Without this, the next kubectl call falls into
+      # `Unauthorized` and Confirm reports a false-negative even when the JobSet
+      # actually reached Completed condition.
+      - name: "[JobSet] Refresh GCP creds before confirm"
+        if: inputs.target_cluster == 'tpu_training'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER) }}
+          service_account: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT) }}
+          access_token_lifetime: 1800s
+
+      - name: "[JobSet] Refresh GKE creds before confirm"
+        if: inputs.target_cluster == 'tpu_training'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_CLUSTER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER) }}
+          location: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_LOCATION_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION) }}
+
+      - name: "[JobSet] Confirm terminal condition + dump on failure"
+        if: inputs.target_cluster == 'tpu_training'
+        env:
+          JOB_NAME: ${{ steps.job.outputs.JOB_NAME }}
+        run: |
+          if kubectl wait --for=condition=Completed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet $JOB_NAME Completed (in-pod compare_loss_100step.py exited 0)."
+            exit 0
+          fi
+          echo "JobSet did not reach Completed; checking Failed..."
+          if kubectl wait --for=condition=Failed jobset/"$JOB_NAME" --timeout=60s 2>/dev/null; then
+            echo "JobSet $JOB_NAME Failed. Dumping last 50 lines from each pod:"
+            for p in $(kubectl get pods -l "jobset.sigs.k8s.io/jobset-name=$JOB_NAME" -o name); do
+              echo "=== $p ==="
+              kubectl logs --tail=50 "$p" -c jax-tpu || true
+            done
+            exit 1
+          fi
+          echo "ERROR: JobSet neither Completed nor Failed within 60s. Status:"
+          kubectl get jobset "$JOB_NAME" -o yaml | tail -30
+          exit 1
+
+      - name: "[JobSet] Cleanup"
+        if: always() && inputs.target_cluster == 'tpu_training'
+        env:
+          JOB_NAME: ${{ steps.job.outputs.JOB_NAME }}
+        run: |
+          kubectl delete jobset "$JOB_NAME" --ignore-not-found || true
 
       - name: Acquire pool
+        if: inputs.target_cluster != 'tpu_training'
         id: acquire
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
@@ -108,6 +253,7 @@ jobs:
           source .github/ci/acquire-lossval16-pool.sh
 
       - name: Stage run.env + clone branch on all 4 pods
+        if: inputs.target_cluster != 'tpu_training'
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
           BRANCH: ${{ inputs.branch || 'main' }}
@@ -193,6 +339,7 @@ jobs:
           echo "Stage + clone done on 4 pods"
 
       - name: Launch trainer detached on all 4 pods
+        if: inputs.target_cluster != 'tpu_training'
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
         run: |
@@ -211,6 +358,7 @@ jobs:
           echo "Trainers launched on all 4 pods"
 
       - name: Poll status + heartbeat lease
+        if: inputs.target_cluster != 'tpu_training'
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
           JOB_NAME: ${{ steps.job.outputs.name }}
@@ -380,7 +528,7 @@ jobs:
           done
 
       - name: Stream pod-0 final log (always)
-        if: always()
+        if: always() && inputs.target_cluster != 'tpu_training'
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
         run: |
@@ -388,7 +536,7 @@ jobs:
           kubectl exec ci-lossval16-pool-0 -c jax-tpu -- cat "/tmp/ramdisk/runs/$RUN_ID/log" 2>/dev/null | tail -200 || true
 
       - name: Collect per-pod logs as artifact
-        if: always()
+        if: always() && inputs.target_cluster != 'tpu_training'
         env:
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}
         run: |
@@ -399,7 +547,7 @@ jobs:
           ls -la logs/
 
       - name: Upload per-pod logs
-        if: always()
+        if: always() && inputs.target_cluster != 'tpu_training'
         uses: actions/upload-artifact@v4
         with:
           name: lossval16-pool-logs-${{ github.run_number }}-${{ github.run_attempt }}
@@ -407,7 +555,7 @@ jobs:
           retention-days: 14
 
       - name: Release pool
-        if: always()
+        if: always() && inputs.target_cluster != 'tpu_training'
         env:
           JOB_NAME: ${{ steps.job.outputs.name }}
           RUN_ID: ${{ steps.acquire.outputs.RUN_ID }}

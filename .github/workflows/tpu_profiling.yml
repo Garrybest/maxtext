@@ -5,6 +5,12 @@ name: TPU Profiling (64 chips)
 on:
   workflow_dispatch:
     inputs:
+      target_cluster:
+        description: "Cluster target (default = repo secrets, lingbo = PR #156 lingbo, tpu_training = on-demand JobSet on tpu_training cluster)"
+        required: false
+        type: choice
+        default: default
+        options: [default, lingbo, tpu_training]
       branch:
         description: "Branch to run on (defaults to the branch you triggered from)"
         required: false
@@ -136,14 +142,14 @@ jobs:
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER) }}
+          service_account: ${{ inputs.target_cluster == 'tpu_training' && secrets.GCP_SERVICE_ACCOUNT_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT) }}
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
-          cluster_name: ${{ secrets.GKE_CLUSTER }}
-          location: ${{ secrets.GKE_LOCATION }}
+          cluster_name: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_CLUSTER_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER) }}
+          location: ${{ inputs.target_cluster == 'tpu_training' && secrets.GKE_LOCATION_TPU_TRAINING || (inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION) }}
 
       - name: Generate unique job name
         id: job
