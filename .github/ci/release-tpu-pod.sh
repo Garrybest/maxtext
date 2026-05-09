@@ -26,13 +26,52 @@ fi
 
 echo "Releasing pod ${POD} (owner: ${JOB_NAME})..."
 
-# --- Owner check ---
-actual_owner=$(kubectl get pod "${POD}" \
-  -o jsonpath='{.metadata.annotations.ci\.primatrix/claimed-by}' 2>/dev/null || true)
+# --- Owner check (with retries on transient kubectl failures) ---
+# A previous version captured `kubectl get` with `2>/dev/null || true` and
+# treated empty output the same as "not our pod". GHA-runner→GKE kubectl
+# calls flake often enough (auth refresh, API server pressure during cluster
+# reconciliation) that this routinely produced empty owner reads, the script
+# silently exit 0'd, and pods leaked their `status=busy` claim until the
+# 165-min watchdog reaped them — capping effective pool concurrency.
+#
+# The fix below distinguishes three cases and fails loud (or attempts the
+# idempotent merge patch anyway) instead of silently skipping:
+#   - kubectl read OK, owner == JOB_NAME    → proceed with release
+#   - kubectl read OK, owner == ""          → already released; exit 0
+#   - kubectl read OK, owner == other-job   → not ours; exit 0 with WARNING
+#   - kubectl read fails 3× in a row        → emit ::warning::, fall through
+#                                             to patch (idempotent, mutates
+#                                             only annotations we set; the
+#                                             readback at the bottom will
+#                                             still flag any real leak).
+fetch_owner() {
+  kubectl get pod "${POD}" \
+    -o jsonpath='{.metadata.annotations.ci\.primatrix/claimed-by}' 2>/dev/null
+}
 
-if [[ "${actual_owner}" != "${JOB_NAME}" ]]; then
-  echo "WARNING: pod ${POD} is owned by '${actual_owner}', not '${JOB_NAME}' — skipping release"
-  exit 0
+actual_owner=""
+fetch_ok=0
+for attempt in 1 2 3; do
+  if owner_out=$(fetch_owner); then
+    actual_owner="${owner_out}"
+    fetch_ok=1
+    break
+  fi
+  echo "kubectl get pod ${POD} failed (attempt ${attempt}/3); retrying..." >&2
+  sleep 2
+done
+
+if [[ ${fetch_ok} -eq 1 ]]; then
+  if [[ -z "${actual_owner}" ]]; then
+    echo "Pod ${POD} has no claim annotation; nothing to release"
+    exit 0
+  fi
+  if [[ "${actual_owner}" != "${JOB_NAME}" ]]; then
+    echo "WARNING: pod ${POD} is owned by '${actual_owner}', not '${JOB_NAME}' — skipping release"
+    exit 0
+  fi
+else
+  echo "::warning::Could not verify owner for pod ${POD} after 3 retries; attempting patch anyway" >&2
 fi
 
 # --- Kill user processes (preserve sleep infinity and PID 1) ---
