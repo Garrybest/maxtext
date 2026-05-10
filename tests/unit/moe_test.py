@@ -1375,5 +1375,155 @@ class FuseGateUpProjTest(unittest.TestCase):
     )
 
 
+class TokenPermutationOptTest(unittest.TestCase):
+  """Math-only tests for the PR2 permute() optimizations.
+
+  These run without TPU and validate the algebraic equivalences that the
+  refactor relies on:
+
+    1. ``searchsorted(diff)`` over an argsort-sorted experts vector produces
+       the same per-expert counts as ``jnp.bincount``.
+  """
+
+  def test_searchsorted_diff_equals_bincount(self):
+    rng = jax.random.PRNGKey(0)
+    num_experts = 17  # deliberately not a power of 2
+    n_tokens = 1024
+    for seed in range(5):
+      key = jax.random.fold_in(rng, seed)
+      flatten_selected_experts = jax.random.randint(key, shape=(n_tokens,), minval=0, maxval=num_experts, dtype=jnp.int32)
+      sorted_idx = jnp.argsort(flatten_selected_experts)
+      sorted_experts = flatten_selected_experts[sorted_idx]
+
+      # Old path.
+      bincount_group_size = jnp.bincount(flatten_selected_experts, length=num_experts)
+
+      # New path.
+      boundaries = jnp.searchsorted(sorted_experts, jnp.arange(num_experts + 1))
+      diff_group_size = jnp.diff(boundaries)
+
+      self.assertEqual(bincount_group_size.shape, diff_group_size.shape)
+      self.assertTrue(
+          jnp.array_equal(bincount_group_size, diff_group_size),
+          (
+              f"searchsorted+diff disagrees with bincount on seed {seed}: "
+              f"bincount={bincount_group_size}, diff={diff_group_size}"
+          ),
+      )
+
+      # Sanity: total token count is preserved.
+      self.assertEqual(int(jnp.sum(diff_group_size)), n_tokens)
+
+    # Zero-bin edge case: ensure searchsorted+diff handles empty experts at
+    # boundaries (expert 0 and expert num_experts-1 receive zero tokens).
+    num_experts_zb = 8
+    flatten_selected_experts = jnp.array([1, 1, 2, 3, 3, 3, 4, 5, 6, 6], dtype=jnp.int32)
+    sorted_idx = jnp.argsort(flatten_selected_experts)
+    sorted_experts = flatten_selected_experts[sorted_idx]
+    boundaries = jnp.searchsorted(sorted_experts, jnp.arange(num_experts_zb + 1))
+    group_size_new = jnp.diff(boundaries)
+    group_size_ref = jnp.bincount(flatten_selected_experts, length=num_experts_zb)
+    self.assertTrue(
+        jnp.array_equal(group_size_new, group_size_ref),
+        f"zero-bin case: searchsorted+diff={group_size_new} != bincount={group_size_ref}",
+    )
+    # Verify expert 0 and expert num_experts_zb-1 indeed got zero tokens.
+    self.assertEqual(int(group_size_new[0]), 0)
+    self.assertEqual(int(group_size_new[-1]), 0)
+
+
+class TokenPermutationBackwardTest(unittest.TestCase):
+  """TPU-only test that the backward pass through permute->op->unpermute
+  performs only a single jnp.argsort (the one in permute's forward).
+
+  Before PR2, unpermute called jnp.argsort(sorted_selected_experts) on every
+  forward, and _sort_activations_custom's bwd called jnp.argsort again, so
+  the trace through one permute+one unpermute had at least 3 argsort calls.
+  After PR2 only the eager argsort in permute (and the inv_perm argsort
+  staged alongside it) remain, so a forward+backward should observe
+  exactly 2 argsort traces and zero additional ones in the bwd.
+  """
+
+  @pytest.mark.tpu_only
+  def test_backward_no_extra_argsort(self):
+    from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+
+    extra_args = get_decoupled_parallelism_overrides()
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="permute_bwd_no_argsort_test",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        dtype="bfloat16",
+        megablox=False,
+        sparse_matmul=False,
+        per_device_batch_size=1,
+        max_target_length=64,
+        **extra_args,
+    )
+    rngs = nnx.Rngs(params=0)
+    devices_array = maxtext_utils.create_device_mesh(cfg)
+    mesh = Mesh(devices_array, cfg.mesh_axes)
+    model = moe.RoutedMoE(
+        config=cfg,
+        num_experts=cfg.num_experts,
+        num_experts_per_tok=cfg.num_experts_per_tok,
+        mesh=mesh,
+        kernel_init=nd_dense_init(1.0, "fan_in", "truncated_normal"),
+        kernel_axes=("embed", "mlp"),
+        dtype=cfg.dtype,
+        rngs=rngs,
+    )
+
+    bsz = int(cfg.per_device_batch_size) * jax.device_count()
+    seq = cfg.max_target_length
+    emb = cfg.base_emb_dim
+    rng = jax.random.PRNGKey(0)
+    rng_in, rng_logits = jax.random.split(rng)
+    inputs = jax.random.normal(rng_in, (bsz, seq, emb), dtype=cfg.dtype)
+    gate_logits = jax.random.normal(rng_logits, (bsz, seq, cfg.num_experts), dtype=jnp.float32)
+
+    original_argsort = jnp.argsort
+    call_count = [0]
+
+    def counting_argsort(*args, **kwargs):
+      call_count[0] += 1
+      return original_argsort(*args, **kwargs)
+
+    def loss_fn(x):
+      sorted_inputs, sorted_idx, inv_perm, weights, *_ = model.permute(x, gate_logits, None, cfg.use_custom_sort_vjp)
+      # Trivial op so backward must flow through both permute and unpermute.
+      intermediate = sorted_inputs * 1.0
+      out = model.unpermute(
+          intermediate,
+          sorted_idx,
+          inv_perm,
+          weights,
+          batch_size=bsz,
+          sequence_length=seq,
+          use_custom_sort_vjp=cfg.use_custom_sort_vjp,
+      )
+      if isinstance(out, tuple):
+        out = out[0]
+      return jnp.sum(out.astype(jnp.float32))
+
+    # Patch jnp.argsort *only inside the moe module* so we count just the
+    # argsort calls that originate in permute/unpermute (not in the model
+    # init or in the test scaffolding).
+    with patch("maxtext.layers.moe.jnp.argsort", side_effect=counting_argsort):
+      _, _ = jax.value_and_grad(loss_fn)(inputs)
+
+    # PR2 invariant: exactly 2 argsort traces (sorted_idx + inv_perm in
+    # permute fwd). The bwd of _gather_with_precomputed_inverse must NOT
+    # add a third.
+    self.assertEqual(
+        call_count[0],
+        2,
+        f"Expected exactly 2 jnp.argsort calls in moe forward+backward, got {call_count[0]}. "
+        "A third call indicates the backward pass is recomputing argsort "
+        "instead of reusing the precomputed inverse permutation.",
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

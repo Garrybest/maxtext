@@ -100,6 +100,32 @@ def _sort_activations_custom_bwd(residuals: jax.Array, grads: jax.Array) -> tupl
 _sort_activations_custom.defvjp(_sort_activations_custom_fwd, _sort_activations_custom_bwd)
 
 
+@jax.custom_vjp
+def _gather_with_precomputed_inverse(
+    inputs: jax.Array, sort_indices: jax.Array, inv_sort_indices: jax.Array
+) -> jax.Array:
+  """Gather with precomputed inverse permutation for the backward pass.
+
+  Mathematically equivalent to ``inputs[sort_indices]``, but the custom VJP
+  reuses the caller-supplied ``inv_sort_indices`` to scatter gradients,
+  avoiding a redundant ``jnp.argsort`` in the backward pass.
+  """
+  return inputs[sort_indices, ...]
+
+
+def _gather_with_precomputed_inverse_fwd(
+    inputs: jax.Array, sort_indices: jax.Array, inv_sort_indices: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+  return inputs[sort_indices, ...], inv_sort_indices
+
+
+def _gather_with_precomputed_inverse_bwd(inv_sort_indices: jax.Array, grads: jax.Array) -> tuple[jax.Array, None, None]:
+  return grads[inv_sort_indices, ...], None, None
+
+
+_gather_with_precomputed_inverse.defvjp(_gather_with_precomputed_inverse_fwd, _gather_with_precomputed_inverse_bwd)
+
+
 def get_batchsplit_init_kernel_axes():
   return (
       ("embed_no_exp", "fsdp_transpose_only", "expert_only"),
@@ -724,9 +750,10 @@ class RoutedMoE(nnx.Module):
     if roll_to_expert_id is not None:
       flatten_selected_experts = (flatten_selected_experts - roll_to_expert_id) % self.num_experts
     sorted_selected_experts = jnp.argsort(flatten_selected_experts)
+    inv_perm = jnp.argsort(sorted_selected_experts)
     # sort inputs for number of selected experts
     replicated_inputs_2d = jnp.repeat(inputs_2d, self.num_experts_per_tok, axis=0)
-    sorted_inputs = _sort_activations(replicated_inputs_2d, sorted_selected_experts, use_custom_sort_vjp).astype(
+    sorted_inputs = _gather_with_precomputed_inverse(replicated_inputs_2d, sorted_selected_experts, inv_perm).astype(
         self.dtype
     )
 
@@ -737,17 +764,22 @@ class RoutedMoE(nnx.Module):
       flatten_weights = jnp.ravel(weights)[:, None]
       sorted_weights = _sort_activations(flatten_weights, sorted_selected_experts, use_custom_sort_vjp).squeeze(-1)
 
-    group_size = jnp.bincount(flatten_selected_experts, length=self.num_experts)
-    # Return the experts for each sorted input.
-    expert_indices = jnp.arange(self.num_experts)
-    sorted_experts = jnp.repeat(
-        expert_indices,
-        repeats=group_size,
-        total_repeat_length=flatten_selected_experts.shape[0],
-    )
+    # group_size via searchsorted+diff on the already-sorted experts. This
+    # avoids the bincount op (which materializes a num_experts-wide histogram
+    # via scatter-adds) and reuses the sorted_experts array we already need
+    # for the sorted_experts return value below.
+    # Invariant: sorted_experts is non-decreasing because
+    # sorted_selected_experts = argsort(flatten_selected_experts).
+    # This is what makes searchsorted(sorted_experts, arange(K+1)) correct.
+    sorted_experts = flatten_selected_experts[sorted_selected_experts]
+    boundaries = jnp.searchsorted(sorted_experts, jnp.arange(self.num_experts + 1))
+    group_size = jnp.diff(boundaries)
+    # Note: inv_perm is inserted between sorted_selected_experts and weights
+    # because they are inverse permutations of each other and are conceptually paired.
     return (
         sorted_inputs,
         sorted_selected_experts,
+        inv_perm,
         weights,
         group_size,
         sorted_experts,
@@ -760,6 +792,7 @@ class RoutedMoE(nnx.Module):
       self,
       intermediate,
       sorted_selected_experts,
+      inv_perm,
       weights,
       batch_size,
       sequence_length,
@@ -767,11 +800,12 @@ class RoutedMoE(nnx.Module):
   ):
     """Unpermute tokens to original order and combine weights."""
 
-    unsort_intermediate = _sort_activations(
-        intermediate,
-        jnp.argsort(sorted_selected_experts),
-        use_custom_sort_vjp,
-    )
+    # The forward gather index here is `inv_perm` (the inverse of the sort
+    # done in permute), and the residual stashed for the backward scatter is
+    # `sorted_selected_experts` (the original sort indices). This matches the
+    # math of the prior implementation, which computed argsort(sorted_idx)
+    # eagerly and then relied on a custom VJP to argsort it again on bwd.
+    unsort_intermediate = _gather_with_precomputed_inverse(intermediate, inv_perm, sorted_selected_experts)
     reshaped_weights = jnp.reshape(weights, (-1, self.num_experts_per_tok))
     reshaped_intermediate = jnp.reshape(
         unsort_intermediate,
@@ -1250,6 +1284,7 @@ class RoutedMoE(nnx.Module):
         (
             x,
             sorted_selected_experts,
+            inv_perm,
             weights,
             group_sizes,
             selected_experts,
@@ -1274,6 +1309,7 @@ class RoutedMoE(nnx.Module):
         (
             x,
             sorted_selected_experts,
+            inv_perm,
             weights,
             group_sizes,
             selected_experts,
@@ -1511,6 +1547,7 @@ class RoutedMoE(nnx.Module):
         output = self.unpermute(
             intermediate_output,
             sorted_selected_experts,
+            inv_perm,
             unpermute_weights,
             batch_size=batch_size,
             sequence_length=sequence_length,
@@ -1579,6 +1616,7 @@ class RoutedMoE(nnx.Module):
         output = self.unpermute(
             intermediate_output,
             sorted_selected_experts,
+            inv_perm,
             unpermute_weights,
             batch_size=batch_size,
             sequence_length=sequence_length,

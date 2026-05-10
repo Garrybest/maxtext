@@ -104,3 +104,11 @@ mtp_loss_scaling_factor: 0.1          # MTP loss weight
 
 # Performance: fuse W_gate and W_up into single GMM call (PR1)
 fuse_gate_up_proj: true
+
+# Performance: GMM tile sizing for the wo (down) projection (PR2).
+# moe_ffn_hidden_size = base_moe_mlp_dim = 512, so the default tile of 1024
+# wastes ~50% of bandwidth. Match the expert hidden dim to keep the GMM
+# tiles fully utilized in both forward and backward passes.
+wo_tile_fwd_embed_dim: 512       # match moe_ffn_hidden_size to avoid 50% bandwidth waste
+wo_tile_dlhs_mlp_dim: 512        # backward dlhs: n=mlp_dim=512, avoid 50% n-tile waste
+wo_tile_drhs_embed_dim: 512      # backward drhs (TGMM): k=mlp_dim=512, avoid 50% k-tile waste
