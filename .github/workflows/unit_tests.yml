@@ -463,6 +463,24 @@ jobs:
             [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ] && [ "$BLOCKWISE_FP8_EXIT" -eq 0 ] && [ "$MEG_EXIT" -eq 0 ]
           '
 
+      # GCP access tokens default to a 1h TTL, but stage 1 + downstream stages
+      # commonly push step 10 past 60 min. Re-authenticate right before release
+      # so kubectl owner-read / patch / readback inside release-tpu-pod.sh do
+      # not hit Unauthorized — the silent path that lets the claim leak.
+      - name: Re-authenticate to GCP (refresh token before release)
+        if: always() && env.USE_TPU_POOL == 'true' && steps.acquire.outputs.pod != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Re-fetch GKE credentials (refresh kubeconfig before release)
+        if: always() && env.USE_TPU_POOL == 'true' && steps.acquire.outputs.pod != ''
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
+          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
+
       - name: Release TPU pod
         if: always() && env.USE_TPU_POOL == 'true' && steps.acquire.outputs.pod != ''
         env:
