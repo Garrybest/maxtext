@@ -585,13 +585,15 @@ def save_weight_files(
       # fork's COW semantics avoid copying the large weight arrays.
       global _MP_SHARDS  # pylint: disable=global-statement
       _MP_SHARDS = shards
-      ctx = mp.get_context("fork")
-      num_workers = min(parallel_threads, len(shards))
-      with ctx.Pool(num_workers) as pool:
-        tasks = [(name, local_dir_to_save_to) for name in shards]
-        for name, path in pool.imap_unordered(_mp_save_shard_worker, tasks):
-          max_logging.log(f"   Saved {name} to {path}")
-      _MP_SHARDS = {}
+      try:
+        ctx = mp.get_context("fork")
+        num_workers = min(parallel_threads, len(shards))
+        with ctx.Pool(num_workers) as pool:
+          tasks = [(name, local_dir_to_save_to) for name in shards]
+          for name, path in pool.imap_unordered(_mp_save_shard_worker, tasks):
+            max_logging.log(f"   Saved {name} to {path}")
+      finally:
+        _MP_SHARDS = {}
     else:
       # Remote output or non-zero process: keep ThreadPoolExecutor (IO-bound)
       with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
