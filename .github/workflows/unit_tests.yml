@@ -209,7 +209,14 @@ jobs:
             curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt 2>&1 | tail -1
           '
 
-          # 3. Resolve dump dir + pre-copy to ramdisk + run tests
+          # 3. Resolve dump dir + pre-copy to ramdisk + run tests.
+          # The inner kubectl exec runs ~50–60 minutes — long enough to cross
+          # GHA OAuth token refresh and GKE API-server churn — so its exit
+          # code is not trustworthy (cf. PR #172 silent kubectl flake). We
+          # capture inner stdout and rely on a verdict sentinel emitted by
+          # the gate at the end of the bash script.
+          INNER_LOG=$(mktemp)
+          set +e +o pipefail
           kubectl exec "$POD" -- timeout 7200 bash -c '
             . /opt/ci-env/bin/activate
             cd /workspace/maxtext
@@ -460,8 +467,30 @@ jobs:
                 -v --timeout=300 \
                 2>&1 || MEG_EXIT=$?
 
-            [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ] && [ "$BLOCKWISE_FP8_EXIT" -eq 0 ] && [ "$MEG_EXIT" -eq 0 ]
-          '
+            # Final gate — OUTER greps for "__CI_VERDICT__: PASS " in stdout
+            # rather than trusting kubectl exec exit code, since the long-lived
+            # SPDY stream can drop silently on token refresh / API churn.
+            EXITS="UNIT=$UNIT_TEST_EXIT ENV=$ENV_SMOKE_EXIT GLA=$GLA_EXIT MLA=$MLA_EXIT MOE=$MOE_EXIT FP8=$BLOCKWISE_FP8_EXIT MEG=$MEG_EXIT"
+            if [ "$UNIT_TEST_EXIT" -eq 0 ] && [ "$ENV_SMOKE_EXIT" -eq 0 ] && [ "$GLA_EXIT" -eq 0 ] && [ "$MLA_EXIT" -eq 0 ] && [ "$MOE_EXIT" -eq 0 ] && [ "$BLOCKWISE_FP8_EXIT" -eq 0 ] && [ "$MEG_EXIT" -eq 0 ]; then
+              echo "__CI_VERDICT__: PASS $EXITS"
+            else
+              echo "__CI_VERDICT__: FAIL $EXITS"
+              exit 1
+            fi
+          ' 2>&1 | tee "$INNER_LOG"
+          KUBE_EXIT=${PIPESTATUS[0]}
+          set -e -o pipefail
+
+          if ! grep -q "^__CI_VERDICT__: PASS " "$INNER_LOG"; then
+            echo "::error::Unit-tests inner script did not emit '__CI_VERDICT__: PASS' (kubectl exit=$KUBE_EXIT)."
+            echo "::error::Either a test stage failed, or the inner bash terminated before the gate (e.g. SPDY drop, pod eviction, OOM)."
+            echo "----- last 80 lines of inner output -----"
+            tail -80 "$INNER_LOG" || true
+            rm -f "$INNER_LOG"
+            exit 1
+          fi
+          echo "Verdict: $(grep "^__CI_VERDICT__: " "$INNER_LOG" | tail -1)"
+          rm -f "$INNER_LOG"
 
       # GCP access tokens default to a 1h TTL, but stage 1 + downstream stages
       # commonly push step 10 past 60 min. Re-authenticate right before release
