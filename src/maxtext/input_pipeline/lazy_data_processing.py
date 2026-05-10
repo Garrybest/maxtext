@@ -23,6 +23,8 @@ from maxtext.input_pipeline._lazy_datasource import MultiShardLazyDataSource
 from maxtext.input_pipeline._lazy_blending import LazyBlendedDataSource
 from maxtext.input_pipeline.multihost_dataloading import MultiHostDataLoadIterator
 
+_SCATTER_SUFFIX = ".scatter"
+
 
 # ---------------------------------------------------------------------------
 # Config parsing helpers
@@ -78,6 +80,40 @@ def _should_split(split: list[float] | None) -> bool:
   return max(split) / sum(split) != 1.0
 
 
+def _dataset_name_from_path(path: str) -> str:
+  """Extract a comparable dataset name from config path variants.
+
+  Supports bare dataset names (used with lazy_data_root), direct .scatter
+  paths, and .scatter/<hash> paths used by native mdata layouts.
+  """
+  path_normalized = path.rstrip("/")
+  parent = os.path.dirname(path_normalized)
+  if parent.endswith(_SCATTER_SUFFIX):
+    # Native mdata organizes hash-backed scatters as
+    # ``{id}_{dataset}.scatter/<hash>``. Strip the leading ID prefix and keep
+    # the dataset name for config matching.
+    ds_name = os.path.basename(parent)[: -len(_SCATTER_SUFFIX)]
+    if "_" in ds_name:
+      return ds_name.split("_", 1)[1]
+    return ds_name
+
+  base = os.path.basename(path_normalized)
+  if base.endswith(_SCATTER_SUFFIX):
+    return base[: -len(_SCATTER_SUFFIX)]
+  return base
+
+
+def _resolve_no_attnmask_ids(files_str: str, no_attnmask_str: str) -> set[int]:
+  """Resolve lazy_no_attnmask_data dataset names to blended dataset indices."""
+  no_attnmask_names = {n.strip() for n in no_attnmask_str.split(",") if n.strip()}
+  no_attnmask_ids = set()
+  paths, _ = _parse_datasets_and_weights(files_str)
+  for idx, path in enumerate(paths):
+    if _dataset_name_from_path(path) in no_attnmask_names:
+      no_attnmask_ids.add(idx)
+  return no_attnmask_ids
+
+
 # ---------------------------------------------------------------------------
 # Data source construction
 # ---------------------------------------------------------------------------
@@ -94,7 +130,7 @@ def _resolve_mode(config, scatter_path: str) -> str:
   bfd_pack = config.lazy_bfd_pack.strip()
   if not bfd_pack:
     return config.lazy_loader_mode
-  ds_name = os.path.basename(scatter_path).replace(".scatter", "")
+  ds_name = _dataset_name_from_path(scatter_path)
   if bfd_pack == "ALL" or ds_name in {n.strip() for n in bfd_pack.split(",")}:
     return "pack"
   return "sliding_window"
@@ -166,9 +202,6 @@ def _build_blend(config, paths: list[str], weights: list[float] | None, stage: s
   if size <= 0:
     raise ValueError(f"Computed blend size is {size}, must be positive")
 
-  if len(sources) == 1:
-    return sources[0]
-
   shuffle_seed = config.lazy_blend_shuffle_seed if stage == "train" else -1
   shuffle_only_dataset = config.lazy_blend_shuffle_only_dataset if stage == "train" else False
   cache_dir = config.lazy_blend_cache_dir or None
@@ -184,7 +217,7 @@ def _build_blend(config, paths: list[str], weights: list[float] | None, stage: s
   )
 
 
-def _build_pipeline(config, source, global_mesh, process_indices, files_str=""):
+def _build_pipeline(config, source, global_mesh, process_indices, files_str="", repeat_epochs: int = 1):
   """Wrap a data source in the standard Grain preprocessing pipeline.
 
   Args:
@@ -194,10 +227,17 @@ def _build_pipeline(config, source, global_mesh, process_indices, files_str=""):
   """
   eod_id = config.lazy_eos_token_id
   dataset = grain.MapDataset.source(source)
+  if repeat_epochs > 1:
+    dataset = dataset.repeat(repeat_epochs)
 
   # Host sharding — fold by scatter (antllm configure_data.py:311-313)
   scatter = abs(config.lazy_loader_scatter)
   if scatter > 1:
+    if len(process_indices) < scatter:
+      raise ValueError(
+          f"loader_scatter={config.lazy_loader_scatter} requires at least {scatter} processes, "
+          f"but only {len(process_indices)} are loading data"
+      )
     host_count = len(process_indices) // scatter
     host_index = process_indices.index(jax.process_index()) // scatter
   else:
@@ -210,12 +250,7 @@ def _build_pipeline(config, source, global_mesh, process_indices, files_str=""):
   no_attnmask_ids = set()
   no_attnmask_str = getattr(config, "lazy_no_attnmask_data", "")
   if no_attnmask_str and config.reset_attention_mask and files_str:
-    no_attnmask_names = {n.strip() for n in no_attnmask_str.split(",") if n.strip()}
-    paths, _ = _parse_datasets_and_weights(files_str)
-    for idx, path in enumerate(paths):
-      ds_name = os.path.basename(path).replace(".scatter", "")
-      if ds_name in no_attnmask_names:
-        no_attnmask_ids.add(idx)
+    no_attnmask_ids = _resolve_no_attnmask_ids(files_str, no_attnmask_str)
 
   # The lazy sources output seq_length+1 tokens (antllm convention).
   # Use MegatronSplitInputsTargets to split into inputs[:-1] / targets[1:].
@@ -226,6 +261,15 @@ def _build_pipeline(config, source, global_mesh, process_indices, files_str=""):
           eod_mask_loss=config.eod_mask_loss,
           no_attnmask_dataset_ids=no_attnmask_ids if no_attnmask_ids else None,
           min_segment_length=input_pipeline_utils.megatron_min_segment_length(config),
+      )
+  )
+
+  # Convert to IterDataset, then multiprocess prefetch + batch
+  # (same pattern as mmap_npy in grain_data_processing._mmap_pretrain_pipeline)
+  dataset = dataset.to_iter_dataset(
+      read_options=grain.ReadOptions(
+          num_threads=config.grain_num_threads,
+          prefetch_buffer_size=config.grain_prefetch_buffer_size,
       )
   )
 
@@ -261,10 +305,6 @@ class SplitDataSource:
 
   def __getitem__(self, idx):
     return self._source[idx % self._size + self._start]
-
-  def set_num_epochs(self, num_epochs: int):
-    """Delegate to the inner source."""
-    _set_source_num_epochs(self._source, num_epochs)
 
 
 def _split_source(source, split_ratios: list[float]):
@@ -341,47 +381,26 @@ def _compute_num_epochs(config, total_samples: int, stage: str = "train") -> int
   return 1
 
 
-def _set_source_num_epochs(source, num_epochs: int):
-  """Set num_epochs on the outermost data source.
-
-  After the source is fully constructed (blending + split), we know the
-  real total_samples and can compute the correct num_epochs.  This function
-  calls set_num_epochs() on the **outermost** source so that Grain sees
-  the inflated __len__ and iterates enough indices for multi-epoch training.
-
-  Key insight: epoch inflation must happen at the outermost level that
-  Grain directly iterates.  Setting it on sub-sources inside a blend is
-  useless because Grain only sees the blend's __len__.
-
-  For blended sources, the blend epoch is propagated to sub-sources via
-  sample_idx offset in LazyBlendedDataSource.__getitem__, which triggers
-  per-epoch shuffle rotation in sub-sources with loader_online_shuffle.
-  """
-  if num_epochs <= 1:
-    return
-
-  if hasattr(source, "set_num_epochs"):
-    source.set_num_epochs(num_epochs)
-
-
 # ---------------------------------------------------------------------------
 # Public iterator factories
 # ---------------------------------------------------------------------------
 
+_pending_eval_source = None
 
-def make_lazy_train_iterator(config, global_mesh, process_indices):
-  """Create a training data iterator from .scatter/.lazy data."""
+
+def _build_train_eval_sources(config, process_index):
+  """Build train (and optionally eval) sources, sharing the underlying blend."""
   paths, weights = _parse_datasets_and_weights(config.lazy_train_files)
   if not paths:
     raise ValueError("lazy_train_files must be specified for dataset_type='lazy'")
 
-  process_index = jax.process_index()
-
   source = _build_blend(config, paths, weights, "train", process_index)
 
   split = _parse_split(config.lazy_split)
+  train_source = source
+  eval_source = None
+
   if _should_split(split):
-    # If separate valid/test files are specified, zero out those split ratios
     if config.lazy_valid_files:
       split[1] = 0.0
     if config.lazy_test_files:
@@ -391,40 +410,47 @@ def make_lazy_train_iterator(config, global_mesh, process_indices):
     parts = _split_source(source, split)
     if parts[0] is None:
       raise ValueError("Split resulted in empty train partition")
-    source = parts[0]
+    train_source = parts[0]
+    eval_source = parts[1]
 
-  # Compute and apply num_epochs after the source is fully constructed (incl.
-  # blending + split), so we have the accurate total_samples for the formula.
-  # _total_samples is the single-epoch sample count; _num_epochs inflates
-  # __len__ so Grain iterates enough indices for the full training run.
-  num_epochs = _compute_num_epochs(config, len(source), "train")
-  _set_source_num_epochs(source, num_epochs)
+  return train_source, eval_source
 
-  dataset = _build_pipeline(config, source, global_mesh, process_indices, files_str=config.lazy_train_files)
+
+def make_lazy_train_iterator(config, global_mesh, process_indices):
+  """Create a training data iterator from .scatter/.lazy data."""
+  global _pending_eval_source
+  train_source, eval_source = _build_train_eval_sources(config, jax.process_index())
+  _pending_eval_source = eval_source
+
+  num_epochs = _compute_num_epochs(config, len(train_source), "train")
+
+  dataset = _build_pipeline(
+      config,
+      train_source,
+      global_mesh,
+      process_indices,
+      files_str=config.lazy_train_files,
+      repeat_epochs=num_epochs,
+  )
   return MultiHostDataLoadIterator(dataset, global_mesh, config.generate_padding_batch_train)
 
 
 def make_lazy_eval_iterator(config, global_mesh, process_indices):
   """Create an eval data iterator from .scatter/.lazy data."""
-  # Mode A: separate eval files
+  global _pending_eval_source
   process_index = jax.process_index()
+
+  # Mode A: separate eval files
   if config.lazy_valid_files:
     paths, weights = _parse_datasets_and_weights(config.lazy_valid_files)
     source = _build_blend(config, paths, weights, "valid", process_index)
     dataset = _build_pipeline(config, source, global_mesh, process_indices, files_str=config.lazy_valid_files)
     return MultiHostDataLoadIterator(dataset, global_mesh, config.generate_padding_batch_eval)
 
-  # Mode B: split-from-train
-  split = _parse_split(config.lazy_split)
-  if _should_split(split) and split[1] > 0:
-    paths, weights = _parse_datasets_and_weights(config.lazy_train_files)
-    if not paths:
-      return None
-    source = _build_blend(config, paths, weights, "train", process_index)
-    parts = _split_source(source, split)
-    if parts[1] is None:
-      return None
-    dataset = _build_pipeline(config, parts[1], global_mesh, process_indices, files_str=config.lazy_train_files)
-    return MultiHostDataLoadIterator(dataset, global_mesh, config.generate_padding_batch_eval)
-
-  return None
+  # Mode B: split-from-train — reuse source built by make_lazy_train_iterator
+  eval_source = _pending_eval_source
+  _pending_eval_source = None
+  if eval_source is None:
+    return None
+  dataset = _build_pipeline(config, eval_source, global_mesh, process_indices, files_str=config.lazy_train_files)
+  return MultiHostDataLoadIterator(dataset, global_mesh, config.generate_padding_batch_eval)

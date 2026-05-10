@@ -30,11 +30,17 @@ Usage:
       --antllm-dir /path/to/antllm_outputs/dataloader \
       --maxtext-dir /path/to/maxtext_outputs \
       --max-samples 100
+
+  # Compare random subset of steps (digest mode)
+  python diff_lazy_outputs.py \
+      --digest /path/to/antllm_digest /path/to/maxtext_digest \
+      --random-steps 50 --step-range 0 1000 --seed 42
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -67,7 +73,57 @@ def get_args():
       help="Aggregate all ranks per step, then compare step-level token sets. "
       "antllm .pt files are grouped by step; MaxText uses --simulate-global output.",
   )
+  parser.add_argument(
+      "--digest",
+      type=str,
+      nargs=2,
+      metavar=("DIR_A", "DIR_B"),
+      default=None,
+      help="Compare two digest directories. Each should contain digest_rank*.jsonl files "
+      "produced by antllm --slim digest or maxtext --digest.",
+  )
+  parser.add_argument(
+      "--random-steps",
+      type=int,
+      default=None,
+      help="Only compare N randomly sampled steps (must match the seed used during dump).",
+  )
+  parser.add_argument(
+      "--step-range",
+      type=int,
+      nargs=2,
+      metavar=("START", "END"),
+      default=None,
+      help="Step range [START, END) for --random-steps filtering (default: auto from data).",
+  )
+  parser.add_argument(
+      "--seed",
+      type=int,
+      default=42,
+      help="Random seed for --random-steps (default: 42). Must match the dump seed.",
+  )
   return parser.parse_args()
+
+
+def _compute_step_filter(random_steps, step_range, seed, available_steps=None):
+  """Compute the set of step indices to compare.
+
+  When random_steps is None, returns None (compare all).
+  Otherwise, samples random_steps indices from step_range or available_steps.
+  """
+  if random_steps is None:
+    return None
+  if step_range:
+    step_start, step_end = step_range
+  elif available_steps:
+    step_start, step_end = min(available_steps), max(available_steps) + 1
+  else:
+    return None
+  rng = np.random.RandomState(seed)
+  pool = np.arange(step_start, step_end)
+  n = min(random_steps, len(pool))
+  selected = sorted(rng.choice(pool, size=n, replace=False))
+  return set(int(s) for s in selected)
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +297,12 @@ def compare_steps(
     label_b: str,
     show_diff_tokens: int = 10,
     quiet: bool = False,
+    step_filter: set | None = None,
 ) -> dict:
   """Compare per-step aggregated token sets between two systems."""
   all_steps = sorted(set(steps_a.keys()) | set(steps_b.keys()))
+  if step_filter is not None:
+    all_steps = [s for s in all_steps if s in step_filter]
   n_match = 0
   n_mismatch = 0
 
@@ -288,6 +347,8 @@ def compare_steps(
   print("=" * 60)
   print("Step-Level Aggregate Comparison")
   print("=" * 60)
+  if step_filter is not None:
+    print(f"  Step filter:     {len(step_filter)} steps")
   print(f"  Steps compared:  {len(all_steps)}")
   print(f"  Matched:         {n_match}")
   print(f"  Mismatched:      {n_mismatch}")
@@ -423,8 +484,106 @@ def load_npy_groups(group_dir: str) -> dict[int, list[np.ndarray]]:
   return steps
 
 
+# ---------------------------------------------------------------------------
+# Digest comparison
+# ---------------------------------------------------------------------------
+
+
+def _load_digest_dir(digest_dir: str) -> dict[int, dict[int, dict]]:
+  """Load digest JSONL files from a directory.
+
+  Returns: {rank: {step: record}} where record has keys sha256, shape, token_sum.
+  """
+  digest_dir = Path(digest_dir)
+  jsonl_files = sorted(digest_dir.glob("digest_rank*.jsonl"))
+  if not jsonl_files:
+    raise FileNotFoundError(f"No digest_rank*.jsonl files found in {digest_dir}")
+
+  result: dict[int, dict[int, dict]] = {}
+  for f in jsonl_files:
+    with open(f, encoding="utf-8") as fh:
+      for line in fh:
+        record = json.loads(line)
+        rank = record["rank"]
+        step = record["step"]
+        result.setdefault(rank, {})[step] = record
+
+  n_records = sum(len(v) for v in result.values())
+  print(f"  Loaded {n_records} records from {len(jsonl_files)} files in {digest_dir}")
+  return result
+
+
+def compare_digests(
+    dir_a: str, dir_b: str, label_a: str = "A", label_b: str = "B", quiet: bool = False, step_filter: set | None = None
+) -> dict:
+  """Compare two digest directories record-by-record."""
+  print(f"Loading digests from {dir_a}...")
+  digests_a = _load_digest_dir(dir_a)
+  print(f"Loading digests from {dir_b}...")
+  digests_b = _load_digest_dir(dir_b)
+
+  all_ranks = sorted(set(digests_a.keys()) | set(digests_b.keys()))
+  n_match = 0
+  n_mismatch = 0
+  n_missing = 0
+
+  for rank in all_ranks:
+    steps_a = digests_a.get(rank, {})
+    steps_b = digests_b.get(rank, {})
+    all_steps = sorted(set(steps_a.keys()) | set(steps_b.keys()))
+
+    for step in all_steps:
+      if step_filter is not None and step not in step_filter:
+        continue
+      ra = steps_a.get(step)
+      rb = steps_b.get(step)
+
+      if ra is None or rb is None:
+        n_missing += 1
+        if not quiet:
+          side = label_b if ra is None else label_a
+          print(f"  rank={rank} step={step}: MISSING in {side}")
+        continue
+
+      if ra["sha256"] == rb["sha256"]:
+        n_match += 1
+      else:
+        n_mismatch += 1
+        if not quiet:
+          print(f"  rank={rank} step={step}: MISMATCH")
+          print(f"    {label_a}: sha256={ra['sha256'][:16]}... shape={ra['shape']} token_sum={ra['token_sum']}")
+          print(f"    {label_b}: sha256={rb['sha256'][:16]}... shape={rb['shape']} token_sum={rb['token_sum']}")
+
+  total = n_match + n_mismatch + n_missing
+  print()
+  print("=" * 60)
+  print("Digest Comparison Summary")
+  print("=" * 60)
+  if step_filter is not None:
+    print(f"  Step filter:     {len(step_filter)} steps")
+  print(f"  Total records:   {total}")
+  print(f"  Matched:         {n_match}")
+  print(f"  Mismatched:      {n_mismatch}")
+  print(f"  Missing:         {n_missing}")
+  if n_mismatch == 0 and n_missing == 0:
+    print("  Result:          ALL MATCH")
+  else:
+    print("  Result:          DIFFERENCES FOUND")
+  print("=" * 60)
+
+  return {"n_total": total, "n_match": n_match, "n_mismatch": n_mismatch, "n_missing": n_missing}
+
+
 def main():
   args = get_args()
+
+  step_filter = _compute_step_filter(args.random_steps, args.step_range, args.seed)
+
+  if args.digest:
+    result = compare_digests(
+        args.digest[0], args.digest[1], label_a="A", label_b="B", quiet=args.quiet, step_filter=step_filter
+    )
+    sys.exit(0 if result["n_mismatch"] == 0 and result["n_missing"] == 0 else 1)
 
   if args.aggregate_steps:
     # Step-level aggregate comparison
@@ -454,6 +613,7 @@ def main():
         label_b=label_b,
         show_diff_tokens=args.show_diff_tokens,
         quiet=args.quiet,
+        step_filter=step_filter,
     )
     sys.exit(0 if result["n_mismatch"] == 0 else 1)
 

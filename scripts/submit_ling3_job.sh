@@ -47,6 +47,15 @@ export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 export REMAT_POLICY="${REMAT_POLICY:-save_out_proj}"
 
+# Lazy dataloader scatter group sharding.
+# -1 = single-host debug: every process reads ALL shards.
+# -4 = production: 4 scatter groups, each process reads 1/4 of shards.
+#       Requires num_hosts to be a multiple of 4.
+# WARNING: -1 and -4 produce DIFFERENT data consumption order — results
+# from single-host debug (-1) are NOT comparable with production (-4).
+# Default: -1 (safe for the 4-chip single-host dev job).
+export LAZY_LOADER_SCATTER="${LAZY_LOADER_SCATTER:--1}"
+
 # Profiler (empty = disabled)
 export PROFILER="${PROFILER:-}"
 export SKIP_FIRST_N_STEPS_FOR_PROFILER="${SKIP_FIRST_N_STEPS_FOR_PROFILER:-}"
@@ -75,6 +84,7 @@ SUBST_VARS+=' $STEPS $EVAL_INTERVAL $OPT_TYPE'
 SUBST_VARS+=' $ICI_EXPERT_PARALLELISM $ICI_DATA_PARALLELISM $ICI_FSDP_PARALLELISM'
 SUBST_VARS+=' $ICI_TENSOR_PARALLELISM $ICI_CONTEXT_PARALLELISM $SHARD_EXP_ON_FSDP'
 SUBST_VARS+=' $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS $REMAT_POLICY'
+SUBST_VARS+=' $LAZY_LOADER_SCATTER'
 SUBST_VARS+=' $PROFILER $SKIP_FIRST_N_STEPS_FOR_PROFILER $PROFILER_STEPS'
 SUBST_VARS+=' $LIBTPU_INIT_ARGS'
 
@@ -87,6 +97,7 @@ echo "  Eval:       every $EVAL_INTERVAL steps"
 echo "  Batch:      $PER_DEVICE_BATCH_SIZE per device × $GRADIENT_ACCUMULATION_STEPS accum"
 echo "  Parallelism: EP=$ICI_EXPERT_PARALLELISM DP=$ICI_DATA_PARALLELISM FSDP=$ICI_FSDP_PARALLELISM TP=$ICI_TENSOR_PARALLELISM CP=$ICI_CONTEXT_PARALLELISM"
 echo "  Remat:      $REMAT_POLICY"
+echo "  Scatter:    $LAZY_LOADER_SCATTER"
 echo "=============================="
 
 envsubst "$SUBST_VARS" < "$TEMPLATE" | kubectl apply -f -

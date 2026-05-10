@@ -43,7 +43,7 @@ fi
 #   blended dataset: "npy_dir|bin_prefix_or_dir,weight;npy_dir|bin_prefix_or_dir,weight"
 # The .npy index files encode document ordering, sampling, and shuffle.
 # bin_dirs provide the raw token data (.bin/.idx files).
-DATASET_TYPE="grain"
+DATASET_TYPE=${DATASET_TYPE:-"grain"}
 GRAIN_FILE_TYPE="mmap_npy"
 
 NEMO_HQ_T2E_WEIGHT="0.597200"
@@ -77,7 +77,31 @@ EOD_MASK_LOSS="true"  # Exclude EOD tokens from loss (matching Megatron --eod-ma
 # 5. Training Hyperparameters
 # ============================================================================
 MODEL_NAME="ling3-tiny"
-CONFIG_FILE="src/maxtext/configs/base.yml"
+BASE_CONFIG_FILE="src/maxtext/configs/base.yml"
+DATASETS_YAML=${DATASETS_YAML:-""}
+MERGED_CONFIG_FILE="src/maxtext/configs/merged_base.yml"
+
+if [[ -n "$DATASETS_YAML" ]]; then
+    if [[ ! -f "$DATASETS_YAML" ]]; then
+        echo "Error: DATASETS_YAML file not found: $DATASETS_YAML" >&2
+        exit 1
+    fi
+    if ! command -v yq &>/dev/null; then
+        echo "Error: yq is required for YAML merge but not found in PATH" >&2
+        exit 1
+    fi
+    echo "Merging dataset config: $DATASETS_YAML -> $MERGED_CONFIG_FILE"
+    # Detect yq variant: mikefarah/yq (Go) vs kislyuk/yq (Python/jq wrapper)
+    if yq --version 2>&1 | grep -qi "mikefarah\|https://github.com/mikefarah"; then
+        yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
+            "$BASE_CONFIG_FILE" "$DATASETS_YAML" > "$MERGED_CONFIG_FILE"
+    else
+        yq -y -s '.[0] * .[1]' "$BASE_CONFIG_FILE" "$DATASETS_YAML" > "$MERGED_CONFIG_FILE"
+    fi
+    CONFIG_FILE="$MERGED_CONFIG_FILE"
+else
+    CONFIG_FILE="$BASE_CONFIG_FILE"
+fi
 
 # Training Steps and Batch Size
 STEPS=${STEPS:-100000}
@@ -286,6 +310,16 @@ python3 -m maxtext.trainers.pre_train.train "$CONFIG_FILE" \
     ${PROFILER:+profiler=$PROFILER} \
     ${PROFILER:+skip_first_n_steps_for_profiler=${SKIP_FIRST_N_STEPS_FOR_PROFILER:-1}} \
     ${PROFILER:+profiler_steps=${PROFILER_STEPS:-5}} \
+    \
+    `# --- Lazy dataloader scatter override (optional) ---` \
+    `# WARNING: LAZY_LOADER_SCATTER=-1 is for single-host debug ONLY.` \
+    `# It reads ALL shards on every process, producing DIFFERENT data` \
+    `# consumption order than -4 (scatter-group sharding). Results` \
+    `# from -1 are NOT comparable with production -4 runs.` \
+    `# NOTE: scatter=-N requires num_hosts to be a multiple of N` \
+    `# (e.g. scatter=-4 needs 4, 8, 12, ... hosts). Otherwise` \
+    `# startup will fail with "requires at least N processes".` \
+    ${LAZY_LOADER_SCATTER:+lazy_loader_scatter=$LAZY_LOADER_SCATTER} \
     \
     "$@"
 

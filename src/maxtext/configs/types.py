@@ -177,6 +177,7 @@ class DatasetType(str, Enum):
   GRAIN = "grain"
   TFDS = "tfds"
   C4MLPERF = "c4_mlperf"
+  LAZY = "lazy"
 
 
 class SamplingStrategy(str, Enum):

@@ -45,6 +45,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -141,6 +142,13 @@ def get_args():
       nargs="+",
       default=None,
       help="Path(s) to .scatter directories. Multiple paths enable blending.",
+  )
+  parser.add_argument(
+      "--data-root",
+      type=str,
+      default=None,
+      help="Prefix path prepended to each scatter-dir. Useful when scatter_dirs in "
+      "maxtext_params.json are relative paths.",
   )
   parser.add_argument(
       "--weights",
@@ -292,6 +300,47 @@ def get_args():
       help="Cache directory for blending indices. When set, dataset_index/dataset_sample_index "
       "arrays are saved after first computation and mmap-loaded on subsequent runs.",
   )
+  parser.add_argument(
+      "--digest",
+      action="store_true",
+      help="Dump SHA256 + shape + token_sum per step as .jsonl instead of full .npy. "
+      "Minimal storage for large-scale comparison with antllm --slim digest output.",
+  )
+  parser.add_argument(
+      "--debug-blend",
+      action="store_true",
+      help="Print blend-epoch diagnostics: blend _size, sub-source total_samples, "
+      "loader_online_shuffle, and whether blend_epoch > 0 at the accessed indices. "
+      "Useful for verifying whether the cross-blend-epoch patch has any effect.",
+  )
+  parser.add_argument(
+      "--consumed-steps",
+      type=int,
+      default=0,
+      help="Skip this many steps before dumping (for testing cross-epoch scenarios). "
+      "Converted to consumed_samples = consumed_steps * batch_per_step internally.",
+  )
+  parser.add_argument(
+      "--random-steps",
+      type=int,
+      default=None,
+      help="Randomly sample N step indices from --step-range instead of dumping sequential steps. "
+      "Useful for spot-checking large training runs without dumping every step.",
+  )
+  parser.add_argument(
+      "--step-range",
+      type=int,
+      nargs=2,
+      metavar=("START", "END"),
+      default=None,
+      help="Step range [START, END) for --random-steps sampling (default: [0, num_steps)).",
+  )
+  parser.add_argument(
+      "--seed",
+      type=int,
+      default=42,
+      help="Random seed for --random-steps (default: 42). Use the same seed on both sides to compare.",
+  )
   args = parser.parse_args()
 
   # Apply config file if provided (CLI args override config values)
@@ -303,6 +352,10 @@ def get_args():
   # Validate: scatter_dir must come from CLI or config
   if not args.scatter_dir:
     parser.error("--scatter-dir is required (either via CLI or --config)")
+
+  # Prepend data-root to scatter dirs if specified
+  if args.data_root:
+    args.scatter_dir = [os.path.join(args.data_root, d) for d in args.scatter_dir]
 
   return args
 
@@ -661,6 +714,112 @@ def _debug_binary(scatter_dir, seq_length, eos_token_id, data_type, mode):
   print(f"\n{'='*60}\n")
 
 
+def _print_blend_debug(source, consumed_samples, batch_per_step, num_steps, step_indices=None):
+  """Print blend-epoch diagnostics for the given source and access range."""
+  # Unwrap _SliceSource if present
+  src = source
+  slice_start = 0
+  if hasattr(src, "_source") and hasattr(src, "_start"):
+    slice_start = src._start
+    src = src._source
+
+  if not hasattr(src, "_dataset_index"):
+    print("  [debug-blend] Source is not a LazyBlendedDataSource, skipping.")
+    return
+
+  blend_size = src._size
+
+  print(f"\n  {'='*60}")
+  print("  Blend-Epoch Diagnostics")
+  print(f"  {'='*60}")
+  print(f"  blend _size (samples per blend pass):  {blend_size:,}")
+  print(f"  blend __len__:                          {len(src):,}")
+
+  # Per-dataset blend allocation and sub-source details
+  ds_index = src._dataset_index
+  ds_sample_index = src._dataset_sample_index
+  for i, sub in enumerate(src._sources):
+    sub_total = getattr(sub, "_total_samples", len(sub))
+    sub_shuffle = getattr(sub, "_loader_online_shuffle", False)
+    sub_mode = getattr(sub, "_mode", "unknown")
+    sub_scatter = getattr(sub, "_scatter_dir", "?")
+    # How many blend slots point to this dataset
+    mask = ds_index == i
+    blend_count = int(mask.sum())
+    # Max dataset_sample_index for this dataset in one blend pass
+    max_sample_idx = int(ds_sample_index[mask].max()) if blend_count > 0 else 0
+    crosses_sub_epoch = max_sample_idx >= sub_total
+    print(f"  sub-source[{i}]: {os.path.basename(sub_scatter)}")
+    print(f"    mode={sub_mode}, total_samples={sub_total:,}, " f"loader_online_shuffle={sub_shuffle}")
+    print(
+        f"    blend_slots={blend_count:,} (ratio={blend_count/blend_size:.4f}), "
+        f"max_sample_idx={max_sample_idx:,}, crosses_sub_epoch={crosses_sub_epoch}"
+    )
+
+  # Compute the actual indices that will be accessed
+  steps = step_indices if step_indices is not None else list(range(num_steps))
+  if not steps:
+    print(f"  {'='*60}\n")
+    return
+
+  first_step, last_step = steps[0], steps[-1]
+  first_idx = consumed_samples + first_step * batch_per_step
+  last_idx = consumed_samples + last_step * batch_per_step + (batch_per_step - 1)
+
+  # Simulate the actual index seen by blend's __getitem__:
+  # 1. _dump_split_source wraps: global_idx % len(source)
+  # 2. _SliceSource (if split) further maps: idx % slice_size + slice_start
+  # Without split, len(source) = _size * num_epochs (inflated), so blend
+  # can see idx >= _size → blend_epoch > 0.
+  # With split, len(source) = slice_size (un-inflated), and the mapped
+  # index is always < _size → blend_epoch = 0.
+  outer_len = len(source)
+  is_split = hasattr(source, "_start")
+  if is_split:
+    slice_size = source._size
+    first_mapped = first_idx % slice_size + slice_start
+    last_mapped = last_idx % slice_size + slice_start
+  else:
+    first_mapped = first_idx % outer_len
+    last_mapped = last_idx % outer_len
+
+  first_blend_epoch = first_mapped // blend_size
+  last_blend_epoch = last_mapped // blend_size
+
+  cross_epoch_threshold_step = (blend_size - consumed_samples) / batch_per_step if batch_per_step > 0 else float("inf")
+
+  print(f"\n  Access range (split={is_split}, outer_len={outer_len:,}):")
+  print(f"    consumed_samples={consumed_samples:,}, batch_per_step={batch_per_step}")
+  print(
+      f"    first global_idx={first_idx:,} -> blend_idx={first_mapped:,}"
+      f" (step {first_step}), blend_epoch={first_blend_epoch}"
+  )
+  print(
+      f"    last  global_idx={last_idx:,} -> blend_idx={last_mapped:,} (step {last_step}), blend_epoch={last_blend_epoch}"
+  )
+  if is_split:
+    print(
+        f"    ** split active: blend_idx always in [{slice_start}, {slice_start + slice_size}), blend_epoch always 0 **"
+    )
+  else:
+    print(f"    blend_epoch crosses >0 at step ~{cross_epoch_threshold_step:,.1f}")
+
+  if last_blend_epoch == 0:
+    print("\n  ** All accessed indices are in blend_epoch=0. **")
+    print("  ** The cross-blend-epoch patch has NO effect at these steps. **")
+  else:
+    print("\n  ** blend_epoch > 0 reached! The cross-blend-epoch patch DOES matter. **")
+    has_shuffle = any(getattr(s, "_loader_online_shuffle", False) for s in src._sources)
+    if not has_shuffle:
+      print("  ** BUT loader_online_shuffle=False on all sub-sources, **")
+      print("  ** so the offset gets mod-ed away — data is identical anyway. **")
+    else:
+      print("  ** AND loader_online_shuffle=True on some sub-sources, **")
+      print("  ** so epoch shuffle ordering WILL differ between old/new code. **")
+
+  print(f"  {'='*60}\n")
+
+
 def _build_source_for_group(args, process_index):
   """Build a full-pipeline source (blend/shuffle/split) for a specific scatter group.
 
@@ -675,29 +834,65 @@ def _build_source_for_group(args, process_index):
   return source
 
 
-def _dump_split_source(source, split_name, base_dir, num_steps, batch_per_step):
-  """Dump samples from a single source into base_dir/<group_id>/step_*.npy structure."""
+def _dump_split_source(
+    source,
+    split_name,
+    base_dir,
+    num_steps,
+    batch_per_step,
+    digest=False,
+    group_id=0,
+    consumed_samples=0,
+    step_indices=None,
+):
+  """Dump samples from a single source into base_dir/<group_id>/step_*.npy structure.
+
+  Args:
+    step_indices: If provided, dump these specific step indices instead of
+      range(num_steps). Each step index determines which samples to read via
+      global_idx = consumed_samples + step * batch_per_step + j.
+  """
   group_samples = len(source)
-  print(f"    [{split_name}] samples={group_samples}")
+  steps_to_dump = step_indices if step_indices is not None else list(range(num_steps))
+  print(f"    [{split_name}] samples={group_samples}, consumed_samples={consumed_samples}, steps={len(steps_to_dump)}")
 
-  sample_count = 0
-  for step in range(num_steps):
-    step_tokens = []
-    for j in range(batch_per_step):
-      global_idx = step * batch_per_step + j
-      if global_idx >= group_samples:
-        global_idx = global_idx % group_samples
-      sample = source[global_idx]
-      tokens = sample["text"] if isinstance(sample, dict) else np.asarray(sample)
-      tokens = np.asarray(tokens)[:-1]  # inputs = text[:-1]
-      step_tokens.append(tokens)
-      sample_count += 1
+  digest_file = None
+  if digest:
+    digest_path = os.path.join(base_dir, f"digest_rank{group_id}.jsonl")
+    digest_file = open(digest_path, "w", encoding="utf-8")  # pylint: disable=consider-using-with
 
-    batch_arr = np.stack(step_tokens, axis=0)
-    np.save(os.path.join(base_dir, f"step_{step:06d}.npy"), batch_arr)
+  try:
+    sample_count = 0
+    for step in steps_to_dump:
+      step_tokens = []
+      for j in range(batch_per_step):
+        global_idx = consumed_samples + step * batch_per_step + j
+        if global_idx >= group_samples:
+          global_idx = global_idx % group_samples
+        sample = source[global_idx]
+        tokens = sample["text"] if isinstance(sample, dict) else np.asarray(sample)
+        tokens = np.asarray(tokens)[:-1]  # inputs = text[:-1]
+        step_tokens.append(tokens)
+        sample_count += 1
 
-    if step < 3 or step == num_steps - 1:
-      print(f"      Step {step}: batch shape={batch_arr.shape}, first_token={int(step_tokens[0][0])}")
+      batch_arr = np.stack(step_tokens, axis=0).astype(np.int32)
+      if digest_file is not None:
+        record = {
+            "step": step,
+            "rank": group_id,
+            "shape": list(batch_arr.shape),
+            "token_sum": int(batch_arr.sum()),
+            "sha256": hashlib.sha256(batch_arr.tobytes()).hexdigest(),
+        }
+        digest_file.write(json.dumps(record) + "\n")
+      else:
+        np.save(os.path.join(base_dir, f"step_{step:06d}.npy"), batch_arr)
+
+      if sample_count <= 3 * batch_per_step or step == steps_to_dump[-1]:
+        print(f"      Step {step}: batch shape={batch_arr.shape}, first_token={int(step_tokens[0][0])}")
+  finally:
+    if digest_file is not None:
+      digest_file.close()
 
   return sample_count
 
@@ -726,6 +921,17 @@ def _dump_groups(args):
 
   num_steps = args.num_steps
   batch_per_step = args.batch_per_step if args.batch_per_step else args.num_samples
+  digest = getattr(args, "digest", False)
+  consumed_samples = getattr(args, "consumed_steps", 0) * batch_per_step
+
+  # Build step indices: sequential or random sampling
+  step_indices = None
+  if args.random_steps:
+    step_start, step_end = args.step_range if args.step_range else [0, num_steps]
+    rng = np.random.RandomState(args.seed)
+    step_indices = sorted(
+        int(step) for step in rng.choice(np.arange(step_start, step_end), size=args.random_steps, replace=False)
+    )
 
   print(f"{'='*70}")
   print("Dumping ALL scatter groups (full pipeline: blend/shuffle/split)")
@@ -734,6 +940,10 @@ def _dump_groups(args):
   print(f"  scatter_dirs={args.scatter_dir}")
   print(f"  split_parts={args.split_parts}")
   print(f"  batch_per_step={batch_per_step}, num_steps={num_steps}")
+  print(f"  consumed_steps={args.consumed_steps}, consumed_samples={consumed_samples}")
+  if step_indices is not None:
+    print(f"  random_steps={len(step_indices)}, step_range=[{step_start}, {step_end}), seed={args.seed}")
+  print(f"  digest={digest}")
   print(f"  output_dir={args.output_dir}")
   print()
 
@@ -742,22 +952,44 @@ def _dump_groups(args):
     sources_dict = _build_source_for_group(args, process_index=group_id)
     multi_split = len(sources_dict) > 1
 
+    if getattr(args, "debug_blend", False):
+      for split_name, source in sources_dict.items():
+        print(f"  [{split_name}] blend-epoch debug (group {group_id}):")
+        _print_blend_debug(source, consumed_samples, batch_per_step, num_steps, step_indices)
+
     for split_name, source in sources_dict.items():
-      if multi_split:
+      if digest:
+        group_dir = args.output_dir
+        if multi_split:
+          group_dir = os.path.join(args.output_dir, split_name)
+      elif multi_split:
         group_dir = os.path.join(args.output_dir, split_name, str(group_id))
       else:
         group_dir = os.path.join(args.output_dir, str(group_id))
       os.makedirs(group_dir, exist_ok=True)
 
-      sample_count = _dump_split_source(source, split_name, group_dir, num_steps, batch_per_step)
+      sample_count = _dump_split_source(
+          source,
+          split_name,
+          group_dir,
+          num_steps,
+          batch_per_step,
+          digest=digest,
+          group_id=group_id,
+          consumed_samples=consumed_samples,
+          step_indices=step_indices,
+      )
 
-      if num_steps > 4:
-        print(f"      ... ({num_steps - 4} steps omitted)")
+      actual_steps = len(step_indices) if step_indices else num_steps
+      if actual_steps > 4:
+        print(f"      ... ({actual_steps - 4} steps omitted)")
       print(f"      Total: {sample_count} samples saved to {group_dir}/")
     print()
 
   print(f"{'='*70}")
-  if multi_split:
+  if digest:
+    print(f"Done. Output: {args.output_dir}/digest_rank*.jsonl")
+  elif multi_split:
     print(f"Done. Output: {args.output_dir}/<split>/<group_id>/step_*.npy")
   else:
     print(f"Done. Output: {args.output_dir}/<group_id>/step_*.npy")
@@ -807,6 +1039,11 @@ def main():
   build_time = time.time() - tic
   for name, src in sources_dict.items():
     print(f"Built [{name}] in {build_time:.2f}s, total samples: {len(src)}")
+
+  if getattr(args, "debug_blend", False):
+    for name, src in sources_dict.items():
+      print(f"  [{name}] blend-epoch debug:")
+      _print_blend_debug(src, args.start_index, 1, args.num_samples)
 
   if args.show_stats:
     print_dataset_stats(list(sources_dict.values())[0], args)

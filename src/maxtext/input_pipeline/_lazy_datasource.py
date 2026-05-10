@@ -14,15 +14,25 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from bisect import bisect_right
 from concurrent.futures import as_completed, ThreadPoolExecutor  # pylint: disable=no-name-in-module
 from pathlib import Path
 
 import grain.python as grain
+from grain.python import SharedMemoryArray
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _cumsum_shm(arr: np.ndarray, dtype=None) -> SharedMemoryArray:
+  """Compute cumsum directly into POSIX shared memory (zero-copy, no temp array)."""
+  if dtype is None:
+    dtype = arr.dtype
+  shm_arr = SharedMemoryArray(arr.shape, np.dtype(dtype))
+  np.cumsum(arr, dtype=dtype, out=shm_arr)
+  shm_arr.unlink_on_del()
+  return shm_arr
 
 
 class LazyIndexedDataset:
@@ -32,7 +42,7 @@ class LazyIndexedDataset:
   shared filesystems, matches MaxText _mmap_datasource.py convention).
   """
 
-  def __init__(self, lazy_dir: str, data_type: str = "text", dtype=np.int32):
+  def __init__(self, lazy_dir: str, data_type: str = "text", dtype=np.int32, _shm_ends=None):
     self._lazy_dir = lazy_dir
     self._data_type = data_type
     self._dtype = np.dtype(dtype)
@@ -41,8 +51,13 @@ class LazyIndexedDataset:
 
     lens_path = os.path.join(lazy_dir, f"{data_type}.lens.npy")
     self._sizes = np.load(lens_path, mmap_mode="r")
-    self._ends = np.cumsum(self._sizes, dtype=np.int64)
     self._num_docs = len(self._sizes)
+
+    if _shm_ends is not None:
+      self._ends = _shm_ends
+    else:
+      self._ends = _cumsum_shm(self._sizes, dtype=np.int64)
+
     self._total_tokens = int(self._ends[-1]) if self._num_docs > 0 else 0
 
     bin_path = os.path.join(lazy_dir, data_type)
@@ -103,10 +118,11 @@ class LazyIndexedDataset:
         "lazy_dir": self._lazy_dir,
         "data_type": self._data_type,
         "dtype": self._dtype,
+        "shm_ends": self._ends,
     }
 
   def __setstate__(self, state):
-    self.__init__(state["lazy_dir"], state["data_type"], state["dtype"])
+    self.__init__(state["lazy_dir"], state["data_type"], state["dtype"], _shm_ends=state["shm_ends"])
 
 
 class LazySlidingWindowDataSource(grain.RandomAccessDataSource):
@@ -237,7 +253,7 @@ class LazyMapDataSource(grain.RandomAccessDataSource):
 
     # Compute mapping_ends from reordered document sizes
     mapping_lens = dataset.sizes[index_mapping]
-    self._mapping_ends = np.cumsum(mapping_lens)
+    self._mapping_ends = _cumsum_shm(mapping_lens)
     total_mapped = int(self._mapping_ends[-1]) if len(self._mapping_ends) > 0 else 0
     if drop_last:
       self._num_samples = total_mapped // seq_length
@@ -288,13 +304,24 @@ class LazyMapDataSource(grain.RandomAccessDataSource):
         "seq_length": self._seq_length,
         "eos_token_id": self._eos_token_id,
         "index_mapping": self._index_mapping,
+        "mapping_ends": self._mapping_ends,
+        "num_samples": self._num_samples,
         "cls_token_id": self._cls_token_id,
         "add_cls": self._add_cls,
         "drop_last": self._drop_last,
     }
 
   def __setstate__(self, state):
-    self.__init__(**state)
+    self._dataset = state["dataset"]
+    self._seq_length = state["seq_length"]
+    self._eos_token_id = state["eos_token_id"]
+    self._cls_token_id = state["cls_token_id"]
+    self._add_cls = state["add_cls"]
+    self._drop_last = state["drop_last"]
+    self._index_mapping = state["index_mapping"]
+    self._mapping_ends = state["mapping_ends"]
+    self._num_samples = state["num_samples"]
+    self._ends = self._dataset.ends
 
 
 class LazyPackDataSource(grain.RandomAccessDataSource):
@@ -341,12 +368,12 @@ class LazyPackDataSource(grain.RandomAccessDataSource):
       self._bin_entries = np.asarray(bin_entries, dtype=np.int32)
       if self._bin_entries.ndim == 1 and self._bin_entries.size == 0:
         self._bin_entries = self._bin_entries.reshape(0, 2)
-      self._bin_ends = np.cumsum(bin_lens)
+      self._bin_ends = _cumsum_shm(bin_lens)
       self._num_samples = len(self._bin_ends)
     else:
       # File-based mode (pre-generated)
       bin_lens = np.load(os.path.join(bin_index_path, "lens.npy"), mmap_mode="r")
-      self._bin_ends = np.cumsum(bin_lens)
+      self._bin_ends = _cumsum_shm(bin_lens)
       self._num_samples = len(self._bin_ends)
       bin_data_path = os.path.join(bin_index_path, "index_offset.bin")
       self._bin_data_fd = os.open(bin_data_path, os.O_RDONLY)
@@ -407,22 +434,34 @@ class LazyPackDataSource(grain.RandomAccessDataSource):
     self.close()
 
   def __getstate__(self):
-    state = {
+    return {
         "dataset": self._dataset,
         "seq_length": self._seq_length,
         "eos_token_id": self._eos_token_id,
         "cls_token_id": self._cls_token_id,
         "add_cls": self._add_cls,
+        "bin_entries": self._bin_entries,
+        "bin_ends": self._bin_ends,
+        "num_samples": self._num_samples,
+        "bin_index_path": self._bin_index_path,
     }
-    if self._bin_entries is not None:
-      # In-memory mode: serialize the arrays
-      state["bin_index_data"] = (self._bin_entries, np.diff(self._bin_ends, prepend=0))
-    else:
-      state["bin_index_path"] = self._bin_index_path
-    return state
 
   def __setstate__(self, state):
-    self.__init__(**state)
+    self._dataset = state["dataset"]
+    self._seq_length = state["seq_length"]
+    self._eos_token_id = state["eos_token_id"]
+    self._cls_token_id = state["cls_token_id"]
+    self._add_cls = state["add_cls"]
+    self._bin_entries = state["bin_entries"]
+    self._bin_ends = state["bin_ends"]
+    self._num_samples = state["num_samples"]
+    self._bin_index_path = state["bin_index_path"]
+    self._ends = self._dataset.ends
+    if self._bin_index_path is not None and self._bin_entries is None:
+      bin_data_path = os.path.join(self._bin_index_path, "index_offset.bin")
+      self._bin_data_fd = os.open(bin_data_path, os.O_RDONLY)
+    else:
+      self._bin_data_fd = None
 
 
 class MultiShardLazyDataSource(grain.RandomAccessDataSource):
@@ -448,7 +487,6 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
       loader_seed: int = 1234,
       loader_scatter: int = -1,
       process_index: int = 0,
-      num_epochs: int = 1,
       bfd_pack_sort_by_lens: bool = False,
       pack_divisible_by: int = -1,
   ):
@@ -468,31 +506,6 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
     self._process_index = process_index
     self._bfd_pack_sort_by_lens = bfd_pack_sort_by_lens
     self._pack_divisible_by = pack_divisible_by
-    # ---------------------------------------------------------------
-    # Epoch handling
-    # ---------------------------------------------------------------
-    # Grain's MapDataset iterates indices 0..len()-1, then StopIteration.
-    # Grain's .repeat(N) does NOT help: it calls __getitem__(idx % original_len)
-    # internally, so the source never sees idx >= original_len and our epoch
-    # detection (epoch = idx // total_samples) would always compute epoch=0.
-    #
-    # Instead we inflate __len__ to total_samples * num_epochs.  Grain then
-    # iterates 0..total_samples*num_epochs-1, and __getitem__ naturally sees
-    # indices that span multiple epochs:
-    #   epoch 0: idx 0 .. total_samples-1
-    #   epoch 1: idx total_samples .. 2*total_samples-1
-    #   ...
-    # This lets _set_epoch() fire at epoch boundaries to re-shuffle when
-    # loader_online_shuffle is enabled.
-    #
-    # For num_epochs=None (infinite), we use sys.maxsize as a practical upper
-    # bound — large enough that training will never exhaust it.
-    # ---------------------------------------------------------------
-    if num_epochs is None:
-      self._num_epochs = sys.maxsize
-    else:
-      self._num_epochs = max(num_epochs, 1)
-
     self._loaders = self._build_loaders()
 
     # Filter out empty loaders (same as antllm)
@@ -509,13 +522,22 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
       self._shuffled_index = None
 
     logger.info(
-        "MultiShardLazyDataSource: scatter_dir=%s, mode=%s, shards=%d, total_samples=%d, num_epochs=%s",
+        "MultiShardLazyDataSource: scatter_dir=%s, mode=%s, shards=%d, total_samples=%d",
         scatter_dir,
         mode,
         len(self._loaders),
         self._total_samples,
-        self._num_epochs,
     )
+
+  @staticmethod
+  def _extract_ds_name(scatter_path: Path) -> str:
+    """Extract dataset name, handling .scatter/<hash> layouts."""
+    if scatter_path.parent.suffix == ".scatter":
+      name = scatter_path.parent.stem
+      if "_" in name:
+        return name.split("_", 1)[1]
+      return name
+    return scatter_path.stem.replace(".scatter", "")
 
   def _filter_shards(self, lazy_dirs: list) -> list:
     """Filter .lazy dirs by scatter group, replicating antllm shard assignment."""
@@ -559,7 +581,7 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
 
     lazy_dirs = self._filter_shards(lazy_dirs)
 
-    ds_name = scatter_path.stem.replace(".scatter", "")
+    ds_name = self._extract_ds_name(scatter_path)
     num_shards = len(lazy_dirs)
     logger.info(
         "Loading %d shards from %s (mode=%s) ...",
@@ -677,20 +699,8 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
     rng.shuffle(self._shuffled_index)
     self._current_epoch = epoch
 
-  def set_num_epochs(self, num_epochs: int):
-    """Set the number of epochs, inflating __len__ accordingly.
-
-    Called by lazy_data_processing after the source is fully built and the
-    total sample count is known, so num_epochs can be auto-computed from
-    training steps.
-    """
-    self._num_epochs = num_epochs
-
   def __len__(self) -> int:
-    # Return inflated length so Grain sees total_samples * num_epochs indices.
-    # This avoids using Grain .repeat() which mods indices back to [0, len),
-    # preventing our epoch-based shuffle rotation from ever triggering.
-    return self._total_samples * self._num_epochs
+    return self._total_samples
 
   def __getitem__(self, global_index: int):
     if self._loader_online_shuffle:
@@ -707,25 +717,26 @@ class MultiShardLazyDataSource(grain.RandomAccessDataSource):
 
   def __getstate__(self):
     return {
-        "scatter_dir": self._scatter_dir,
-        "mode": self._mode,
-        "seq_length": self._seq_length,
-        "eos_token_id": self._eos_token_id,
-        "data_type": self._data_type,
-        "cls_token_id": self._cls_token_id,
-        "add_cls": self._add_cls,
-        "drop_last": self._drop_last,
-        "index_mapping_path": self._index_mapping_path,
-        "bin_index_base_path": self._bin_index_base_path,
+        "loaders": self._loaders,
+        "cnt_ends": self._cnt_ends,
+        "total_samples": self._total_samples,
         "loader_online_shuffle": self._loader_online_shuffle,
         "loader_seed": self._loader_seed,
-        "loader_scatter": self._loader_scatter,
-        "process_index": self._process_index,
-        "num_epochs": self._num_epochs,
+        "scatter_dir": self._scatter_dir,
+        "mode": self._mode,
     }
 
   def __setstate__(self, state):
-    self.__init__(**state)
+    self._loaders = state["loaders"]
+    self._cnt_ends = state["cnt_ends"]
+    self._total_samples = state["total_samples"]
+    self._loader_online_shuffle = state["loader_online_shuffle"]
+    self._loader_seed = state["loader_seed"]
+    self._scatter_dir = state.get("scatter_dir", "")
+    self._mode = state.get("mode", "")
+    if self._loader_online_shuffle:
+      self._current_epoch = -1
+      self._shuffled_index = None
 
 
 class _EmptySource(grain.RandomAccessDataSource):

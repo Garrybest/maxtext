@@ -12,6 +12,7 @@ import sys
 import tempfile
 import shutil
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,7 +26,13 @@ from maxtext.input_pipeline._lazy_datasource import (
     MultiShardLazyDataSource,
 )
 from maxtext.input_pipeline._lazy_blending import LazyBlendedDataSource
-from maxtext.input_pipeline.lazy_data_processing import SplitDataSource, _resolve_mode
+from maxtext.input_pipeline import lazy_data_processing
+from maxtext.input_pipeline.lazy_data_processing import (
+    SplitDataSource,
+    _dataset_name_from_path,
+    _resolve_mode,
+    _resolve_no_attnmask_ids,
+)
 
 # Import antllm for alignment comparison
 ANTLLM_ROOT = os.environ.get("ANTLLM_DATA_ROOT", "/Volumes/code/tpu/antllm_data")
@@ -915,6 +922,247 @@ class TestPickleSupport:
 
 
 # ---------------------------------------------------------------------------
+# Test: Cross-process SharedMemory sharing (simulates Grain spawn workers)
+# ---------------------------------------------------------------------------
+
+
+def _child_check_shm(send_q, recv_q):
+  """Target for spawned child process. Receives pickled objects via Queue,
+  checks SharedMemoryArray names and data correctness, sends results back."""
+  from grain.python import SharedMemoryArray  # noqa: F811
+
+  task = send_q.get(timeout=30)
+  kind = task["kind"]
+  results = {}
+
+  if kind == "indexed_dataset":
+    ds = task["obj"]
+    results["ends_shm_name"] = ds._ends.shm.name if isinstance(ds._ends, SharedMemoryArray) else None
+    results["doc0"] = ds.get(0).tolist()
+
+  elif kind == "multi_shard":
+    src = task["obj"]
+    shm_names = []
+    for loader in src._loaders:
+      inner_ds = loader._dataset if hasattr(loader, "_dataset") else None
+      if inner_ds and isinstance(inner_ds._ends, SharedMemoryArray):
+        shm_names.append(inner_ds._ends.shm.name)
+    results["shm_names"] = shm_names
+    results["item0"] = src[0]["text"].tolist() if len(src) > 0 else None
+
+  elif kind == "blend_shm":
+    src = task["obj"]
+    results["di_shm_name"] = src._dataset_index.shm.name if isinstance(src._dataset_index, SharedMemoryArray) else None
+    results["dsi_shm_name"] = (
+        src._dataset_sample_index.shm.name if isinstance(src._dataset_sample_index, SharedMemoryArray) else None
+    )
+    results["item0"] = src[0]["text"].tolist() if len(src) > 0 else None
+
+  elif kind == "blend_cache":
+    src = task["obj"]
+    results["di_is_mmap"] = isinstance(src._dataset_index, np.memmap)
+    results["dsi_is_mmap"] = isinstance(src._dataset_sample_index, np.memmap)
+    results["item0"] = src[0]["text"].tolist() if len(src) > 0 else None
+
+  elif kind == "pack_source":
+    src = task["obj"]
+    results["bin_ends_shm_name"] = src._bin_ends.shm.name if isinstance(src._bin_ends, SharedMemoryArray) else None
+    results["item0"] = src[0]["text"].tolist() if len(src) > 0 else None
+
+  recv_q.put(results)
+
+
+def _spawn_child_and_check(task):
+  """Spawn a child process, send task via Queue, return results."""
+  import multiprocessing
+
+  ctx = multiprocessing.get_context("spawn")
+  send_q = ctx.Queue()
+  recv_q = ctx.Queue()
+  p = ctx.Process(target=_child_check_shm, args=(send_q, recv_q))
+  p.start()
+  send_q.put(task)
+  results = recv_q.get(timeout=60)
+  p.join(timeout=10)
+  return results
+
+
+class TestCrossProcessSharing:
+  """Verify SharedMemoryArray fields are truly shared (not copied) across spawn-mode workers."""
+
+  def test_indexed_dataset_ends_shared(self, tmp_dir):
+    """LazyIndexedDataset._ends shm name survives pickle to child process."""
+    from grain.python import SharedMemoryArray  # noqa: F811
+
+    docs = [np.arange(50, dtype=np.int32) + 100, np.arange(30, dtype=np.int32) + 200]
+    lazy_dir = _make_lazy_dir(tmp_dir, 0, docs)
+    ds = LazyIndexedDataset(lazy_dir)
+
+    assert isinstance(ds._ends, SharedMemoryArray)
+    parent_shm_name = ds._ends.shm.name
+    parent_doc0 = ds.get(0).tolist()
+
+    results = _spawn_child_and_check({"kind": "indexed_dataset", "obj": ds})
+
+    assert (
+        results["ends_shm_name"] == parent_shm_name
+    ), f"Child got different shm segment: {results['ends_shm_name']} vs {parent_shm_name}"
+    assert results["doc0"] == parent_doc0
+
+  def test_multi_shard_loaders_shared(self, tmp_dir):
+    """MultiShardLazyDataSource serializes loaders directly; child reuses shm."""
+    from grain.python import SharedMemoryArray  # noqa: F811
+
+    rng = np.random.default_rng(42)
+    shard_docs = [_make_docs(rng, 5, 10, 30) for _ in range(2)]
+    scatter_dir = _make_test_scatter(tmp_dir, "shm_ds", shard_docs)
+
+    source = MultiShardLazyDataSource(
+        scatter_dir=scatter_dir,
+        mode="sliding_window",
+        seq_length=SEQ_LENGTH + 1,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+
+    parent_shm_names = []
+    for loader in source._loaders:
+      inner_ds = loader._dataset if hasattr(loader, "_dataset") else None
+      if inner_ds and isinstance(inner_ds._ends, SharedMemoryArray):
+        parent_shm_names.append(inner_ds._ends.shm.name)
+
+    assert len(parent_shm_names) > 0
+    parent_item0 = source[0]["text"].tolist()
+
+    results = _spawn_child_and_check({"kind": "multi_shard", "obj": source})
+
+    assert (
+        results["shm_names"] == parent_shm_names
+    ), f"Child loaders got different shm segments: {results['shm_names']} vs {parent_shm_names}"
+    assert results["item0"] == parent_item0
+
+  def _make_blend_sources(self, tmp_dir, rng):
+    """Helper: create two MultiShardLazyDataSources for blending tests."""
+    shard_docs1 = [_make_docs(rng, 5, 10, 30)]
+    shard_docs2 = [_make_docs(rng, 5, 10, 30)]
+    scatter1 = _make_test_scatter(tmp_dir, "blend_a", shard_docs1)
+    scatter2 = _make_test_scatter(tmp_dir, "blend_b", shard_docs2)
+    src1 = MultiShardLazyDataSource(
+        scatter_dir=scatter1,
+        mode="sliding_window",
+        seq_length=SEQ_LENGTH + 1,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+    src2 = MultiShardLazyDataSource(
+        scatter_dir=scatter2,
+        mode="sliding_window",
+        seq_length=SEQ_LENGTH + 1,
+        eos_token_id=EOS_TOKEN_ID,
+    )
+    return src1, src2
+
+  def test_blend_cache_miss_shm_shared(self, tmp_dir):
+    """Cache miss: blend indices are SharedMemoryArray, child reuses same shm segment."""
+    from grain.python import SharedMemoryArray  # noqa: F811
+
+    rng = np.random.default_rng(77)
+    src1, src2 = self._make_blend_sources(tmp_dir, rng)
+    weights = np.array([0.6, 0.4])
+    size = min(len(src1), len(src2), 20)
+    if size == 0:
+      pytest.skip("Sources too small for blending test")
+
+    # No cache_dir → always computes → SharedMemoryArray
+    blended = LazyBlendedDataSource(
+        sources=[src1, src2],
+        weights=weights,
+        size=size,
+        shuffle_seed=-1,
+    )
+    assert isinstance(blended._dataset_index, SharedMemoryArray)
+    parent_di_name = blended._dataset_index.shm.name
+    parent_dsi_name = blended._dataset_sample_index.shm.name
+    parent_item0 = blended[0]["text"].tolist()
+
+    results = _spawn_child_and_check({"kind": "blend_shm", "obj": blended})
+
+    assert (
+        results["di_shm_name"] == parent_di_name
+    ), f"Child got different shm for dataset_index: {results['di_shm_name']} vs {parent_di_name}"
+    assert (
+        results["dsi_shm_name"] == parent_dsi_name
+    ), f"Child got different shm for dataset_sample_index: {results['dsi_shm_name']} vs {parent_dsi_name}"
+    assert results["item0"] == parent_item0
+
+  def test_blend_cache_hit_mmap_in_child(self, tmp_dir):
+    """Cache hit: blend indices are mmap, child re-mmaps same files (not anonymous copies)."""
+    rng = np.random.default_rng(77)
+    src1, src2 = self._make_blend_sources(tmp_dir, rng)
+    cache_dir = os.path.join(tmp_dir, "blend_cache")
+    weights = np.array([0.6, 0.4])
+    size = min(len(src1), len(src2), 20)
+    if size == 0:
+      pytest.skip("Sources too small for blending test")
+
+    # First call writes cache
+    _ = LazyBlendedDataSource(
+        sources=[src1, src2],
+        weights=weights,
+        size=size,
+        shuffle_seed=-1,
+        cache_dir=cache_dir,
+    )
+
+    # Second call hits cache (mmap)
+    blended = LazyBlendedDataSource(
+        sources=[src1, src2],
+        weights=weights,
+        size=size,
+        shuffle_seed=-1,
+        cache_dir=cache_dir,
+    )
+    assert isinstance(blended._dataset_index, np.memmap), "Expected mmap from cache hit"
+    parent_item0 = blended[0]["text"].tolist()
+
+    results = _spawn_child_and_check({"kind": "blend_cache", "obj": blended})
+
+    assert results["di_is_mmap"], "Child _dataset_index should be mmap (re-opened from cache file)"
+    assert results["dsi_is_mmap"], "Child _dataset_sample_index should be mmap (re-opened from cache file)"
+    assert results["item0"] == parent_item0
+
+  def test_pack_source_bin_ends_shared(self, tmp_dir):
+    """LazyPackDataSource._bin_ends shm name survives pickle to child process."""
+    from grain.python import SharedMemoryArray  # noqa: F811
+    from maxtext.input_pipeline._lazy_bfd_packing import build_bin_index
+
+    docs = [np.arange(20, dtype=np.int32) + 100 for _ in range(10)]
+    lazy_dir = _make_lazy_dir(tmp_dir, 0, docs)
+    dataset = LazyIndexedDataset(lazy_dir)
+
+    bin_entries, bin_lens = build_bin_index(
+        doc_lens=dataset.sizes,
+        seq_length=SEQ_LENGTH + 1,
+    )
+    source = LazyPackDataSource(
+        dataset=dataset,
+        seq_length=SEQ_LENGTH + 1,
+        eos_token_id=EOS_TOKEN_ID,
+        bin_index_data=(bin_entries, bin_lens),
+    )
+
+    assert isinstance(source._bin_ends, SharedMemoryArray)
+    parent_shm_name = source._bin_ends.shm.name
+    parent_item0 = source[0]["text"].tolist() if len(source) > 0 else None
+
+    results = _spawn_child_and_check({"kind": "pack_source", "obj": source})
+
+    assert (
+        results["bin_ends_shm_name"] == parent_shm_name
+    ), f"Child got different shm: {results['bin_ends_shm_name']} vs {parent_shm_name}"
+    if parent_item0 is not None:
+      assert results["item0"] == parent_item0
+
+
+# ---------------------------------------------------------------------------
 # Test 10-15: Scatter shard filtering
 # ---------------------------------------------------------------------------
 
@@ -1087,42 +1335,8 @@ class TestScatterShardFiltering:
 class TestEpochHandling:
   """Tests for multi-epoch support via num_epochs inflation."""
 
-  def test_num_epochs_inflates_len(self, tmp_dir):
-    """num_epochs=3 should make __len__ return 3 * total_samples."""
-    docs = [np.arange(51, dtype=np.int32) + 100]  # 51 tokens -> 3 samples at seq=17
-    scatter_dir = _make_test_scatter(tmp_dir, "epoch_len", [docs])
-
-    effective_seq = SEQ_LENGTH + 1  # 17
-    source = MultiShardLazyDataSource(
-        scatter_dir=scatter_dir,
-        mode="sliding_window",
-        seq_length=effective_seq,
-        eos_token_id=EOS_TOKEN_ID,
-        num_epochs=3,
-    )
-    single_epoch_samples = source._total_samples
-    assert single_epoch_samples > 0
-    assert len(source) == single_epoch_samples * 3
-
-  def test_set_num_epochs_updates_len(self, tmp_dir):
-    """set_num_epochs() should update __len__ without rebuilding the source."""
-    docs = [np.arange(51, dtype=np.int32) + 100]
-    scatter_dir = _make_test_scatter(tmp_dir, "epoch_set", [docs])
-
-    source = MultiShardLazyDataSource(
-        scatter_dir=scatter_dir,
-        mode="sliding_window",
-        seq_length=SEQ_LENGTH + 1,
-        eos_token_id=EOS_TOKEN_ID,
-    )
-    base_len = source._total_samples
-    assert len(source) == base_len  # num_epochs=1 by default
-
-    source.set_num_epochs(5)
-    assert len(source) == base_len * 5
-
   def test_epoch_boundary_triggers_reshuffle(self, tmp_dir):
-    """With loader_online_shuffle + num_epochs>1, crossing epoch boundary
+    """With loader_online_shuffle, crossing epoch boundary via direct index
     should produce a different sample ordering."""
     rng = np.random.default_rng(42)
     docs = _make_docs(rng, num_docs=10, min_len=20, max_len=40)
@@ -1136,21 +1350,18 @@ class TestEpochHandling:
         eos_token_id=EOS_TOKEN_ID,
         loader_online_shuffle=True,
         loader_seed=42,
-        num_epochs=3,
     )
     n = source._total_samples
     assert n > 0
 
-    # Collect samples from epoch 0 and epoch 1
+    # Access indices beyond total_samples to trigger epoch detection
     epoch0 = [source[i]["text"].copy() for i in range(n)]
     epoch1 = [source[n + i]["text"].copy() for i in range(n)]
 
     # Both epochs should contain the same *set* of samples (just reordered)
-    # Check that orderings differ
     diffs = sum(1 for a, b in zip(epoch0, epoch1) if not np.array_equal(a, b))
     assert diffs > 0, "Epoch 0 and 1 should have different orderings"
 
-    # Same content as a set
     epoch0_sorted = sorted(epoch0, key=lambda x: x.tobytes())
     epoch1_sorted = sorted(epoch1, key=lambda x: x.tobytes())
     for a, b in zip(epoch0_sorted, epoch1_sorted):
@@ -1158,13 +1369,12 @@ class TestEpochHandling:
 
   def test_scatter_uneven_shards_cross_epoch(self, tmp_dir):
     """Different scatter groups have unequal sample counts; verify each
-    group can iterate across multiple epochs independently.
+    group can iterate across multiple epochs via direct index access.
 
     Setup: 4 shards with very different sizes assigned to 2 scatter groups.
       Group 0 (shards 0,1): small (20+20=40 tokens)
       Group 1 (shards 2,3): large (60+60=120 tokens)
     With seq_length=17, group 0 has ~2 samples, group 1 has ~7 samples.
-    3 epochs should allow full iteration for both groups.
     """
     shard_docs = [
         [np.arange(20, dtype=np.int32) + 1000],  # shard 0: small
@@ -1175,7 +1385,6 @@ class TestEpochHandling:
     scatter_dir = _make_test_scatter(tmp_dir, "scatter_epoch", shard_docs)
 
     effective_seq = SEQ_LENGTH + 1  # 17
-    num_epochs = 3
 
     # Group 0: rank 0 with scatter=-2 -> shards [0, 1]
     src_g0 = MultiShardLazyDataSource(
@@ -1185,7 +1394,6 @@ class TestEpochHandling:
         eos_token_id=EOS_TOKEN_ID,
         loader_scatter=-2,
         process_index=0,
-        num_epochs=num_epochs,
     )
     # Group 1: rank 1 with scatter=-2 -> shards [2, 3]
     src_g1 = MultiShardLazyDataSource(
@@ -1195,25 +1403,24 @@ class TestEpochHandling:
         eos_token_id=EOS_TOKEN_ID,
         loader_scatter=-2,
         process_index=1,
-        num_epochs=num_epochs,
     )
 
     n0 = src_g0._total_samples
     n1 = src_g1._total_samples
     assert n0 != n1, "Groups should have different sample counts for this test"
-    assert len(src_g0) == n0 * num_epochs
-    assert len(src_g1) == n1 * num_epochs
+    assert len(src_g0) == n0
+    assert len(src_g1) == n1
 
-    # Iterate all indices across all epochs — should not raise
-    for i in range(len(src_g0)):
+    # Access indices across multiple epochs — should not raise
+    num_epochs = 3
+    for i in range(n0 * num_epochs):
       sample = src_g0[i]["text"]
       assert sample.shape == (effective_seq,)
-    for i in range(len(src_g1)):
+    for i in range(n1 * num_epochs):
       sample = src_g1[i]["text"]
       assert sample.shape == (effective_seq,)
 
     # Verify epoch wrap: sample at index n0 should equal sample at index 0
-    # (without shuffle, epoch 1 repeats epoch 0)
     np.testing.assert_array_equal(src_g0[0]["text"], src_g0[n0]["text"])
     np.testing.assert_array_equal(src_g1[0]["text"], src_g1[n1]["text"])
 
@@ -1229,7 +1436,6 @@ class TestEpochHandling:
     scatter_dir = _make_test_scatter(tmp_dir, "scatter_shuf_epoch", shard_docs)
 
     effective_seq = SEQ_LENGTH + 1
-    num_epochs = 3
 
     src_g0 = MultiShardLazyDataSource(
         scatter_dir=scatter_dir,
@@ -1240,7 +1446,6 @@ class TestEpochHandling:
         process_index=0,
         loader_online_shuffle=True,
         loader_seed=999,
-        num_epochs=num_epochs,
     )
     src_g1 = MultiShardLazyDataSource(
         scatter_dir=scatter_dir,
@@ -1251,7 +1456,6 @@ class TestEpochHandling:
         process_index=1,
         loader_online_shuffle=True,
         loader_seed=999,
-        num_epochs=num_epochs,
     )
 
     n0 = src_g0._total_samples
@@ -1270,39 +1474,35 @@ class TestEpochHandling:
       diffs = sum(1 for a, b in zip(e0, e1) if not np.array_equal(a, b))
       assert diffs > 0, "Group 1 shuffle should differ across epochs"
 
-  def test_blended_num_epochs_inflates_len(self, tmp_dir):
-    """LazyBlendedDataSource.set_num_epochs should inflate __len__ at the
-    blend level, not at sub-source level."""
-    rng = np.random.default_rng(77)
-    docs_a = _make_docs(rng, num_docs=8, min_len=20, max_len=40)
-    docs_b = _make_docs(rng, num_docs=4, min_len=20, max_len=40)
-    scatter_a = _make_test_scatter(tmp_dir, "blend_ep_a", [docs_a])
-    scatter_b = _make_test_scatter(tmp_dir, "blend_ep_b", [docs_b])
+  def test_single_weighted_source_uses_blend_wrapper(self, monkeypatch):
+    """A single source with explicit weights should still go through blend."""
 
-    effective_seq = SEQ_LENGTH + 1
-    src_a = MultiShardLazyDataSource(
-        scatter_dir=scatter_a, mode="sliding_window", seq_length=effective_seq, eos_token_id=EOS_TOKEN_ID
+    class _FakeSource:
+
+      def __len__(self):
+        return 10
+
+      def __getitem__(self, idx):
+        return {"text": np.array([idx], dtype=np.int32)}
+
+    monkeypatch.setattr(lazy_data_processing, "_build_source", lambda *args, **kwargs: _FakeSource())
+
+    config = SimpleNamespace(
+        lazy_data_root="",
+        lazy_dataset_weight_mode="epoch",
+        lazy_blend_shuffle_seed=-1,
+        lazy_blend_shuffle_only_dataset=False,
+        lazy_blend_cache_dir="",
+        lazy_loader_scatter=1,
+        lazy_data_size_B_tokens=1.0,
+        max_target_length=16,
     )
-    src_b = MultiShardLazyDataSource(
-        scatter_dir=scatter_b, mode="sliding_window", seq_length=effective_seq, eos_token_id=EOS_TOKEN_ID
-    )
 
-    weights = np.array([0.8, 0.2], dtype=np.float64)
-    blend_size = int(0.8 * len(src_a) + 0.2 * len(src_b))
-    if blend_size == 0:
-      pytest.skip("Not enough tokens for blending test")
+    blended = lazy_data_processing._build_blend(config, ["dummy.scatter"], [0.5], "train", process_index=0)
 
-    blended = LazyBlendedDataSource([src_a, src_b], weights, blend_size)
-    assert len(blended) == blend_size  # 1 epoch
-
-    blended.set_num_epochs(3)
-    assert len(blended) == blend_size * 3
-
-    # All indices should be accessible
-    for i in range(len(blended)):
-      sample = blended[i]
-      tokens = sample["text"] if isinstance(sample, dict) else sample
-      assert len(tokens) == effective_seq
+    assert isinstance(blended, LazyBlendedDataSource)
+    assert len(blended.sources) == 1
+    assert len(blended) == 5
 
   def test_blended_epoch_repeats_same_order(self, tmp_dir):
     """Blend epochs repeat the same sample order (blend indices are fixed)."""
@@ -1326,10 +1526,9 @@ class TestEpochHandling:
       pytest.skip("Not enough tokens")
 
     blended = LazyBlendedDataSource([src_a, src_b], weights, blend_size)
-    blended.set_num_epochs(2)
 
-    # Epoch 0 and epoch 1 should produce identical samples
-    # (no sub-source shuffle, blend order is deterministic)
+    # Blend wraps via idx % _size, so epoch 0 and epoch 1 produce identical
+    # samples (no sub-source shuffle, blend order is deterministic)
     for i in range(blend_size):
       s0 = blended[i]
       s1 = blended[blend_size + i]
@@ -1337,43 +1536,139 @@ class TestEpochHandling:
       t1 = s1["text"] if isinstance(s1, dict) else np.asarray(s1)
       np.testing.assert_array_equal(t0, t1, err_msg=f"Mismatch at blend index {i}")
 
-  def test_blended_epoch_propagates_to_subsource_shuffle(self, tmp_dir):
-    """When sub-sources have loader_online_shuffle, blend epoch boundaries
-    should trigger re-shuffle in sub-sources via the sample_idx offset."""
-    rng = np.random.default_rng(99)
-    # Need enough samples so shuffle produces visible reordering
-    docs = _make_docs(rng, num_docs=15, min_len=20, max_len=40)
-    scatter_dir = _make_test_scatter(tmp_dir, "blend_shuf_prop", [docs])
+  def test_blended_cross_epoch_identical_with_shuffle(self, tmp_dir):
+    """Key antllm alignment test: blend epoch 0 and 1 produce identical
+    sequences even with multiple shuffled sub-sources."""
+    rng = np.random.default_rng(111)
+    docs_a = _make_docs(rng, num_docs=10, min_len=20, max_len=40)
+    docs_b = _make_docs(rng, num_docs=6, min_len=20, max_len=40)
+    scatter_a = _make_test_scatter(tmp_dir, "cross_ep_a", [docs_a])
+    scatter_b = _make_test_scatter(tmp_dir, "cross_ep_b", [docs_b])
 
     effective_seq = SEQ_LENGTH + 1
-    src = MultiShardLazyDataSource(
-        scatter_dir=scatter_dir,
+    src_a = MultiShardLazyDataSource(
+        scatter_dir=scatter_a,
+        mode="sliding_window",
+        seq_length=effective_seq,
+        eos_token_id=EOS_TOKEN_ID,
+        loader_online_shuffle=True,
+        loader_seed=77,
+    )
+    src_b = MultiShardLazyDataSource(
+        scatter_dir=scatter_b,
+        mode="sliding_window",
+        seq_length=effective_seq,
+        eos_token_id=EOS_TOKEN_ID,
+        loader_online_shuffle=True,
+        loader_seed=77,
+    )
+
+    weights = np.array([0.7, 0.3], dtype=np.float64)
+    blend_size = int(0.7 * len(src_a) + 0.3 * len(src_b))
+    if blend_size < 2:
+      pytest.skip("Not enough tokens for blending test")
+
+    blended = LazyBlendedDataSource([src_a, src_b], weights, blend_size)
+
+    for i in range(blend_size):
+      s0 = blended[i]["text"]
+      s1 = blended[blend_size + i]["text"]
+      np.testing.assert_array_equal(s0, s1, err_msg=f"Cross-epoch mismatch at blend index {i}")
+
+  def test_within_blend_subsource_epoch_crossing(self, tmp_dir):
+    """When weight > 1 for a dataset, the greedy algorithm produces
+    dataset_sample_index values exceeding len(ds), naturally triggering
+    sub-source epoch transition and re-shuffle within a single blend pass."""
+    rng = np.random.default_rng(222)
+    # Small dataset: few samples so greedy algorithm easily exceeds len(ds)
+    docs_small = _make_docs(rng, num_docs=3, min_len=20, max_len=30)
+    # Large dataset to pair with
+    docs_large = _make_docs(rng, num_docs=20, min_len=20, max_len=40)
+    scatter_small = _make_test_scatter(tmp_dir, "epoch_cross_small", [docs_small])
+    scatter_large = _make_test_scatter(tmp_dir, "epoch_cross_large", [docs_large])
+
+    effective_seq = SEQ_LENGTH + 1
+    src_small = MultiShardLazyDataSource(
+        scatter_dir=scatter_small,
         mode="sliding_window",
         seq_length=effective_seq,
         eos_token_id=EOS_TOKEN_ID,
         loader_online_shuffle=True,
         loader_seed=42,
     )
-    n_sub = src._total_samples
-    if n_sub < 3:
+    src_large = MultiShardLazyDataSource(
+        scatter_dir=scatter_large,
+        mode="sliding_window",
+        seq_length=effective_seq,
+        eos_token_id=EOS_TOKEN_ID,
+        loader_online_shuffle=True,
+        loader_seed=42,
+    )
+    n_small = src_small._total_samples
+    n_large = src_large._total_samples
+    if n_small < 1 or n_large < 1:
       pytest.skip("Not enough samples")
 
-    weights = np.array([1.0], dtype=np.float64)
-    blended = LazyBlendedDataSource([src], weights, n_sub)
-    blended.set_num_epochs(3)
+    # Give the small dataset a high weight so it gets many more draws
+    # than its actual sample count, crossing epoch boundary naturally.
+    weights = np.array([0.9, 0.1], dtype=np.float64)
+    blend_size = int(0.9 * n_small * 5 + 0.1 * n_large)
+    if blend_size < 2:
+      pytest.skip("Not enough samples for blending")
 
-    # Epoch 0 vs epoch 1 should have different orderings
-    e0 = [blended[i]["text"].copy() for i in range(n_sub)]
-    e1 = [blended[n_sub + i]["text"].copy() for i in range(n_sub)]
+    blended = LazyBlendedDataSource([src_small, src_large], weights, blend_size)
 
-    diffs = sum(1 for a, b in zip(e0, e1) if not np.array_equal(a, b))
-    assert diffs > 0, "Blend epoch should propagate to sub-source shuffle"
+    # Check that dataset_sample_index for dataset 0 exceeds n_small
+    ds0_mask = blended.dataset_index == 0
+    ds0_sample_indices = blended.dataset_sample_index[ds0_mask]
+    max_ds0_idx = int(ds0_sample_indices.max()) if ds0_mask.any() else 0
+    assert max_ds0_idx >= n_small, (
+        f"Expected dataset_sample_index to exceed len(ds)={n_small}, "
+        f"but max was {max_ds0_idx}. Increase blend_size or weight."
+    )
 
-    # But same content as a set
-    e0_sorted = sorted(e0, key=lambda x: x.tobytes())
-    e1_sorted = sorted(e1, key=lambda x: x.tobytes())
-    for a, b in zip(e0_sorted, e1_sorted):
-      np.testing.assert_array_equal(a, b)
+    # All indices should be accessible without errors
+    for i in range(blend_size):
+      sample = blended[i]
+      assert "text" in sample
+      assert sample["text"].shape == (effective_seq,)
+
+  def test_make_lazy_train_iterator_uses_repeat(self, monkeypatch):
+    """Train iterator should always use Grain .repeat(num_epochs)."""
+
+    class _FakeSource:
+      """Stub source for testing repeat path."""
+
+      def __len__(self):
+        return 17
+
+    fake_source = _FakeSource()
+    captured = {}
+
+    monkeypatch.setattr(lazy_data_processing, "_build_blend", lambda *args, **kwargs: fake_source)
+    monkeypatch.setattr(lazy_data_processing, "_compute_num_epochs", lambda *args, **kwargs: 3)
+
+    def _fake_build_pipeline(config, source, global_mesh, process_indices, files_str="", repeat_epochs=1):
+      captured["source"] = source
+      captured["files_str"] = files_str
+      captured["repeat_epochs"] = repeat_epochs
+      return captured
+
+    monkeypatch.setattr(lazy_data_processing, "_build_pipeline", _fake_build_pipeline)
+    monkeypatch.setattr(lazy_data_processing, "MultiHostDataLoadIterator", lambda dataset, *args, **kwargs: dataset)
+
+    config = SimpleNamespace(
+        lazy_train_files="dummy_scatter",
+        lazy_valid_files="",
+        lazy_test_files="",
+        lazy_split="",
+        generate_padding_batch_train=False,
+    )
+
+    result = lazy_data_processing.make_lazy_train_iterator(config, global_mesh=None, process_indices=[0])
+    assert result["source"] is fake_source  # pylint: disable=unsubscriptable-object
+    assert result["files_str"] == "dummy_scatter"  # pylint: disable=unsubscriptable-object
+    assert result["repeat_epochs"] == 3  # pylint: disable=unsubscriptable-object
 
 
 # ---------------------------------------------------------------------------
@@ -1437,6 +1732,13 @@ class TestResolveModePerDataset:
     assert _resolve_mode(cfg, "my_dataset.scatter") == "pack"
     assert _resolve_mode(cfg, "/a/b/c/other.scatter") == "sliding_window"
 
+  def test_bfd_pack_extracts_name_from_hash_subdir(self):
+    """Hash-subdir scatter paths should still match by dataset name."""
+    cfg = _FakeBfdConfig(lazy_bfd_pack="dataset")
+    assert _resolve_mode(cfg, "/a/b/c/my_dataset.scatter/hash123") == "pack"
+    cfg = _FakeBfdConfig(lazy_bfd_pack="my_dataset")
+    assert _resolve_mode(cfg, "/a/b/c/379824db_my_dataset.scatter/hash123") == "pack"
+
   def test_bfd_pack_overrides_global_mode(self):
     """lazy_bfd_pack overrides lazy_loader_mode even when global is 'map'."""
     cfg = _FakeBfdConfig(lazy_loader_mode="map", lazy_bfd_pack="ds1")
@@ -1488,6 +1790,33 @@ class TestResolveModePerDataset:
     # Sliding window mode: sample is a sequential window
     sample_slide = src_slide[0]["text"]
     assert sample_slide.shape == (effective_seq,)
+
+
+# ---------------------------------------------------------------------------
+# Dataset name resolution helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetNameResolution:
+  """Tests for path-to-dataset-name normalization."""
+
+  def test_extracts_bare_dataset_name(self):
+    assert _dataset_name_from_path("my_dataset") == "my_dataset"
+
+  def test_extracts_name_from_scatter_path(self):
+    assert _dataset_name_from_path("/a/b/c/my_dataset.scatter") == "my_dataset"
+
+  def test_extracts_name_from_hash_subdir_path(self):
+    assert _dataset_name_from_path("/a/b/c/my_dataset.scatter/hash123") == "dataset"
+
+  def test_strips_native_mdata_prefix_for_hash_subdir_path(self):
+    assert _dataset_name_from_path("/a/b/c/379824db_my_dataset.scatter/hash123") == "my_dataset"
+
+  def test_resolves_no_attnmask_ids_from_mixed_path_forms(self):
+    files_str = "0.7 /a/b/c/379824db_ds_a.scatter/hash123 0.3 ds_b"
+    assert _resolve_no_attnmask_ids(files_str, "ds_a") == {0}
+    assert _resolve_no_attnmask_ids(files_str, "ds_b") == {1}
+    assert _resolve_no_attnmask_ids(files_str, "ds_a,ds_b") == {0, 1}
 
 
 # ---------------------------------------------------------------------------

@@ -14,9 +14,27 @@ import tempfile
 from typing import Sequence
 
 import grain.python as grain
+from grain.python import SharedMemoryArray
 import numpy as np
 
 from maxtext.input_pipeline._megatron_blending import build_blending_indices
+
+
+def _new_shm(shape, dtype) -> SharedMemoryArray:
+  """Allocate a zeroed SharedMemoryArray in POSIX shared memory."""
+  shm_arr = SharedMemoryArray(shape, np.dtype(dtype))
+  shm_arr.fill(0)
+  shm_arr.unlink_on_del()
+  return shm_arr
+
+
+def _take_shm(arr: np.ndarray, indices: np.ndarray) -> SharedMemoryArray:
+  """Fancy-index ``arr[indices]`` directly into a new SharedMemoryArray (zero-copy)."""
+  shm_arr = SharedMemoryArray(indices.shape, arr.dtype)
+  np.take(arr, indices, out=shm_arr)
+  shm_arr.unlink_on_del()
+  return shm_arr
+
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +168,6 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
 
     self._sources = list(sources)
     self._size = size
-    self._num_epochs = 1
     num_datasets = len(sources)
 
     # Scatter group identity: all processes with the same scatter_id load
@@ -180,15 +197,18 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
         scatter_id=scatter_id,
         source_lengths=source_lengths,
     )
+    self._blend_cache_dir = cache_dir
+    self._blend_cache_key = cache_key
+
     cached = _try_load_blend_cache(cache_dir, cache_key, size) if cache_dir else None
 
     if cached is not None:
       self._dataset_index, self._dataset_sample_index = cached
     else:
-      # Build blending indices (same algorithm as antllm C++ helper)
+      # Build blending indices directly into shared memory (zero-copy).
       logger.info("Building blending indices: size=%d, num_datasets=%d ...", size, num_datasets)
-      self._dataset_index = np.zeros(size, dtype=np.int16)
-      self._dataset_sample_index = np.zeros(size, dtype=np.int64)
+      self._dataset_index = _new_shm((size,), np.int16)
+      self._dataset_sample_index = _new_shm((size,), np.int64)
       build_blending_indices(
           dataset_index=self._dataset_index,
           dataset_sample_index=self._dataset_sample_index,
@@ -198,13 +218,11 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
       )
 
       # Optional shuffle (antllm BlendableDataset lines 204-218)
-      # Memory optimization: del intermediates aggressively so old arrays
-      # are freed before new ones are allocated (peak 2x instead of 3x).
       if shuffle_seed > 0:
         rng = np.random.RandomState(shuffle_seed)
         inds = np.arange(size, dtype=np.int64)
         rng.shuffle(inds)
-        self._dataset_index = self._dataset_index[inds]
+        self._dataset_index = _take_shm(self._dataset_index, inds)
         if shuffle_only_dataset:
           # antllm: only shuffle dataset_index, regenerate dataset_sample_index
           # as contiguous [0, 1, 2, ...] per dataset (lines 213-216)
@@ -213,9 +231,8 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
             mask = self._dataset_index == i
             self._dataset_sample_index[mask] = np.arange(mask.sum())
         else:
-          new_dsi = self._dataset_sample_index[inds]
+          self._dataset_sample_index = _take_shm(self._dataset_sample_index, inds)
           del inds
-          self._dataset_sample_index = new_dsi
 
       # Only one process per scatter group writes; atomic save prevents
       # concurrent readers from seeing partial files.
@@ -231,49 +248,14 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
         shuffle_only_dataset,
     )
 
-  # ---------------------------------------------------------------
-  # Epoch support
-  # ---------------------------------------------------------------
-  # Grain iterates indices 0..len()-1, then StopIteration.  To support
-  # multi-epoch training without Grain's .repeat() (which mods indices
-  # back and hides epoch boundaries from sub-sources), we inflate
-  # __len__ to _size * _num_epochs and wrap idx in __getitem__.
-  #
-  # Within each blend epoch the sample ordering is identical (the
-  # precomputed dataset_index / dataset_sample_index repeat).  This
-  # matches antllm behavior where the blend ordering is fixed and
-  # only the sub-source online shuffle (if enabled) varies per epoch.
-  #
-  # Sub-source epoch detection: dataset_sample_index values are
-  # cumulative per-dataset counters (0, 1, 2, ...).  Across blend
-  # epochs the same counters repeat, so raw sample_idx stays within
-  # one epoch of the sub-source.  To propagate the blend epoch to
-  # sub-sources (triggering their per-epoch shuffle), we offset
-  # sample_idx by blend_epoch * sub_source_len.  This way the
-  # sub-source's __getitem__ sees:
-  #   epoch = (sample_idx + offset) // sub_total → blend_epoch
-  # and calls _set_epoch() with the correct epoch number.
-  # ---------------------------------------------------------------
-
-  def set_num_epochs(self, num_epochs: int):
-    """Set number of epochs, inflating __len__ accordingly."""
-    self._num_epochs = num_epochs
-
   def __len__(self) -> int:
-    return self._size * self._num_epochs
+    return self._size
 
   def __getitem__(self, idx: int):
-    blend_epoch = idx // self._size
     idx_in_epoch = idx % self._size
     ds_idx = int(self._dataset_index[idx_in_epoch])
     sample_idx = int(self._dataset_sample_index[idx_in_epoch])
-    source = self._sources[ds_idx]
-    # Offset sample_idx by blend_epoch so that sub-sources with
-    # loader_online_shuffle detect the epoch boundary and re-shuffle.
-    # For sub-sources without shuffle, the extra offset is harmless
-    # because __getitem__ does global_index % total_samples anyway.
-    effective_sample_idx = sample_idx + blend_epoch * len(source)
-    result = source[effective_sample_idx]
+    result = self._sources[ds_idx][sample_idx]
     result["dataset_id"] = np.int32(ds_idx)
     return result
 
@@ -291,17 +273,27 @@ class LazyBlendedDataSource(grain.RandomAccessDataSource):
     return self._dataset_sample_index
 
   def __getstate__(self):
-    return {
+    state = {
         "sources": self._sources,
-        "dataset_index": self._dataset_index,
-        "dataset_sample_index": self._dataset_sample_index,
         "size": self._size,
-        "num_epochs": self._num_epochs,
+        "blend_cache_dir": self._blend_cache_dir,
+        "blend_cache_key": self._blend_cache_key,
     }
+    if isinstance(self._dataset_index, SharedMemoryArray):
+      state["dataset_index"] = self._dataset_index
+      state["dataset_sample_index"] = self._dataset_sample_index
+    return state
 
   def __setstate__(self, state):
     self._sources = state["sources"]
-    self._dataset_index = state["dataset_index"]
-    self._dataset_sample_index = state["dataset_sample_index"]
     self._size = state["size"]
-    self._num_epochs = state.get("num_epochs", 1)
+    self._blend_cache_dir = state.get("blend_cache_dir")
+    self._blend_cache_key = state.get("blend_cache_key")
+    if "dataset_index" in state:
+      self._dataset_index = state["dataset_index"]
+      self._dataset_sample_index = state["dataset_sample_index"]
+    else:
+      cached = _try_load_blend_cache(self._blend_cache_dir, self._blend_cache_key, self._size)
+      if cached is None:
+        raise RuntimeError(f"Blend cache missing in worker: dir={self._blend_cache_dir}, key={self._blend_cache_key}")
+      self._dataset_index, self._dataset_sample_index = cached
