@@ -65,6 +65,7 @@ Example Usage:
 """
 
 import jax
+import numpy as np
 import os
 from typing import Sequence
 import time
@@ -113,6 +114,12 @@ flags.DEFINE_bool(
     False,
     "Pass trust_remote_code=True to AutoConfig/AutoTokenizer. Required when "
     "--hf_reference_path points to a repo with custom modeling code.",
+)
+flags.DEFINE_string(
+    "save_dtype",
+    "",
+    "Cast all weights to this dtype before saving (e.g., 'bfloat16', 'float16'). "
+    "If empty, preserve the original checkpoint dtype.",
 )
 
 FLAGS = flags.FLAGS
@@ -292,6 +299,9 @@ def main(argv: Sequence[str]) -> None:
   max_logging.log("\nProccessing weight...")
   start = time.time()
   processed_params_list = []
+  target_dtype = np.dtype(FLAGS.save_dtype) if FLAGS.save_dtype else None
+  if target_dtype:
+    max_logging.log(f"Will cast weights to {target_dtype} during transform...")
 
   for key in MemoryMonitorTqdm(filtered_map_keys, total=len(filtered_map_keys), leave=True):
     if isinstance(key, tuple):
@@ -302,6 +312,9 @@ def main(argv: Sequence[str]) -> None:
       weight = maxtext_state_dict[key]
 
     processed_params = process_maxtext_param(key, weight, param_map, hook_fn_map, shape_map, config)
+    # Cast inline to avoid a second full-weight traversal
+    if target_dtype:
+      processed_params = [(k, v.astype(target_dtype)) for k, v in processed_params]
     processed_params_list.extend(processed_params)
 
   transformed_hf_weights = dict(processed_params_list)

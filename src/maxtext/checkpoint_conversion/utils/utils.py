@@ -16,6 +16,7 @@
 
 import contextlib
 import io
+import multiprocessing as mp
 import os
 import tempfile
 import time
@@ -86,6 +87,22 @@ def _import_epath():
   from etils import epath  # pylint: disable=import-outside-toplevel
 
   return epath
+
+
+# Module-level dict shared with forked workers via copy-on-write.
+_MP_SHARDS = {}
+
+
+def _mp_save_shard_worker(args):
+  """Worker function for multiprocessing-based shard saving (must be module-level for pickling)."""
+  shard_name, local_dir = args
+  from safetensors.numpy import save_file  # pylint: disable=import-outside-toplevel
+
+  shard = _MP_SHARDS[shard_name]
+  filtered = {k: v for k, v in shard.items() if v is not None}
+  path = os.path.join(local_dir, shard_name)
+  save_file(filtered, path, metadata={"format": "pt"})
+  return shard_name, path
 
 
 SAFE_TENSORS_CONFIG_FILE = "config.json"
@@ -545,33 +562,52 @@ def save_weight_files(
     index,
     local_dir_to_save_to: str,
     output_dir_final: str,
-    parallel_threads=8,
+    parallel_threads=32,
     remove_local_copy_after_upload: bool = False,
 ):
   """Saves weight files and index if needed.
 
+  For local output, uses multiprocessing (fork) to bypass the GIL and achieve
+  true parallel serialization of safetensors shards.  For remote output (GCS/HF),
+  keeps the original ThreadPoolExecutor (IO-bound, GIL is not the bottleneck).
+
   Requires local system to have at least `parallel_threads * DEFAULT_MAX_SHARD_SIZE`
-  free disk space, as each thread will maintain a local cache of its shard during processing.
+  free disk space, as each worker will maintain a local cache of its shard during processing.
   """
   if index is None:
     # 'shards' is actually the single state_dict here
     save_safetensor_file(shards, local_dir_to_save_to, output_dir_final, SAFE_TENSORS_WEIGHTS_FILE)
   else:
-    # Save sharded weights in parallel
-    with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
-      shard_items = list(shards.items())
-      futures = [
-          executor.submit(
-              save_safetensor_file,
-              shard_dict,
-              local_dir_to_save_to,
-              output_dir_final,
-              shard_name,
-          )
-          for shard_name, shard_dict in shard_items
-      ]
-      for future in futures:
-        future.result()
+    is_local = not output_dir_final.startswith("gs://") and not output_dir_final.startswith("hf://")
+
+    if is_local and jax.process_index() == 0:
+      # Multiprocessing (fork): bypass GIL for CPU-bound safetensors serialization.
+      # fork's COW semantics avoid copying the large weight arrays.
+      global _MP_SHARDS  # pylint: disable=global-statement
+      _MP_SHARDS = shards
+      ctx = mp.get_context("fork")
+      num_workers = min(parallel_threads, len(shards))
+      with ctx.Pool(num_workers) as pool:
+        tasks = [(name, local_dir_to_save_to) for name in shards]
+        for name, path in pool.imap_unordered(_mp_save_shard_worker, tasks):
+          max_logging.log(f"   Saved {name} to {path}")
+      _MP_SHARDS = {}
+    else:
+      # Remote output or non-zero process: keep ThreadPoolExecutor (IO-bound)
+      with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+        shard_items = list(shards.items())
+        futures = [
+            executor.submit(
+                save_safetensor_file,
+                shard_dict,
+                local_dir_to_save_to,
+                output_dir_final,
+                shard_name,
+            )
+            for shard_name, shard_dict in shard_items
+        ]
+        for future in futures:
+          future.result()
 
     # Save index file
     save_index_file(
@@ -604,7 +640,7 @@ def save_model_files(
     tokenizer: None | Any,  # transformers.PreTrainedTokenizerBase
     processor,
     output_dir: str,
-    parallel_threads=8,
+    parallel_threads=32,
 ):
   """
   Saves model files (config and weights) to the specified directory.
