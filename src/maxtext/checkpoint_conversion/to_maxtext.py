@@ -75,7 +75,7 @@ import jax
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import MODEL_MODE_TRAIN
 from maxtext.checkpoint_conversion.standalone_scripts.llama_or_mistral_ckpt import save_weights_to_checkpoint
-from maxtext.checkpoint_conversion.utils.param_mapping import HOOK_FNS, PARAM_MAPPING
+from maxtext.checkpoint_conversion.utils.param_mapping import HOOK_FNS, PARAM_MAPPING, get_expert_axis_keys
 from maxtext.checkpoint_conversion.utils.utils import MemoryMonitorTqdm, apply_hook_fns, get_hf_model, print_peak_memory, print_ram_usage, validate_and_filter_param_map_keys
 from maxtext.inference.inference_utils import str2bool
 from maxtext.layers import quantizations
@@ -386,6 +386,7 @@ def _build_single_axis_stacked_tensor(
     hook_fns: Any,
     target_shape: tuple,
     config,
+    is_expert_axis: bool = False,
 ) -> np.ndarray:
   """Builds a MaxText tensor by stacking HF weights along a single axis.
 
@@ -404,7 +405,12 @@ def _build_single_axis_stacked_tensor(
   """
   tensors_to_stack = []
 
-  if config.scan_layers:
+  # `is_expert_axis` (per-key override) takes priority over the global scan_layers flag,
+  # supporting models like Ling3 whose mixed scan/unscan layout emits 1D-list expert keys
+  # alongside 1D-list scan keys under a single global scan_layers=True.
+  if is_expert_axis:
+    axis_to_stack = 0
+  elif config.scan_layers:
     # If it's a standard scanned layer, we use the configured param_scan_axis.
     axis_to_stack = config.param_scan_axis
   else:
@@ -426,13 +432,20 @@ def _build_single_axis_stacked_tensor(
   return np.stack(tensors_to_stack, axis=axis_to_stack)
 
 
-def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_shape_or_shapes, config):
+def _get_hf_loading_function(
+    hf_source_keys_or_key, tensor_getter, hook_fn, mt_target_shape_or_shapes, config, is_expert_axis: bool = False
+):
   """Determine the loading function for HF keys.
   HF keys can take four forms:
     Case 1: Unscanned (single string)
     Case 2: Scanned (list of strings)
     Case 3: Unscanned with expert stacking (list of strings)
     Case 4: Scanned with expert stacking (nested list of strings)
+
+  When `is_expert_axis=True`, the Case 2/3 disambiguation forces axis 0 stacking
+  (expert axis) regardless of `config.scan_layers`. Used for Ling3-style mixed
+  scan/unscan layouts where unscan-prefix MoE / MTP expert keys coexist with
+  scan-region keys under a single global scan_layers=True.
   """
   load_fn = None
   if not isinstance(hf_source_keys_or_key, list):
@@ -457,6 +470,7 @@ def _get_hf_loading_function(hf_source_keys_or_key, tensor_getter, hook_fn, mt_t
         hook_fn,
         mt_target_shape_or_shapes,
         config,
+        is_expert_axis=is_expert_axis,
     )
   else:
     # isinstance(hf_source_keys_or_key[0], list)
@@ -657,6 +671,8 @@ def main(
   # Example of Hook FN mapping, to perform reshape:
   # f"params-decoder-layers_{maxtext_layer_idx}-self_attention_global-key-kernel": reshape_kernel,
   hook_fn_map_mt = HOOK_FNS[model_key](hf_config_obj.to_dict(), config, config.scan_layers, saving_to_hf=False)
+  # Per-key axis-0 override set (Ling3 mixed scan/unscan); empty for models that don't register.
+  expert_axis_keys = get_expert_axis_keys(model_key, hf_config_obj.to_dict(), config, config.scan_layers)
   max_logging.log("Parameter mappings and hooks obtained.")
 
   maxtext_abstract_dict, abstract_params_treedef = get_maxtext_model_info(config)
@@ -693,12 +709,14 @@ def main(
 
     # Step 2: Determine the loading function for hf key
     # based on hf_key form (unscanned, scanned, unscanned with expert stacking, or scanned with expert stacking)
+    is_expert_axis = mt_param_key_or_keys in expert_axis_keys
     load_fn = _get_hf_loading_function(
         hf_source_keys_or_key,
         tensor_getter,
         hook_fn,
         mt_target_shape_or_shapes,
         config,
+        is_expert_axis=is_expert_axis,
     )
 
     # Step 3: Load hf keys and convert to maxtext keys

@@ -79,6 +79,7 @@ from maxtext.configs import pyconfig
 from maxtext.checkpoint_conversion.utils.param_mapping import (
     HOOK_FNS,
     PARAM_MAPPING,
+    get_expert_axis_keys,
 )
 from maxtext.checkpoint_conversion.utils.hf_shape import HF_SHAPE
 from maxtext.checkpoint_conversion.utils.hf_model_configs import HF_MODEL_CONFIGS
@@ -150,6 +151,8 @@ def _get_model_mappings(
       "param_mapping": PARAM_MAPPING[model_name](hf_config_dict, maxtext_config, scan_layers),
       "shape_mapping": HF_SHAPE[model_name](hf_config_dict),
       "hook_fn_mapping": HOOK_FNS[model_name](hf_config_dict, maxtext_config, scan_layers, saving_to_hf=True),
+      # Per-key axis-0 override set (Ling3 mixed scan/unscan); empty for unregistered models.
+      "expert_axis_keys": get_expert_axis_keys(model_name, hf_config_dict, maxtext_config, scan_layers),
   }
 
 
@@ -286,6 +289,7 @@ def main(argv: Sequence[str]) -> None:
   param_map = mappings["param_mapping"]
   shape_map = mappings["shape_mapping"]  # HF target shapes
   hook_fn_map = mappings["hook_fn_mapping"]
+  expert_axis_keys = mappings["expert_axis_keys"]
 
   # 4. Extract and transform weights for Linen/NNX-SFT/NNX-RL checkpoints
   maxtext_state_dict = detect_and_extract_checkpoint(checkpoint_dict)
@@ -311,7 +315,9 @@ def main(argv: Sequence[str]) -> None:
       # if key is single param name, weight is single param weight
       weight = maxtext_state_dict[key]
 
-    processed_params = process_maxtext_param(key, weight, param_map, hook_fn_map, shape_map, config)
+    processed_params = process_maxtext_param(
+        key, weight, param_map, hook_fn_map, shape_map, config, expert_axis_keys=expert_axis_keys
+    )
     # Cast inline to avoid a second full-weight traversal
     if target_dtype:
       processed_params = [(k, v.astype(target_dtype)) for k, v in processed_params]

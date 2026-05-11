@@ -252,6 +252,7 @@ def process_maxtext_param(
     hook_fn_map: dict[str, Any],
     hf_shape_map: dict[str, Any],
     maxtext_config: Any,
+    expert_axis_keys: set[str] | None = None,
 ) -> list[tuple[str, np.ndarray]]:
   """Processes a single MaxText parameter (or a group of parameters) for conversion, used in to_huggingface.
 
@@ -315,7 +316,13 @@ def process_maxtext_param(
     # Case 2 or 3: The source tensor is stacked on a single axis.
     # i.e., hf_target_paths is an (un-nested) list
     # We determine if it's standard scanned (stack on layer axis) or unscanned MoE (stack on expert axis).
-    if maxtext_config.scan_layers:
+    # `expert_axis_keys` (per-key override) is checked first to support models like Ling3 whose
+    # mixed scan/unscan layout has 1D-list expert keys coexisting with 1D-list scan keys under a
+    # single global scan_layers=True.
+    if expert_axis_keys is not None and maxtext_param_key in expert_axis_keys:
+      max_logging.log("\texpert (per-key hint)")
+      axis_to_slice = 0
+    elif maxtext_config.scan_layers:
       max_logging.log("\tscan")
       # Case 2: Standard scanned layer.
       # The tensor is stacked ONLY on the layer axis.

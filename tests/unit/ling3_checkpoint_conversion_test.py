@@ -23,17 +23,23 @@ weights. Mirrors the Ling2 test template (RFC-0003, RFC-0017 §测试方案).
 
 import json
 import os
+import re
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from maxtext.checkpoint_conversion.utils.hf_shape import HF_SHAPE
 from maxtext.checkpoint_conversion.utils.param_mapping import (
+    EXPERT_AXIS_KEYS,
     HOOK_FNS,
+    LING3_EXPERT_AXIS_KEYS,
     LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN,
     LING3_MAXTEXT_TO_HF_PARAM_MAPPING,
     PARAM_MAPPING,
+    _ling3_unscan_prefix,
+    get_expert_axis_keys,
 )
 from maxtext.checkpoint_conversion.utils.utils import process_maxtext_param
 from maxtext.utils.globals import HF_IDS
@@ -390,14 +396,13 @@ class Ling3CheckpointConversionTest(unittest.TestCase):
     hooks = LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, saving_to_hf=True)
     self.assertIn(f"{mtp_tf_prefix}-query-kernel", hooks)
 
-  def test_scan_layers_plus_mtp_raises(self):
-    """scan_layers=True + has_mtp is unsupported by the framework; both functions raise."""
+  def test_scan_layers_plus_mtp_no_longer_raises(self):
+    """scan_layers=True + MTP is now supported via EXPERT_AXIS_KEYS registry."""
     hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
-    with self.assertRaises(NotImplementedError):
-      LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
-    with self.assertRaises(NotImplementedError):
-      LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=True)
-    # Sanity: scan_layers=True without MTP still works
+    # Both must NOT raise — the per-key registry replaces the prior NotImplementedError.
+    LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=True)
+    # Sanity: scan_layers=True without MTP also works
     hf_config_no_mtp, mt_config_no_mtp = _make_configs(num_nextn_predict_layers=0)
     LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config_no_mtp, mt_config_no_mtp, scan_layers=True)
     LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config_no_mtp, mt_config_no_mtp, scan_layers=True)
@@ -428,13 +433,11 @@ class Ling3CheckpointConversionTest(unittest.TestCase):
 class Ling3CheckpointConversionScanTest(unittest.TestCase):
   """Scan-mode (scan_layers=True) mapping tests — RFC-0017 §7 / RFC-0012 §4.6.
 
-  MTP is disabled here because scan_layers=True + MTP is guarded as
-  NotImplementedError (see test_scan_layers_plus_mtp_raises in the sister
-  class); scan-mode conversion is only supported with MTP off.
+  MTP is disabled here to keep these tests focused on scan-region mapping shape;
+  scan_layers=True + MTP is now supported (see Ling3MixedScanMTPTest).
   """
 
   def setUp(self):
-    # MTP off: scan_layers=True + MTP is explicitly unsupported.
     self.hf_config, self.maxtext_config = _make_configs(num_nextn_predict_layers=0)
     self.mapping = LING3_MAXTEXT_TO_HF_PARAM_MAPPING(self.hf_config, self.maxtext_config, scan_layers=True)
     self.hooks = LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(
@@ -698,6 +701,345 @@ class Ling3RealCheckpointShapeCoverageTest(unittest.TestCase):
         [],
         f"{len(missing)} real HF keys not emitted by PARAM_MAPPING: {missing[:5]}",
     )
+
+
+class Ling3MixedScanMTPTest(unittest.TestCase):
+  """Tests for the EXPERT_AXIS_KEYS registry + scan_layers=True with MTP support.
+
+  These tests cover the framework-side per-key axis-0 override that lets Ling3's
+  mixed unscan-prefix + scan-region + MTP layout convert in scan mode without
+  the prior NotImplementedError workaround.
+  """
+
+  # ---------- 5.1 不抛错 smoke ----------
+  def test_scan_mtp_mapping_does_not_raise(self):
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mt_config.scan_layers = True
+    LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+
+  def test_scan_mtp_hook_does_not_raise(self):
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mt_config.scan_layers = True
+    LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=True, saving_to_hf=True)
+    LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=True, saving_to_hf=False)
+
+  # ---------- 5.2 mtp_num_layers guard ----------
+  def test_mtp_num_layers_2_raises_in_scan_mode(self):
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mt_config.mtp_num_layers = 2
+    with self.assertRaises(NotImplementedError):
+      LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    with self.assertRaises(NotImplementedError):
+      LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=True)
+
+  def test_mtp_num_layers_2_raises_in_unscan_mode(self):
+    """Critical: guard must be independent of scan_layers (codex P1)."""
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mt_config.mtp_num_layers = 2
+    with self.assertRaises(NotImplementedError):
+      LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=False)
+    with self.assertRaises(NotImplementedError):
+      LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(hf_config, mt_config, scan_layers=False)
+
+  def test_mtp_config_inconsistent_raises(self):
+    """hf_config has MTP but maxtext_config says mtp_num_layers=0 (or vice versa) → ValueError."""
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mt_config.mtp_num_layers = 0
+    with self.assertRaises(ValueError):
+      LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    # Reverse: maxtext says MTP but HF doesn't.
+    hf_config2, mt_config2 = _make_configs(num_nextn_predict_layers=0)
+    mt_config2.mtp_num_layers = 1
+    with self.assertRaises(ValueError):
+      LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config2, mt_config2, scan_layers=True)
+
+  # ---------- 5.3 Registry 注册 + 内容程序化 ----------
+  def test_expert_axis_keys_registered(self):
+    self.assertIn("ling3-tiny", EXPERT_AXIS_KEYS)
+    # Other models fallback to empty set (codex regression guard against v2 heuristic).
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=0)
+    self.assertEqual(get_expert_axis_keys("mixtral-8x7b", hf_config, mt_config, True), set())
+    self.assertEqual(get_expert_axis_keys("gpt-oss-20b", hf_config, mt_config, True), set())
+    self.assertEqual(get_expert_axis_keys("deepseek3-671b", hf_config, mt_config, True), set())
+
+  def test_expert_axis_keys_contents_default_ling3_tiny(self):
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    self.assertEqual(LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=False), set())
+
+    hf_no_mtp, mt_no_mtp = _make_configs(num_nextn_predict_layers=0)
+    expected_unscan_only = set()
+    for moe_idx in (0, 1, 2):
+      for suffix in ("wi_0", "wi_1", "wo"):
+        expected_unscan_only.add(f"params-decoder-moe_layers_{moe_idx}-mlp-MoeBlock_0-{suffix}")
+    self.assertEqual(LING3_EXPERT_AXIS_KEYS(hf_no_mtp, mt_no_mtp, scan_layers=True), expected_unscan_only)
+
+    expected_with_mtp = set(expected_unscan_only)
+    mtp_tf = "params-mtp_block-mtp_layer_1-mtp_1_transformer_layer"
+    for suffix in ("wi_0", "wi_1", "wo"):
+      expected_with_mtp.add(f"{mtp_tf}-mlp-MoeBlock_0-{suffix}")
+    self.assertEqual(LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True), expected_with_mtp)
+
+  def test_expert_axis_keys_scales_with_first_num_dense_layers(self):
+    """Set scales programmatically with first_num_dense_layers, not hardcoded."""
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=0)
+    # first_num_dense_layers=0 → no unscan prefix → empty
+    hf_config["first_k_dense_replace"] = 0
+    mt_config.first_num_dense_layers = 0
+    self.assertEqual(LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True), set())
+    # first_num_dense_layers=5, interval=4 → unscan_prefix=8 → num_moe_prefix=3 → 9 keys
+    hf_config["first_k_dense_replace"] = 5
+    mt_config.first_num_dense_layers = 5
+    keys = LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True)
+    self.assertEqual(len(keys), 9)
+    for moe_idx in (0, 1, 2):
+      for suffix in ("wi_0", "wi_1", "wo"):
+        self.assertIn(f"params-decoder-moe_layers_{moe_idx}-mlp-MoeBlock_0-{suffix}", keys)
+
+  # ---------- 5.4 Registry vs Mapping 双向一致性(codex P2) ----------
+  def test_expert_axis_keys_subset_of_mapping_keys_in_scan_mode(self):
+    """Every registry entry must exist as a mapping key (防 dead key)."""
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mapping = LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    keys = LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True)
+    self.assertTrue(keys, "registry should be non-empty for scan+MTP")
+    for k in keys:
+      self.assertIn(k, mapping, f"registry references dead key {k}")
+
+  def test_expert_axis_keys_values_are_1d_string_lists(self):
+    """Every registry entry's mapping value must be a flat list[str] (not nested 2D list)."""
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mapping = LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    for k in LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True):
+      v = mapping[k]
+      self.assertIsInstance(v, list, f"{k}: expected list, got {type(v)}")
+      self.assertTrue(all(isinstance(x, str) for x in v), f"{k}: expected list[str], got nested list")
+
+  def test_expert_axis_keys_equals_all_real_expert_lists(self):
+    """REVERSE: every 1D list[str] in mapping with HF path matching .mlp.experts.{e}. must be in registry.
+
+    Catches missing registry entries (e.g., if a future change adds a new expert family).
+    """
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mapping = LING3_MAXTEXT_TO_HF_PARAM_MAPPING(hf_config, mt_config, scan_layers=True)
+    expert_pat = re.compile(r"\.mlp\.experts\.\d+\.")
+    real_expert_keys = set()
+    for k, v in mapping.items():
+      if not isinstance(v, list):
+        continue
+      if not v or not isinstance(v[0], str):
+        continue
+      if any(expert_pat.search(p) for p in v):
+        real_expert_keys.add(k)
+    registry = LING3_EXPERT_AXIS_KEYS(hf_config, mt_config, scan_layers=True)
+    self.assertEqual(
+        registry,
+        real_expert_keys,
+        f"Registry/mapping mismatch.\n  registry-only: {registry - real_expert_keys}\n"
+        f"  mapping-only: {real_expert_keys - registry}",
+    )
+
+  # ---------- 5.5 底层 helper ----------
+  def _fake_mt_config(self, scan_layers=True, param_scan_axis=1):
+    return SimpleNamespace(scan_layers=scan_layers, param_scan_axis=param_scan_axis)
+
+  def test_process_maxtext_param_unscan_prefix_expert_axis_0(self):
+    mt_key = "params-decoder-moe_layers_0-mlp-MoeBlock_0-wi_0"
+    paths = [f"model.layers.1.mlp.experts.{e}.gate_proj.weight" for e in range(4)]
+    param_map = {mt_key: paths}
+    hook_fn_map = {}
+    hf_shape_map = {p: [8] for p in paths}
+    weight = np.arange(4 * 8, dtype=np.float32).reshape(4, 8)
+    out = process_maxtext_param(
+        mt_key,
+        weight,
+        param_map,
+        hook_fn_map,
+        hf_shape_map,
+        self._fake_mt_config(scan_layers=True),
+        expert_axis_keys={mt_key},
+    )
+    self.assertEqual(len(out), 4)
+    for i, (path, tensor) in enumerate(out):
+      self.assertEqual(path, paths[i])
+      self.assertEqual(tensor.shape, (8,))
+      np.testing.assert_array_equal(tensor, weight[i])
+
+  def test_process_maxtext_param_mtp_expert_axis_0(self):
+    mt_key = "params-mtp_block-mtp_layer_1-mtp_1_transformer_layer-mlp-MoeBlock_0-wi_0"
+    paths = [f"model.layers.24.mlp.experts.{e}.gate_proj.weight" for e in range(4)]
+    param_map = {mt_key: paths}
+    hf_shape_map = {p: [8] for p in paths}
+    weight = np.arange(4 * 8, dtype=np.float32).reshape(4, 8)
+    out = process_maxtext_param(
+        mt_key,
+        weight,
+        param_map,
+        {},
+        hf_shape_map,
+        self._fake_mt_config(scan_layers=True),
+        expert_axis_keys={mt_key},
+    )
+    self.assertEqual(len(out), 4)
+    for i, (_, tensor) in enumerate(out):
+      self.assertEqual(tensor.shape, (8,))
+      np.testing.assert_array_equal(tensor, weight[i])
+
+  def test_process_maxtext_param_scan_region_axis_param_scan_axis(self):
+    mt_key = "params-decoder-moe_layers-layers_0-attention-q_proj-kernel"
+    paths = [f"model.layers.{4 + i * 4}.attention.q_proj.weight" for i in range(2)]
+    param_map = {mt_key: paths}
+    hf_shape_map = {p: [8, 8] for p in paths}
+    # Shape (hidden=8, scan_length=2, hidden=8) along param_scan_axis=1.
+    weight = np.arange(8 * 2 * 8, dtype=np.float32).reshape(8, 2, 8)
+    out = process_maxtext_param(
+        mt_key,
+        weight,
+        param_map,
+        {},
+        hf_shape_map,
+        self._fake_mt_config(scan_layers=True, param_scan_axis=1),
+        expert_axis_keys=set(),  # explicitly empty: not an expert key
+    )
+    self.assertEqual(len(out), 2)
+    for i, (_, tensor) in enumerate(out):
+      self.assertEqual(tensor.shape, (8, 8))
+      np.testing.assert_array_equal(tensor, weight[:, i, :])
+
+  @staticmethod
+  def _fake_expert_getter(key):
+    expert_idx = int(key.split(".experts.")[1].split(".")[0])
+    return np.full((8,), expert_idx, dtype=np.float32)
+
+  @staticmethod
+  def _fake_scan_getter(_key):
+    return np.zeros((8, 8), dtype=np.float32)
+
+  def test_build_single_axis_stacked_tensor_expert_axis_0(self):
+    # `to_maxtext` transitively imports torch via llama_or_mistral_ckpt;
+    # skip the three to_maxtext tests when torch is unavailable.
+    pytest.importorskip("torch")
+    from maxtext.checkpoint_conversion.to_maxtext import (  # pylint: disable=import-outside-toplevel
+        _build_single_axis_stacked_tensor,
+    )
+
+    paths = [f"model.layers.1.mlp.experts.{e}.gate_proj.weight" for e in range(4)]
+    out = _build_single_axis_stacked_tensor(
+        paths,
+        self._fake_expert_getter,
+        None,
+        target_shape=(4, 8),
+        config=self._fake_mt_config(scan_layers=True),
+        is_expert_axis=True,
+    )
+    self.assertEqual(out.shape, (4, 8))
+    for e in range(4):
+      np.testing.assert_array_equal(out[e], np.full((8,), e))
+
+  def test_build_single_axis_stacked_tensor_scan_axis(self):
+    pytest.importorskip("torch")
+    from maxtext.checkpoint_conversion.to_maxtext import (  # pylint: disable=import-outside-toplevel
+        _build_single_axis_stacked_tensor,
+    )
+
+    paths = [f"model.layers.{4 + i * 4}.attention.q_proj.weight" for i in range(2)]
+    out = _build_single_axis_stacked_tensor(
+        paths,
+        self._fake_scan_getter,
+        None,
+        target_shape=(8, 2, 8),
+        config=self._fake_mt_config(scan_layers=True, param_scan_axis=1),
+        is_expert_axis=False,
+    )
+    self.assertEqual(out.shape, (8, 2, 8))
+
+  # ---------- 5.6 Wiring 中间层(codex P3) ----------
+  def test_get_model_mappings_returns_expert_axis_keys(self):
+    from maxtext.checkpoint_conversion.to_huggingface import (  # pylint: disable=import-outside-toplevel
+        _get_model_mappings,
+    )
+
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    out = _get_model_mappings("ling3-tiny", True, hf_config, mt_config)
+    self.assertIn("expert_axis_keys", out)
+    self.assertIsInstance(out["expert_axis_keys"], set)
+    self.assertEqual(len(out["expert_axis_keys"]), 12)
+
+  def test_get_hf_loading_function_with_is_expert_axis_true(self):
+    pytest.importorskip("torch")
+    from maxtext.checkpoint_conversion.to_maxtext import (  # pylint: disable=import-outside-toplevel
+        _get_hf_loading_function,
+    )
+
+    paths = [f"model.layers.1.mlp.experts.{e}.gate_proj.weight" for e in range(4)]
+    load_fn = _get_hf_loading_function(
+        paths,
+        self._fake_expert_getter,
+        None,
+        (4, 8),
+        self._fake_mt_config(scan_layers=True),
+        is_expert_axis=True,
+    )
+    out = load_fn()
+    self.assertEqual(out.shape, (4, 8))
+    for e in range(4):
+      np.testing.assert_array_equal(out[e], np.full((8,), e))
+
+  def test_to_huggingface_main_loop_can_thread_expert_axis_keys(self):
+    """Wiring sanity: the dict returned by _get_model_mappings has the key the main loop
+    references, with the expected payload shape."""
+    from maxtext.checkpoint_conversion.to_huggingface import (  # pylint: disable=import-outside-toplevel
+        _get_model_mappings,
+    )
+
+    hf_config, mt_config = _make_configs(num_nextn_predict_layers=1)
+    mappings = _get_model_mappings("ling3-tiny", True, hf_config, mt_config)
+    # The to_huggingface main loop reads `mappings["expert_axis_keys"]` and forwards it
+    # to process_maxtext_param. Verify the shape of that payload is what the call site expects.
+    self.assertIsInstance(mappings["expert_axis_keys"], set)
+    self.assertTrue(
+        all(isinstance(k, str) for k in mappings["expert_axis_keys"]),
+        "expert_axis_keys must be a set[str]",
+    )
+    self.assertIn("params-decoder-moe_layers_0-mlp-MoeBlock_0-wi_0", mappings["expert_axis_keys"])
+
+  # ---------- 5.7 公式同步保障 ----------
+  def test_unscan_prefix_matches_decoder_formula(self):
+    """_ling3_unscan_prefix must match decoders.py:1259 formula for representative cases."""
+    cases = [
+        (0, 4, 0),
+        (1, 4, 4),
+        (3, 4, 4),
+        (4, 4, 4),
+        (5, 4, 8),
+        (1, 1, 1),
+        (2, 8, 8),
+        (9, 8, 16),
+    ]
+    for first_dense, interval, expected in cases:
+      with self.subTest(first_dense=first_dense, interval=interval):
+        self.assertEqual(_ling3_unscan_prefix(first_dense, interval), expected)
+
+  # ---------- 5.8 全 unscan 回归保险 ----------
+  def test_existing_unscan_mode_unchanged_without_expert_axis_keys(self):
+    """scan_layers=False expert MoE keys still slice axis 0 even without expert_axis_keys."""
+    mt_key = "params-decoder-moe_layers_0-mlp-MoeBlock_0-wi_0"
+    paths = [f"model.layers.1.mlp.experts.{e}.gate_proj.weight" for e in range(4)]
+    param_map = {mt_key: paths}
+    hf_shape_map = {p: [8] for p in paths}
+    weight = np.arange(4 * 8, dtype=np.float32).reshape(4, 8)
+    # Note: scan_layers=False, expert_axis_keys=None → falls through to else branch (axis=0).
+    out = process_maxtext_param(
+        mt_key,
+        weight,
+        param_map,
+        {},
+        hf_shape_map,
+        self._fake_mt_config(scan_layers=False),
+    )
+    self.assertEqual(len(out), 4)
+    for i, (_, tensor) in enumerate(out):
+      self.assertEqual(tensor.shape, (8,))
+      np.testing.assert_array_equal(tensor, weight[i])
 
 
 if __name__ == "__main__":

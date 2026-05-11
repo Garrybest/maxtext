@@ -2576,6 +2576,43 @@ def LING2_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   return hooks
 
 
+def _ling3_unscan_prefix(first_num_dense_layers: int, layer_group_size: int) -> int:
+  """Round first_num_dense_layers up to the next layer_group_size boundary.
+
+  Mirrors the formula in src/maxtext/layers/decoders.py:1259 verbatim — the
+  conversion script must agree with the model so MaxText keys line up. If you
+  change this, also update decoders.py and the test
+  `test_unscan_prefix_matches_decoder_formula`.
+  """
+  if first_num_dense_layers <= 0:
+    return 0
+  return ((first_num_dense_layers + layer_group_size - 1) // layer_group_size) * layer_group_size
+
+
+def _ling3_validate_mtp_config(config, maxtext_config):
+  """Shared MTP-consistency guard for Ling3 mapping + hook functions.
+
+  Independent of `scan_layers` because mapping / HF_SHAPE both hardcode a single
+  `mtp_layer_1` / `model.layers.{num_hidden_layers}` MTP slot — multi-layer MTP
+  would silently mis-map regardless of scan mode.
+  """
+  has_mtp_in_hf = int(config.get("num_nextn_predict_layers", 0)) > 0
+  mtp_num_layers = getattr(maxtext_config, "mtp_num_layers", 0)
+  if has_mtp_in_hf != (mtp_num_layers > 0):
+    raise ValueError(
+        f"Inconsistent MTP config: hf_config.num_nextn_predict_layers="
+        f"{config.get('num_nextn_predict_layers', 0)} but "
+        f"maxtext_config.mtp_num_layers={mtp_num_layers}. "
+        f"Either both should declare MTP or neither."
+    )
+  if has_mtp_in_hf and mtp_num_layers != 1:
+    raise NotImplementedError(
+        f"Ling3 checkpoint conversion currently supports mtp_num_layers=1 only "
+        f"(got {mtp_num_layers}). Multi-layer MTP needs the mapping function and "
+        f"HF_SHAPE to emit mtp_layer_2..N — out of scope for this PR."
+    )
+
+
 def LING3_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False):
   """Generates a parameter mapping from MaxText to HuggingFace for Ling3.
 
@@ -2610,6 +2647,7 @@ def LING3_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False)
     dict: Mapping from MaxText parameter keys to HF parameter key(s) (str or list).
   """
   # pylint: disable=line-too-long
+  _ling3_validate_mtp_config(config, maxtext_config)
   num_layers = int(config["num_hidden_layers"])
   first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
   num_experts = int(config.get("num_experts", config.get("n_routed_experts", maxtext_config.num_experts)))
@@ -2642,31 +2680,7 @@ def LING3_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=False)
     return is_last_layer_of_group or is_last_layer_of_model
 
   if scan_layers:
-    if has_mtp and maxtext_config.mtp_num_layers > 0:
-      # MTP is always a single unscanned layer whose MoE expert tensor is
-      # shape [num_experts, ...]. `process_maxtext_param` Case 2 in scan mode
-      # slices any 1D list along `param_scan_axis`, which would mis-slice this
-      # expert-stacked tensor. Fixing this cleanly requires a per-key
-      # scanned/unscanned discriminator in `utils.py:process_maxtext_param`
-      # (framework scope, out of this RFC).
-      #
-      # Note: ling3-tiny.yml sets `scan_layers: true` for training efficiency,
-      # but checkpoint conversion is typically run with `scan_layers=false`
-      # overridden on the CLI (same pattern Ling2 requires; see RFC-0017
-      # §测试方案 for the exact invocation).
-      raise NotImplementedError(
-          "Ling3 checkpoint conversion with scan_layers=True + MTP enabled is not "
-          "supported: the shared framework cannot disambiguate MTP expert-stacking "
-          "(1D list of num_experts HF keys) from scan-axis slicing in scan mode. "
-          "Workaround: pass `scan_layers=false` at the conversion CLI (this is the "
-          "standard ckpt-conversion workflow; the ling3-tiny.yml default "
-          "`scan_layers: true` applies to training only), or set "
-          "`mtp_num_layers=0` if MTP is not needed."
-      )
-    if first_num_dense_layers > 0:
-      unscan_prefix = ((first_num_dense_layers + layer_group_size - 1) // layer_group_size) * layer_group_size
-    else:
-      unscan_prefix = 0
+    unscan_prefix = _ling3_unscan_prefix(first_num_dense_layers, layer_group_size)
     if unscan_prefix >= num_layers:
       raise ValueError(
           f"unscan_prefix ({unscan_prefix}) >= num_decoder_layers ({num_layers}); "
@@ -2860,6 +2874,7 @@ def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
     transposed = np.transpose(np.squeeze(input_tensor, axis=1), (1, 0))
     return transposed[::-1, :]
 
+  _ling3_validate_mtp_config(config, maxtext_config)
   num_layers = int(config["num_hidden_layers"])
   first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
   layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
@@ -2891,19 +2906,7 @@ def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
     return is_last_layer_of_group or is_last_layer_of_model
 
   if scan_layers:
-    if has_mtp and maxtext_config.mtp_num_layers > 0:
-      # Mirror the same guard as LING3_MAXTEXT_TO_HF_PARAM_MAPPING.
-      raise NotImplementedError(
-          "Ling3 checkpoint conversion with scan_layers=True + MTP enabled is not "
-          "supported: the shared framework cannot disambiguate MTP expert-stacking "
-          "from scan-axis slicing in scan mode. Workaround: pass `scan_layers=false` "
-          "at the conversion CLI (standard ckpt-conversion workflow), or set "
-          "`mtp_num_layers=0`."
-      )
-    if first_num_dense_layers > 0:
-      unscan_prefix = ((first_num_dense_layers + layer_group_size - 1) // layer_group_size) * layer_group_size
-    else:
-      unscan_prefix = 0
+    unscan_prefix = _ling3_unscan_prefix(first_num_dense_layers, layer_group_size)
   else:
     unscan_prefix = num_layers
 
@@ -2995,6 +2998,46 @@ def LING3_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False,
   return hooks
 
 
+def LING3_EXPERT_AXIS_KEYS(config, maxtext_config, scan_layers=False) -> set[str]:
+  """MaxText keys whose 1D-list mapping value must slice along axis 0 (expert axis).
+
+  In Ling3 scan mode, the unscan-prefix MoE transition layers and the MTP block
+  emit 1D-list expert-stacked params (Case 3 in process_maxtext_param). Without
+  a per-key hint, the global `scan_layers=True` flag would mis-route these keys
+  through the scan-axis branch (Case 2). Scan-region MoE expert params use
+  Case 4 (2D nested) and are unaffected.
+
+  Returns an empty set when scan_layers=False (full-unscan mode disambiguates
+  correctly via the global flag).
+  """
+  if not scan_layers:
+    return set()
+  num_layers = int(config["num_hidden_layers"])
+  first_num_dense_layers = int(config.get("first_k_dense_replace", maxtext_config.first_num_dense_layers))
+  layer_group_size = int(config.get("layer_group_size", maxtext_config.inhomogeneous_layer_cycle_interval))
+  has_mtp = int(config.get("num_nextn_predict_layers", 0)) > 0
+  mtp_num_layers = getattr(maxtext_config, "mtp_num_layers", 0)
+
+  unscan_prefix = _ling3_unscan_prefix(first_num_dense_layers, layer_group_size)
+
+  result = set()
+
+  # 1. Unscan-prefix MoE transition layers' expert params.
+  for hf_idx in range(first_num_dense_layers, min(unscan_prefix, num_layers)):
+    moe_idx = hf_idx - first_num_dense_layers
+    mt_prefix = f"params-decoder-moe_layers_{moe_idx}"
+    for suffix in ("wi_0", "wi_1", "wo"):
+      result.add(f"{mt_prefix}-mlp-MoeBlock_0-{suffix}")
+
+  # 2. MTP MoE expert params (mtp_num_layers == 1 enforced by _ling3_validate_mtp_config).
+  if has_mtp and mtp_num_layers == 1:
+    mtp_tf = "params-mtp_block-mtp_layer_1-mtp_1_transformer_layer"
+    for suffix in ("wi_0", "wi_1", "wo"):
+      result.add(f"{mtp_tf}-mlp-MoeBlock_0-{suffix}")
+
+  return result
+
+
 # {maxtext model name: {maxtext weight name: hf weight name}}
 PARAM_MAPPING = {
     "gemma2-2b": GEMMA2_MAXTEXT_TO_HF_PARAM_MAPPING,
@@ -3080,3 +3123,19 @@ VLLM_HOOK_FNS = {
     "llama3.1": LLAMA31_NNX_TO_VLLM_PARAM_HOOK_FN,
     "deepseek3": DEEPSEEK_NNX_TO_VLLM_PARAM_HOOK_FN,
 }
+
+# {maxtext model name: callable returning a set[str] of MaxText keys whose 1D-list
+# mapping value must slice along axis 0 (expert axis) regardless of scan_layers}.
+# Models without an entry default to an empty set (no override) — see
+# `get_expert_axis_keys` below.
+EXPERT_AXIS_KEYS = {
+    "ling3-tiny": LING3_EXPERT_AXIS_KEYS,
+}
+
+
+def get_expert_axis_keys(model_name, config, maxtext_config, scan_layers):
+  """Return the per-key axis-0 override set for `model_name`, or empty set if unregistered."""
+  fn = EXPERT_AXIS_KEYS.get(model_name)
+  if fn is None:
+    return set()
+  return fn(config, maxtext_config, scan_layers)
