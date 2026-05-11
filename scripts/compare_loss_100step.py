@@ -89,6 +89,13 @@ def main():
       default=DEFAULT_AVG_TOL,
       help=f"Average relative diff tolerance for steps 1-N (default: {DEFAULT_AVG_TOL})",
   )
+  parser.add_argument(
+      "--max-steps",
+      type=int,
+      default=None,
+      help="Compare only the first N reference steps (default: all). Lets a long "
+      "reference (1000 steps) gate a short CI run (100 steps).",
+  )
   args = parser.parse_args()
 
   ref_file = args.reference
@@ -120,6 +127,9 @@ def main():
   ref_by_step = {s: (lm, mtp) for s, lm, mtp in ref_losses}
   mxt_by_step = {s: (lm, mtp) for s, lm, mtp in mxt_losses}
   required_steps = sorted(ref_by_step.keys())
+
+  if args.max_steps is not None:
+    required_steps = required_steps[: args.max_steps]
 
   missing_mxt = [s for s in required_steps if s not in mxt_by_step]
   if missing_mxt:

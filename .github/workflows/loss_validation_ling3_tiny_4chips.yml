@@ -1,0 +1,218 @@
+name: Loss Validation (Ling3-tiny, 4 chips, 100 steps, KDA-varlen)
+
+# Auto-trigger on PRs and pushes to main; also exposes manual workflow_dispatch.
+# Mirrors tpu_pretrain_smoke_test.yml's TPU-pool acquire pattern: claim an
+# idle pod from the lingbo `ci-tpu` shell pool, kubectl-exec install + train
+# + in-pod gate, then release. ~1min idle acquire latency on lingbo.
+#
+# To make the gate "required" for merging into main, repo admin needs to
+# configure Settings → Branches → main → Require status checks after the
+# workflow runs at least once on main.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'tests/**'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/CODEOWNERS'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'tests/**'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/CODEOWNERS'
+      - '**/*.md'
+  workflow_dispatch:
+    inputs:
+      target_cluster:
+        description: "Cluster target (default = repo secrets, lingbo = pre-cutover validation)"
+        required: false
+        type: choice
+        default: default
+        options: [default, lingbo]
+
+concurrency:
+  # Per-branch group + cancel-in-progress so a force-push or rebase mid-run
+  # kills the now-stale TPU job rather than queueing another behind it.
+  group: ci-tpu-lossval-ling3-tiny-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  USE_TPU_POOL: 'true'
+
+jobs:
+  tpu_lossval_ling3_tiny:
+    name: "100-step loss validation on TPU (Ling3-tiny, 4 chips, GBS=16)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 90
+    steps:
+      - name: Resolve test target
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+            echo "pod_ref=$GITHUB_REF_VALUE" >> "$GITHUB_OUTPUT"
+            echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.checkout_ref }}
+
+      - name: Verify *_LINGBO secrets are populated
+        if: inputs.target_cluster == 'lingbo'
+        env:
+          WIF_LINGBO: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO }}
+          SA_LINGBO: ${{ secrets.GCP_SERVICE_ACCOUNT_LINGBO }}
+          CLUSTER_LINGBO: ${{ secrets.GKE_CLUSTER_LINGBO }}
+          LOCATION_LINGBO: ${{ secrets.GKE_LOCATION_LINGBO }}
+        run: |
+          missing=()
+          [ -z "$WIF_LINGBO" ] && missing+=(GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO)
+          [ -z "$SA_LINGBO" ] && missing+=(GCP_SERVICE_ACCOUNT_LINGBO)
+          [ -z "$CLUSTER_LINGBO" ] && missing+=(GKE_CLUSTER_LINGBO)
+          [ -z "$LOCATION_LINGBO" ] && missing+=(GKE_LOCATION_LINGBO)
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::target_cluster=lingbo but these secrets are empty: ${missing[*]} - refusing to silently fall back to the default cluster."
+            exit 1
+          fi
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER_LINGBO || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ inputs.target_cluster == 'lingbo' && secrets.GCP_SERVICE_ACCOUNT_LINGBO || secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_CLUSTER_LINGBO || secrets.GKE_CLUSTER }}
+          location: ${{ inputs.target_cluster == 'lingbo' && secrets.GKE_LOCATION_LINGBO || secrets.GKE_LOCATION }}
+
+      - name: Generate unique job name
+        id: job
+        run: |
+          JOB_NAME="ci-lossval-ling3-tiny-${GITHUB_RUN_NUMBER}"
+          JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire TPU pod
+        if: env.USE_TPU_POOL == 'true'
+        id: acquire
+        env:
+          JOB_NAME: ${{ steps.job.outputs.name }}
+          TASK_TYPE: loss-validation
+        run: |
+          source .github/ci/acquire-tpu-pod.sh
+          echo "pod=$POD" >> "$GITHUB_OUTPUT"
+
+      - name: "Run: clean + clone + install + train + gate"
+        if: env.USE_TPU_POOL == 'true'
+        env:
+          POD: ${{ steps.acquire.outputs.pod }}
+          TARGET_REF: ${{ steps.target.outputs.pod_ref }}
+          EXPECTED_SHA: ${{ steps.target.outputs.expected_sha }}
+          TOKEN: ${{ github.token }}
+          CROSS_REPO_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          # 1. Clean previous workspace and venv (per smoke-test convention)
+          kubectl exec "$POD" -- find /workspace /opt/ci-env -mindepth 1 -delete
+
+          # 2. Fetch the exact workflow target using an immutable ref when available.
+          echo "$TOKEN" | kubectl exec -i "$POD" -- bash -c '
+            read -r GITHUB_TOKEN
+            git init /workspace/maxtext
+            cd /workspace/maxtext
+            git remote add origin \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/primatrix/maxtext.git"
+            git fetch --depth=1 origin "'"$TARGET_REF"'"
+            git checkout --detach FETCH_HEAD
+
+            ACTUAL_SHA=$(git rev-parse HEAD)
+            EXPECTED_SHA="'"$EXPECTED_SHA"'"
+            if [ -n "${EXPECTED_SHA}" ] && [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+              echo "ERROR: checked out ${ACTUAL_SHA}, expected ${EXPECTED_SHA}" >&2
+              exit 1
+            fi
+          '
+
+          # 3. Fresh venv + install maxtext + lossval-specific extras (KDA pallas
+          # kernels via install_maxtext_tpu_github_deps; optax-from-source for
+          # the Muon optimizer used by ling3-tiny pretrain). CROSS_REPO_TOKEN
+          # is piped via stdin so uv can fetch private primatrix/* git deps;
+          # GIT_CONFIG_GLOBAL is scoped to a tempfile so the token-bearing
+          # insteadOf rule does not persist in /root/.gitconfig across jobs.
+          echo "$CROSS_REPO_TOKEN" | kubectl exec -i "$POD" -- bash -c '
+            read -r CROSS_REPO_TOKEN
+            export GIT_CONFIG_GLOBAL=/tmp/git-config-install
+            trap "rm -f $GIT_CONFIG_GLOBAL" EXIT
+            git config --global \
+              url."https://x-access-token:${CROSS_REPO_TOKEN}@github.com/primatrix/".insteadOf \
+              "https://github.com/primatrix/"
+
+            cd /workspace/maxtext
+            /opt/tools/uv venv --python 3.12 --seed /opt/ci-env
+            . /opt/ci-env/bin/activate
+            /opt/tools/uv pip install -e ".[tpu]" --resolution=lowest
+            install_maxtext_tpu_github_deps
+            pip uninstall optax -y 2>/dev/null || true
+            pip install git+https://github.com/google-deepmind/optax
+          '
+
+          # 4. Run 100-step training + in-pod gate. Lossval contract env vars
+          # (STEPS=100, LR_SCHEDULE_STEPS=1000, WARMUP_ITERS=250) override
+          # pretrain_ling3_tiny.sh's defaults so the LR curve over the first
+          # 100 steps lines up exactly with the Megatron-varlen 1000-iter
+          # reference. Strict thresholds: step-0 ≤ 0.01%, avg ≤ 0.1%.
+          kubectl exec "$POD" -- timeout 5400 bash -c "
+            set -exo pipefail
+            . /opt/ci-env/bin/activate
+            cd /workspace/maxtext
+
+            export STEPS=100
+            export LEARNING_RATE_SCHEDULE_STEPS=1000
+            export WARMUP_ITERS=250
+            export EVAL_INTERVAL=200
+            export ICI_EXPERT_PARALLELISM=1
+            export ICI_DATA_PARALLELISM=1
+            export ICI_FSDP_PARALLELISM=8
+            export ICI_TENSOR_PARALLELISM=1
+            export ICI_CONTEXT_PARALLELISM=1
+            export SHARD_EXP_ON_FSDP=false
+            export USE_VERTEX_TENSORBOARD=false
+            export ENABLE_GOODPUT=false
+            export GCS_BUCKET=gs://data_ant/pretrain/ci-loss-validation-ling3
+            export RUN_NAME=$JOB_NAME
+
+            METRICS_FILE=/tmp/ramdisk/loss_validation_metrics.txt
+            bash scripts/pretrain_ling3_tiny.sh metrics_file=\${METRICS_FILE}
+
+            python3 scripts/compare_loss_100step.py \"\${METRICS_FILE}\" \\
+              --reference scripts/reference_losses_ling3_varlen_999step.json \\
+              --max-steps 100
+          "
+
+      - name: Release TPU pod
+        if: always() && env.USE_TPU_POOL == 'true' && steps.acquire.outputs.pod != ''
+        env:
+          POD: ${{ steps.acquire.outputs.pod }}
+          JOB_NAME: ${{ steps.job.outputs.name }}
+        run: source .github/ci/release-tpu-pod.sh
