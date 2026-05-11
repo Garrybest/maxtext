@@ -55,6 +55,9 @@ enable_checkpointing: True
 save_checkpoint_on_completion: True
 async_checkpointing: True
 checkpoint_period: 10_000
+checkpoint_period_by_samples: 0
+checkpoint_period_by: "steps"
+save_trainer_state: True
 max_num_checkpoints_to_keep: None
 enable_continuous_checkpointing: False
 # enables one replica to read the ckpt then broadcast to the rest

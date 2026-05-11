@@ -832,6 +832,19 @@ def train_loop(config, recorder, state=None):
 
   _job_completed_gracefully = False
   try:
+    # Initialize consumed samples/tokens counters
+    # Orbax saves the checkpoint at directory <step>/ but the restored state.step == step + 1
+    # (because apply_gradients increments it before saving), so look up step - 1.
+    restored_trainer_state = (
+        checkpointing.load_trainer_state(config.checkpoint_dir, start_step - 1) if start_step > 0 else None
+    )
+    if restored_trainer_state:
+      consumed_train_samples = restored_trainer_state["consumed_train_samples"]
+      consumed_train_tokens = restored_trainer_state["consumed_train_tokens"]
+    else:
+      consumed_train_samples = start_step * config.global_batch_size_to_train_on
+      consumed_train_tokens = consumed_train_samples * config.max_target_length
+
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
       prof.maybe_activate_profiler(step, state)
@@ -853,7 +866,16 @@ def train_loop(config, recorder, state=None):
       last_step_completion = datetime.datetime.now()
 
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
-      checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator, step)
+      consumed_train_samples += config.global_batch_size_to_train_on
+      consumed_train_tokens += config.global_batch_size_to_train_on * config.max_target_length
+      trainer_state = {
+          "consumed_train_tokens": int(consumed_train_tokens),
+          "consumed_train_samples": int(consumed_train_samples),
+          "global_step": int(step),
+      }
+      checkpointing.maybe_save_checkpoint(
+          checkpoint_manager, state_to_save, config, data_iterator, step, trainer_state=trainer_state
+      )
 
       if config.dump_hlo and step == (config.dump_step if config.dump_step >= 0 else start_step):
         jax.block_until_ready(state)  # Ensure compilation has finished.
@@ -900,7 +922,15 @@ def train_loop(config, recorder, state=None):
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
-      checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator)
+      final_step = int(state_to_save.step) - 1
+      trainer_state = {
+          "consumed_train_tokens": int(consumed_train_tokens),
+          "consumed_train_samples": int(consumed_train_samples),
+          "global_step": final_step,
+      }
+      checkpointing.maybe_save_checkpoint(
+          checkpoint_manager, state_to_save, config, data_iterator, trainer_state=trainer_state
+      )
     if checkpoint_manager is not None:
       # in case the last checkpoint_period checkpoint is still in progress
       checkpoint_manager.wait_until_finished()

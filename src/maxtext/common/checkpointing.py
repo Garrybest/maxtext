@@ -14,6 +14,7 @@
 
 """Create an Orbax CheckpointManager with specified (Async or not) Checkpointer."""
 
+import os
 import time
 from typing import Any, Optional
 
@@ -117,6 +118,33 @@ class GrainCheckpointHandler(PyGrainCheckpointHandler, ocp.CheckpointHandler):
       return restore_single_process(item, process_index, process_count)
 
 
+class JsonCheckpointHandler(ocp.CheckpointHandler):
+  """A simple JSON checkpoint item handler."""
+
+  def save(
+      self,
+      directory: epath.Path,
+      item: Optional[Any] = None,
+      args: Any = None,
+  ):
+    """Saves a JSON-serializable object in the item directory."""
+    item = item if item is not None else args.item
+    if jax.process_index() != 0:
+      return
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "trainer_state.json").write_text(json.dumps(item, indent=2))
+
+  def restore(
+      self,
+      directory: epath.Path,
+      item: Optional[Any] = None,
+      args: Any = None,
+  ) -> Any:
+    """Restores a JSON-serializable object from the item directory."""
+    del item, args
+    return json.loads((directory / "trainer_state.json").read_text())
+
+
 @ocp.args.register_with_handler(GrainCheckpointHandler, for_save=True)
 @dataclasses.dataclass
 class GrainCheckpointSave(ocp.args.CheckpointArgs):
@@ -129,6 +157,18 @@ class GrainCheckpointRestore(ocp.args.CheckpointArgs):
   item: Any
   process_index: Optional[int | list[int]] = None
   process_count: Optional[int] = None
+
+
+@ocp.args.register_with_handler(JsonCheckpointHandler, for_save=True)
+@dataclasses.dataclass
+class JsonCheckpointSave(ocp.args.CheckpointArgs):
+  item: Any
+
+
+@ocp.args.register_with_handler(JsonCheckpointHandler, for_restore=True)
+@dataclasses.dataclass
+class JsonCheckpointRestore(ocp.args.CheckpointArgs):
+  item: Any = None
 
 
 def _is_remote_iterator(data_iterator):
@@ -230,7 +270,7 @@ def create_orbax_checkpoint_manager(
   max_logging.log(f"Creating checkpoint manager with ocdbt={use_ocdbt} and zarr3={use_zarr3}")
 
   # Base configuration for all dataset types
-  item_names = ("items",)
+  item_names = ("items", "trainer_state")
   # we need to use ocdbt and zarr3 to control max file size in the checkpoint
   item_handlers = {
       "items": PyTreeCheckpointHandler(
@@ -238,7 +278,8 @@ def create_orbax_checkpoint_manager(
           save_concurrent_gb=checkpoint_storage_concurrent_gb,
           use_ocdbt=use_ocdbt,
           use_zarr3=use_zarr3,
-      )
+      ),
+      "trainer_state": JsonCheckpointHandler(),
   }
 
   if dataset_type in ("grain", "lazy"):
@@ -711,7 +752,33 @@ def save_params_to_path(checkpoint_dir, params, use_ocdbt=True, use_zarr3=True):
   print(f"Quantized params checkpoint saved at: {checkpoint_dir}")
 
 
-def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None):
+def should_save_by_samples(consumed_train_samples, save_samples, global_batch_size):
+  """Check whether a checkpoint should be saved based on consumed sample count.
+
+  Returns True when consumed_train_samples is at or near a multiple of save_samples,
+  accounting for the fact that global_batch_size may not evenly divide save_samples.
+  """
+  if save_samples <= 0 or consumed_train_samples == 0:
+    return False
+  remainder = consumed_train_samples % save_samples
+  half_batch = global_batch_size // 2
+  return remainder == 0 or remainder < half_batch or (save_samples - remainder) <= half_batch
+
+
+def load_trainer_state(checkpoint_dir, step):
+  """Load trainer_state.json from the checkpoint directory. Returns None if not found."""
+  ckpt_path = os.path.join(checkpoint_dir, str(step), "trainer_state", "trainer_state.json")
+  try:
+    if ckpt_path.startswith("gs://"):
+      return gcs_utils.read_json_from_gcs(ckpt_path)
+    else:
+      with open(ckpt_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+  except (FileNotFoundError, json.JSONDecodeError, OSError):
+    return None
+
+
+def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step=None, trainer_state=None):
   """Save checkpoint if checkpointing is enabled."""
   if checkpoint_manager is None:
     return
@@ -721,15 +788,29 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
   # and use the last completed step from the state.
   actual_step = (int(state.step) - 1) if step is None else int(step)
 
-  # Determine if a checkpoint save should be forced, overriding the usual `config.checkpoint_period` logic.
-  # This occurs if this function was called:
-  # without an explicit 'step' (implying it's a checkpoint save for final step),
-  # AND the 'actual_step' is a valid step,
-  # AND it's not a step that would normally trigger a checkpoint save.
-  force_ckpt_save = step is None and actual_step != -1 and (actual_step % config.checkpoint_period != 0)
+  # Determine if a checkpoint save should be forced.
+  if config.checkpoint_period_by == "samples":
+    # In sample-based mode, saving is driven entirely by force flag from the caller.
+    # The final-step force logic still applies.
+    force_ckpt_save = step is None and actual_step != -1
+    # Check sample-based save condition
+    if trainer_state and step is not None:
+      force_ckpt_save = should_save_by_samples(
+          trainer_state["consumed_train_samples"],
+          config.checkpoint_period_by_samples,
+          config.global_batch_size_to_train_on,
+      )
+  else:
+    # Original step-based logic
+    force_ckpt_save = step is None and actual_step != -1 and (actual_step % config.checkpoint_period != 0)
 
   try:
-    checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
+    trainer_state_to_save = None
+    if config.save_trainer_state and trainer_state is not None:
+      trainer_state_to_save = trainer_state
+    checkpoint_saved = save_checkpoint(
+        checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save, trainer_state_to_save
+    )
     if checkpoint_saved:
       print_save_message(actual_step, config.async_checkpointing)
   except Exception as e:
@@ -744,7 +825,7 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     raise exceptions.StopTraining("Job is preempted.")
 
 
-def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False):
+def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False, trainer_state=None):
   """Wrapper for saving checkpoint."""
   if config and config.enable_checkpointing:
     if (
@@ -774,6 +855,8 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
       ocdbt_target_data_file_size=chunk_byte_size,
   )
   save_args_composite = {"items": checkpoint_args}
+  if trainer_state is not None:
+    save_args_composite["trainer_state"] = JsonCheckpointSave(item=trainer_state)
 
   if (
       config

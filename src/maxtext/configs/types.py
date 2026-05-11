@@ -331,6 +331,17 @@ class Checkpointing(BaseModel):
   save_checkpoint_on_completion: bool = Field(
       True, description="If True, saves a final checkpoint upon training completion."
   )
+  checkpoint_period_by_samples: int = Field(
+      0,
+      description="Save checkpoint by consumed sample count. Used when checkpoint_period_by='samples'. "
+      "0 means disabled.",
+  )
+  checkpoint_period_by: Literal["steps", "samples"] = Field(
+      "steps",
+      description="Determines the checkpoint saving strategy: 'steps' uses checkpoint_period, "
+      "'samples' uses checkpoint_period_by_samples.",
+  )
+  save_trainer_state: bool = Field(True, description="If True, saves trainer_state.json alongside each checkpoint.")
   enable_continuous_checkpointing: bool = Field(False, description="If True, enables continuous checkpointing.")
   colocated_python_checkpointing: bool = Field(
       False,
@@ -2693,6 +2704,8 @@ class MaxTextConfig(
     # H. RUN ALL CROSS-FIELD VALIDATIONS
     if self.load_parameters_path and self.load_full_state_path:
       raise ValueError("At most one of `load_parameters_path` or `load_full_state_path` should be set.")
+    if self.checkpoint_period_by == "samples" and self.checkpoint_period_by_samples <= 0:
+      raise ValueError("`checkpoint_period_by_samples` must be > 0 when `checkpoint_period_by` is 'samples'.")
     if self.load_full_state_path and not self.enable_checkpointing:
       raise ValueError("You must set enable_checkpointing=True to load full state.")
     if self.enable_multi_tier_checkpointing:

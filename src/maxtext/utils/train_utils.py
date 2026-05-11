@@ -67,11 +67,14 @@ def create_training_tools(config, model, mesh):
     checkpoint_dir = ""
     if config.enable_checkpointing:
       checkpoint_dir = config.checkpoint_dir
+    # When using sample-based checkpointing, disable Orbax's auto-save by setting
+    # a very large interval. Saving is driven by force=True in maybe_save_checkpoint.
+    save_interval = config.steps + 1 if config.checkpoint_period_by == "samples" else config.checkpoint_period
     checkpoint_manager = checkpointing.create_orbax_checkpoint_manager(
         checkpoint_dir,
         config.enable_checkpointing,
         config.async_checkpointing,
-        config.checkpoint_period,
+        save_interval,
         config.dataset_type,
         logger,
         use_ocdbt,
