@@ -1,10 +1,10 @@
 #!/bin/bash
-# Submit Ling3 Tiny Pretrain job to GKE
+# Submit Ling3 Tiny Pretrain job to GKE (64 chips / 128 devices, 4x4x4)
 #
 # Usage:
-#   scripts/submit_ling3_job.sh                    # use current branch
-#   scripts/submit_ling3_job.sh feat/my-branch     # specify branch
-#   STEPS=1000 scripts/submit_ling3_job.sh         # override defaults
+#   scripts/submit_ling3_64chips_job.sh                    # use current branch
+#   scripts/submit_ling3_64chips_job.sh feat/my-branch     # specify branch
+#   STEPS=1000 scripts/submit_ling3_64chips_job.sh         # override defaults
 #
 # Prerequisites:
 #   - kubectl configured with GKE cluster credentials
@@ -23,7 +23,7 @@ set -euo pipefail
 # ============================================================================
 BRANCH="${1:-$(git rev-parse --abbrev-ref HEAD)}"
 if [ -z "${JOB_NAME:-}" ]; then
-  JOB_NAME="ling3-$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 30)-$(date +%m%d%H%M)"
+  JOB_NAME="ling3-64-$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9]/-/g' | head -c 27)-$(date +%m%d%H%M)"
   JOB_NAME=$(echo "$JOB_NAME" | tr '[:upper:]' '[:lower:]' | head -c 63)
 fi
 BRANCH_LABEL=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g' | head -c 63 | sed 's/^[^a-zA-Z0-9]//;s/[^a-zA-Z0-9]$//')
@@ -32,31 +32,38 @@ USER="${USER:-$(whoami)}"
 # ============================================================================
 # 2. Training Parameters (override via environment)
 # ============================================================================
-export STEPS="${STEPS:-500}"
-export EVAL_INTERVAL="${EVAL_INTERVAL:-250}"
+export STEPS="${STEPS:-1000}"
+export EVAL_INTERVAL="${EVAL_INTERVAL:-2000}"
 export OPT_TYPE="${OPT_TYPE:-muon}"
 
-# Parallelism (single pod, 8 devices)
+# Dataset selection (default: opensource via grain)
+#   Opensource: DATASET_TYPE=grain  DATASETS_YAML=""
+#   Ant data:   DATASET_TYPE=lazy   DATASETS_YAML=scripts/datasets/ant_datasets_dev.yml
+export DATASET_TYPE="${DATASET_TYPE:-grain}"
+export DATASETS_YAML="${DATASETS_YAML:-}"
+
+# Parallelism (16 hosts × 8 devices = 128 devices total)
+# Default: EP=1, FSDP=32, DP=4 — 1 × 32 × 4 = 128 ✓
 export ICI_EXPERT_PARALLELISM="${ICI_EXPERT_PARALLELISM:-1}"
-export ICI_DATA_PARALLELISM="${ICI_DATA_PARALLELISM:-1}"
-export ICI_FSDP_PARALLELISM="${ICI_FSDP_PARALLELISM:-8}"
+export ICI_DATA_PARALLELISM="${ICI_DATA_PARALLELISM:-4}"
+export ICI_FSDP_PARALLELISM="${ICI_FSDP_PARALLELISM:-32}"
 export ICI_TENSOR_PARALLELISM="${ICI_TENSOR_PARALLELISM:-1}"
 export ICI_CONTEXT_PARALLELISM="${ICI_CONTEXT_PARALLELISM:-1}"
-export SHARD_EXP_ON_FSDP="${SHARD_EXP_ON_FSDP:-false}"
+export SHARD_EXP_ON_FSDP="${SHARD_EXP_ON_FSDP:-true}"
 
 # Performance
-export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
-export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-8}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 export REMAT_POLICY="${REMAT_POLICY:-save_out_proj}"
 
 # Lazy dataloader scatter group sharding.
 # -1 = single-host debug: every process reads ALL shards.
 # -4 = production: 4 scatter groups, each process reads 1/4 of shards.
-#       Requires num_hosts to be a multiple of 4.
+#       Requires num_hosts to be a multiple of 4. (16 hosts ✓)
 # WARNING: -1 and -4 produce DIFFERENT data consumption order — results
 # from single-host debug (-1) are NOT comparable with production (-4).
-# Default: -1 (safe for the 4-chip single-host dev job).
-export LAZY_LOADER_SCATTER="${LAZY_LOADER_SCATTER:--1}"
+# Default: -4 (production for the 16-host 64-chip job).
+export LAZY_LOADER_SCATTER="${LAZY_LOADER_SCATTER:--4}"
 
 # Profiler (empty = disabled)
 export PROFILER="${PROFILER:-}"
@@ -71,7 +78,7 @@ export JOB_NAME BRANCH BRANCH_LABEL USER
 # ============================================================================
 # 3. Submit
 # ============================================================================
-TEMPLATE=".github/ci/tpu-4chips-ling3-job.yaml"
+TEMPLATE=".github/ci/tpu-64chips-ling3-job.yaml"
 if [ ! -f "$TEMPLATE" ]; then
   echo "ERROR: Template not found: $TEMPLATE" >&2
   echo "Run this script from the repo root." >&2
@@ -83,6 +90,7 @@ fi
 # are preserved for the pod's bash script to resolve at execution time.
 SUBST_VARS='$JOB_NAME $BRANCH $BRANCH_LABEL $USER'
 SUBST_VARS+=' $STEPS $EVAL_INTERVAL $OPT_TYPE'
+SUBST_VARS+=' $DATASET_TYPE $DATASETS_YAML'
 SUBST_VARS+=' $ICI_EXPERT_PARALLELISM $ICI_DATA_PARALLELISM $ICI_FSDP_PARALLELISM'
 SUBST_VARS+=' $ICI_TENSOR_PARALLELISM $ICI_CONTEXT_PARALLELISM $SHARD_EXP_ON_FSDP'
 SUBST_VARS+=' $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS $REMAT_POLICY'
@@ -90,24 +98,27 @@ SUBST_VARS+=' $LAZY_LOADER_SCATTER'
 SUBST_VARS+=' $PROFILER $SKIP_FIRST_N_STEPS_FOR_PROFILER $PROFILER_STEPS'
 SUBST_VARS+=' $LIBTPU_INIT_ARGS'
 
-echo "=== Submitting Ling3 Job ==="
+echo "=== Submitting Ling3 64-chips Job ==="
 echo "  JobSet:     $JOB_NAME"
 echo "  Branch:     $BRANCH"
+echo "  Topology:   4x4x4 (64 chips / 128 devices, 16 hosts)"
 echo "  Optimizer:  $OPT_TYPE"
+echo "  Dataset:    $DATASET_TYPE${DATASETS_YAML:+ ($DATASETS_YAML)}"
 echo "  Steps:      $STEPS"
 echo "  Eval:       every $EVAL_INTERVAL steps"
 echo "  Batch:      $PER_DEVICE_BATCH_SIZE per device × $GRADIENT_ACCUMULATION_STEPS accum"
 echo "  Parallelism: EP=$ICI_EXPERT_PARALLELISM DP=$ICI_DATA_PARALLELISM FSDP=$ICI_FSDP_PARALLELISM TP=$ICI_TENSOR_PARALLELISM CP=$ICI_CONTEXT_PARALLELISM"
+echo "  ShardExpFSDP: $SHARD_EXP_ON_FSDP"
 echo "  Remat:      $REMAT_POLICY"
 echo "  Scatter:    $LAZY_LOADER_SCATTER"
-echo "=============================="
+echo "====================================="
 
 envsubst "$SUBST_VARS" < "$TEMPLATE" | kubectl apply -f -
 
 echo ""
 echo "Monitor with:"
 echo "  kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$JOB_NAME -w"
-echo "  kubectl logs -f \$(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=$JOB_NAME -o jsonpath='{.items[0].metadata.name}') -c jax-tpu"
+echo "  kubectl logs -f job/$JOB_NAME-worker-0 -c jax-tpu"
 echo ""
 echo "Cleanup:"
 echo "  kubectl delete jobset $JOB_NAME"
