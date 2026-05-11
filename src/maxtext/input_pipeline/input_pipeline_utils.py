@@ -355,7 +355,7 @@ class HFDataSource(grain.RandomAccessDataSource):
       max_target_length: int,
       data_column_names: list[str],
   ):
-    from datasets.distributed import split_dataset_by_node  # pylint: disable=import-outside-toplevel
+    from datasets.distributed import split_dataset_by_node  # pylint: disable=import-outside-toplevel,no-name-in-module
 
     self._split_dataset_by_node = split_dataset_by_node
     self.dataset = dataset
