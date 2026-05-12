@@ -1148,7 +1148,7 @@ def has_nested_key(mapping, nested_key):
   return True
 
 
-def update_state_param(state, target_path, value, zero_mean_update=False):
+def update_state_param(state, target_path, value, zero_mean_update=False, zero_mean_axis=-1):
   """
   Updates a specific parameter in state.params at the given path.
 
@@ -1156,7 +1156,13 @@ def update_state_param(state, target_path, value, zero_mean_update=False):
       state: The current TrainState.
       target_path: A tuple of keys matching the structure inside state.params.
       value: The value to apply.
-      zero_mean_update: Whether to re-center updated tensor along the last axis.
+      zero_mean_update: Whether to re-center updated tensor.
+      zero_mean_axis: Axis along which to re-center when ``zero_mean_update`` is True.
+        Defaults to -1 for backward compatibility (correct for 1D bias of shape
+        ``(num_experts,)``). For 2D scan-stacked bias of shape
+        ``(num_experts, scan_length)`` callers must pass ``zero_mean_axis=0`` so
+        the mean is computed along the expert axis (per-layer router bias has
+        zero mean across experts).
   """
 
   def create_jax_path(target_path):
@@ -1169,7 +1175,7 @@ def update_state_param(state, target_path, value, zero_mean_update=False):
     if path == updated_target_path:
       updated = param + value
       if zero_mean_update:
-        updated = updated - jnp.mean(updated, axis=-1, keepdims=True)
+        updated = updated - jnp.mean(updated, axis=zero_mean_axis, keepdims=True)
       return updated
     return param
 

@@ -295,6 +295,48 @@ def deepstack_process(hidden_states, bidirectional_mask, visual_embeds):
   return hidden_states
 
 
+def compute_ling3_scan_layout(config):
+  """Computes the Ling3 scan-mode layer layout.
+
+  Returns a tuple of three integers describing how the decoder splits when
+  ``scan_layers=True`` for the LING3 decoder block:
+
+    - ``num_dense_prefix``: dense (non-MoE) layers in Phase 1a (= ``first_num_dense_layers``).
+    - ``num_moe_prefix``: MoE layers in Phase 1b unscan prefix (named
+      ``moe_layers_{0..num_moe_prefix-1}``). These exist so the remaining MoE
+      region divides evenly by ``inhomogeneous_layer_cycle_interval``.
+    - ``scan_length``: number of ``Ling3ScannableBlock`` iterations in Phase 2.
+      Each iteration contains ``inhomogeneous_layer_cycle_interval`` sub-layers
+      named ``moe_layers/layers_{0..interval-1}``.
+
+  Total decoder layers = num_dense_prefix + num_moe_prefix +
+  scan_length * inhomogeneous_layer_cycle_interval. Mirrors the math inside
+  ``Decoder._apply_ling3_scan_layers`` so trainer / checkpoint conversion / tests
+  can reuse the same source of truth.
+  """
+  interval = config.inhomogeneous_layer_cycle_interval
+  if config.first_num_dense_layers > 0:
+    unscan_prefix = ((config.first_num_dense_layers + interval - 1) // interval) * interval
+  else:
+    unscan_prefix = 0
+  if unscan_prefix >= config.num_decoder_layers:
+    raise ValueError(
+        f"Ling3 unscan_prefix ({unscan_prefix}) >= num_decoder_layers "
+        f"({config.num_decoder_layers}): first_num_dense_layers "
+        f"({config.first_num_dense_layers}) cannot cover all decoder layers."
+    )
+  num_moe_prefix = max(unscan_prefix - config.first_num_dense_layers, 0)
+  scan_layers_count = config.num_decoder_layers - unscan_prefix
+  if scan_layers_count % interval != 0:
+    raise ValueError(
+        f"Ling3 scan region ({scan_layers_count} layers) must be divisible by "
+        f"inhomogeneous_layer_cycle_interval ({interval}); unscan_prefix "
+        f"({unscan_prefix}) was supposed to round up to a cycle boundary."
+    )
+  scan_length = scan_layers_count // interval
+  return config.first_num_dense_layers, num_moe_prefix, scan_length
+
+
 class Decoder(nn.Module):
   """A stack of decoder layers as a part of an encoder-decoder architecture."""
 
@@ -1250,27 +1292,14 @@ class Decoder(nn.Module):
     cfg = self.config
     mesh = self.mesh
     model_mode = self.model_mode
-    interval = cfg.inhomogeneous_layer_cycle_interval
 
-    # Round the unscan prefix up to a cycle boundary so that the MoE scan
-    # region is divisible by `interval`. With first_num_dense_layers=0 this
-    # collapses to 0 (the entire model goes through the scan).
-    if cfg.first_num_dense_layers > 0:
-      unscan_prefix = ((cfg.first_num_dense_layers + interval - 1) // interval) * interval
-    else:
-      unscan_prefix = 0
-    assert unscan_prefix < cfg.num_decoder_layers, (
-        f"Ling3 unscan_prefix ({unscan_prefix}) >= num_decoder_layers "
-        f"({cfg.num_decoder_layers}): first_num_dense_layers "
-        f"({cfg.first_num_dense_layers}) cannot cover all decoder layers."
-    )
-    num_moe_prefix = unscan_prefix - cfg.first_num_dense_layers
+    num_dense_prefix, num_moe_prefix, scan_length = compute_ling3_scan_layout(cfg)
 
     assert len(remat_layers) == 3, "Ling3 scan path expects 3 remat layer classes (Dense, ScannableBlock, MoE)."
     dense_layer, scannable_block, moe_layer = remat_layers
 
     # Phase 1a — unscan dense prefix
-    for idx in range(cfg.first_num_dense_layers):
+    for idx in range(num_dense_prefix):
       y, _ = dense_layer(
           config=cfg,
           mesh=mesh,
@@ -1282,7 +1311,7 @@ class Decoder(nn.Module):
 
     # Phase 1b — unscan MoE transition layers (filling out to the cycle boundary)
     for idx in range(num_moe_prefix):
-      global_idx = cfg.first_num_dense_layers + idx
+      global_idx = num_dense_prefix + idx
       y, _ = moe_layer(
           config=cfg,
           mesh=mesh,
@@ -1293,13 +1322,6 @@ class Decoder(nn.Module):
       )(y, *broadcast_args, global_layer_idx=global_idx)
 
     # Phase 2 — scan MoE ScannableBlocks
-    scan_layers_count = cfg.num_decoder_layers - unscan_prefix
-    assert scan_layers_count % interval == 0, (
-        f"Ling3 scan region ({scan_layers_count} layers) must be divisible by "
-        f"inhomogeneous_layer_cycle_interval ({interval}); unscan_prefix "
-        f"({unscan_prefix}) was supposed to round up to a cycle boundary."
-    )
-    scan_length = scan_layers_count // interval
     if scan_length > 0:
       y, _ = self.scan_decoder_layers(
           cfg,

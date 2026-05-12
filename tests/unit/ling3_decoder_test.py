@@ -426,14 +426,14 @@ class Ling3ScanLayerMathTest(unittest.TestCase):
 
   def test_unscan_prefix_covers_all_layers_raises(self):
     """unscan_prefix == num_decoder_layers trips the assert (no MoE region left)."""
-    with self.assertRaises(AssertionError) as ctx:
+    with self.assertRaises(ValueError) as ctx:
       self._run_helper(num_decoder_layers=4, first_num_dense_layers=4, interval=4)
     self.assertIn("unscan_prefix", str(ctx.exception))
 
   def test_scan_region_not_divisible_raises(self):
     """If num_decoder_layers - unscan_prefix is not a multiple of interval, assert trips."""
     # num=10, dense=1, interval=4 → unscan_prefix=4, scan_region=6, 6%4 != 0
-    with self.assertRaises(AssertionError) as ctx:
+    with self.assertRaises(ValueError) as ctx:
       self._run_helper(num_decoder_layers=10, first_num_dense_layers=1, interval=4)
     self.assertIn("divisible", str(ctx.exception))
 

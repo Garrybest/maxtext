@@ -45,7 +45,7 @@ from maxtext.utils.globals import EPS
 
 # pylint: disable=too-many-positional-arguments
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
-from maxtext.layers.moe import expert_counts_to_bias_update
+from maxtext.trainers.pre_train import moe_aux
 from maxtext.common import checkpointing, profiler
 from maxtext.common.goodput import (
     GoodputEvent,
@@ -80,185 +80,17 @@ def get_first_step(state):
   return int(state.step)
 
 
-def _count_moe_layers(config):
-  """Return the number of MoE layers based on the model config."""
-  moe_layer_freq = getattr(config, "moe_layer_freq", None)
-  if moe_layer_freq:
-    count = sum(moe_layer_freq[: config.num_decoder_layers])
-  else:
-    num_moe_candidates = config.num_decoder_layers - config.first_num_dense_layers
-    # interleave_moe_layer_step > 1 means only every Nth layer is MoE (e.g. Llama4).
-    if config.interleave_moe_layer_step > 1:
-      num_moe_candidates = num_moe_candidates // config.interleave_moe_layer_step
-    count = max(num_moe_candidates, 1)
-  # MTP layers also contain MoE (matching Megatron's get_num_moe_layers)
-  if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
-    count += config.mtp_num_layers
-  return count
-
-
-def _collect_moe_intermediate_sum(config, intermediate_outputs, key):
-  """Collect and sum a sowed intermediate value (e.g. moe_lb_loss) from MoE decoder layers.
-
-  Handles all decoder block types and scan/unscan modes, mirroring the
-  moe_expert_counts collection logic.
-  """
-
-  def _get_sow_scalar(nested_key):
-    """Get a per-layer sowed scalar, unwrapping the Flax sow tuple accumulation."""
-    raw = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
-    # Flax/NNX sow() accumulates values into tuples (e.g. (value,)); unwrap to get the scalar.
-    return raw[-1] if isinstance(raw, tuple) else raw
-
-  if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
-    if config.scan_layers:
-      nested_key = ("intermediates", "decoder", "moe_layers", key)
-      values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
-    else:
-      num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-      values = []
-      for i in range(num_moe_layers):
-        nested_key = ("intermediates", "decoder", f"moe_layers_{i}", key)
-        values.append(_get_sow_scalar(nested_key))
-  else:
-    # Mixtral, Llama4, GPT_OSS, Qwen3, etc.
-    if config.scan_layers:
-      nested_key = ("intermediates", "decoder", "layers", key)
-      values = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, 0.0)
-    else:
-      values = []
-      for lyr in range(config.num_decoder_layers):
-        nested_key = ("intermediates", "decoder", f"layers_{lyr}", key)
-        values.append(_get_sow_scalar(nested_key))
-  backbone_sum = jnp.sum(jnp.array(values))
-
-  # Collect from MTP block MoE layers
-  mtp_sum = 0.0
-  if getattr(config, "mtp_num_layers", 0) > 0 and config.num_experts > 1:
-    for k in range(1, config.mtp_num_layers + 1):
-      nested_key = (
-          "intermediates",
-          "mtp_block",
-          f"mtp_layer_{k}",
-          f"mtp_{k}_transformer_layer",
-          key,
-      )
-      mtp_sum += _get_sow_scalar(nested_key)
-
-  return backbone_sum + mtp_sum
-
-
-def _collect_moe_intermediate_mean(config, intermediate_outputs, key):
-  """Collect and average a sowed intermediate value across all MoE layers."""
-  total = _collect_moe_intermediate_sum(config, intermediate_outputs, key)
-  return total / max(_count_moe_layers(config), 1)
-
-
-def _try_update_bias(config, new_state, target_path, expert_counts, path_label):
-  """Try to apply a single MoE gate bias update at the given path.
-
-  Returns the (possibly updated) TrainState.
-  """
-  if not maxtext_utils.has_nested_key(new_state.params, target_path):
-    max_logging.log(f"Skipping {path_label}: gate.bias path not found.")
-    return new_state
-  counts = jnp.array(expert_counts[0])
-  update_value = expert_counts_to_bias_update(counts, config.num_experts, config.routed_bias_update_rate)
-  return maxtext_utils.update_state_param(
-      new_state,
-      target_path,
-      update_value,
-      zero_mean_update=config.routed_bias_zero_mean_update,
-  )
-
-
-def _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts):
-  """Apply bias updates for DeepSeek/LING2/LING3 decoder blocks."""
-  if config.scan_layers:
-    target_path = (
-        "params",
-        "decoder",
-        "moe_layers",
-        moe_block_name,
-        "MoeBlock_0",
-        "gate",
-        "bias",
-    )
-    new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts, "moe_expert_counts")
-  else:
-    num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-    for i in range(num_moe_layers):
-      if moe_expert_counts[i] is None:
-        continue
-      target_path = (
-          "params",
-          "decoder",
-          f"moe_layers_{i}",
-          moe_block_name,
-          "MoeBlock_0",
-          "gate",
-          "bias",
-      )
-      new_state = _try_update_bias(config, new_state, target_path, moe_expert_counts[i], f"moe_layers_{i}")
-  return new_state
-
-
-def _apply_moe_bias_updates(config, new_state, moe_expert_counts, mtp_expert_counts):
-  """Apply Auxiliary-Loss-Free load balancing bias updates from expert counts.
-
-  moe_expert_counts contains raw per-expert token counts (possibly summed
-  across gradient-accumulation micro-batches by the GA scan).  We convert
-  them to bias updates here so that the direction is computed from the
-  *total* counts, matching Megatron's accumulate-then-update semantics.
-
-  Args:
-    config: Model configuration.
-    new_state: The current TrainState (after apply_gradients).
-    moe_expert_counts: Per-layer expert token counts from backbone, or None.
-    mtp_expert_counts: Per-layer expert token counts from MTP layers, or None.
-
-  Returns:
-    Updated TrainState with bias corrections applied.
-  """
-  # Determine MoE sub-path based on decoder type
-  moe_block_name = None
-  if config.decoder_block == DecoderBlockType.DEEPSEEK:
-    moe_block_name = "DeepSeekMoeBlock_0"
-  elif config.decoder_block in (DecoderBlockType.LING2, DecoderBlockType.LING3):
-    moe_block_name = "mlp"
-
-  # --- Backbone MoE bias updates ---
-  if moe_expert_counts is not None:
-    if moe_block_name is None:
-      max_logging.log("Skipping moe_expert_counts: unsupported decoder block type.")
-    elif config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
-      new_state = _update_deepseek_bias(config, new_state, moe_block_name, moe_expert_counts)
-
-  # --- MTP MoE expert bias updates ---
-  # Matches Megatron's recursive module traversal which updates ALL routers including MTP layers.
-  # Note: maxtext's MultiTokenPredictionLayer uses a property that stores the transformer
-  # layer as f"mtp_{k}_transformer_layer" attribute, so the param tree key is
-  # f"mtp_{k}_transformer_layer" (not "transformer_layer" as in ant-pretrain).
-  if mtp_expert_counts is not None:
-    if moe_block_name is not None:
-      for k, expert_counts_for_layer in enumerate(mtp_expert_counts, start=1):
-        if expert_counts_for_layer is None:
-          continue
-        target_path = (
-            "params",
-            "mtp_block",
-            f"mtp_layer_{k}",
-            f"mtp_{k}_transformer_layer",
-            moe_block_name,
-            "MoeBlock_0",
-            "gate",
-            "bias",
-        )
-        new_state = _try_update_bias(config, new_state, target_path, expert_counts_for_layer, f"mtp_layer_{k}")
-    else:
-      max_logging.log("Skipping mtp_expert_counts: unsupported decoder block type.")
-
-  return new_state
+# MoE auxiliary helpers live in moe_aux to keep this file focused on the train loop.
+# Re-exported with leading underscores so existing call sites and tests that reach
+# into ``train._foo`` keep working without churn.
+_count_moe_layers = moe_aux.count_moe_layers
+_collect_moe_intermediate_sum = moe_aux.collect_moe_intermediate_sum
+_collect_moe_intermediate_mean = moe_aux.collect_moe_intermediate_mean
+_collect_moe_expert_counts = moe_aux.collect_moe_expert_counts
+_collect_mtp_expert_counts = moe_aux.collect_mtp_expert_counts
+_apply_moe_bias_updates = moe_aux.apply_moe_bias_updates
+_try_update_bias = moe_aux._try_update_bias  # pylint: disable=protected-access
+_update_ling3_scan_bias = moe_aux._update_ling3_scan_bias  # pylint: disable=protected-access
 
 
 # -----------------------------------------------------------------------------
@@ -447,13 +279,14 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   moe_lb_loss = 0.0
   moe_z_loss = 0.0
   if config.num_experts > 1:
-    moe_lb_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_lb_loss")
-    if use_ga_raw_sum:
-      # Scale by total_positions (B*S incl. padding) to match Megatron's
-      # MoEAuxLossAutoScaler which uses `activation.shape[0]` (= T_total).
-      loss += moe_lb_loss * total_positions
-    else:
-      loss += moe_lb_loss
+    if config.load_balance_loss_weight > 0.0:
+      moe_lb_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_lb_loss")
+      if use_ga_raw_sum:
+        # Scale by total_positions (B*S incl. padding) to match Megatron's
+        # MoEAuxLossAutoScaler which uses `activation.shape[0]` (= T_total).
+        loss += moe_lb_loss * total_positions
+      else:
+        loss += moe_lb_loss
     if config.moe_z_loss_weight > 0.0:
       moe_z_loss = _collect_moe_intermediate_sum(config, intermediate_outputs, "moe_z_loss")
       if use_ga_raw_sum:
@@ -477,51 +310,12 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   moe_expert_counts = None
   if config.routed_bias and config.routed_bias_update_rate > 0.0:
     if config.decoder_block in (DecoderBlockType.DEEPSEEK, DecoderBlockType.LING2, DecoderBlockType.LING3):
-      if config.scan_layers:
-        # Scanned: single stacked tensor from scan intermediates
-        nested_key = ("intermediates", "decoder", "moe_layers", "moe_expert_counts")
-        moe_expert_counts = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
-      else:
-        # Unscanned: collect per-layer counts (local MoE index)
-        num_moe_layers = config.num_decoder_layers - config.first_num_dense_layers
-        per_layer_updates = []
-        for i in range(num_moe_layers):
-          nested_key = (
-              "intermediates",
-              "decoder",
-              f"moe_layers_{i}",
-              "moe_expert_counts",
-          )
-          per_layer_updates.append(maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None))
-        if any(u is not None for u in per_layer_updates):
-          moe_expert_counts = per_layer_updates
+      moe_expert_counts = _collect_moe_expert_counts(config, intermediate_outputs)
     else:
       max_logging.log(f"Skipping moe_expert_counts collection: unsupported decoder_block={config.decoder_block}.")
 
   # Collect MoE expert counts from MTP layers (matching Megatron's recursive module traversal)
-  mtp_expert_counts = None
-  if (
-      config.routed_bias
-      and config.routed_bias_update_rate > 0.0
-      and getattr(config, "mtp_num_layers", 0) > 0
-      and config.num_experts > 1
-  ):
-    mtp_per_layer = [
-        maxtext_utils.get_nested_value(
-            intermediate_outputs,
-            (
-                "intermediates",
-                "mtp_block",
-                f"mtp_layer_{k}",
-                f"mtp_{k}_transformer_layer",
-                "moe_expert_counts",
-            ),
-            None,
-        )
-        for k in range(1, config.mtp_num_layers + 1)
-    ]
-    if any(u is not None for u in mtp_per_layer):
-      mtp_expert_counts = mtp_per_layer
+  mtp_expert_counts = _collect_mtp_expert_counts(config, intermediate_outputs)
 
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
