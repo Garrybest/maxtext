@@ -155,7 +155,7 @@ spec:
                 value: "${LIBTPU_INIT_ARGS}"
               # --- Vertex AI TensorBoard ---
               - name: USE_VERTEX_TENSORBOARD
-                value: "false"
+                value: "${USE_VERTEX_TENSORBOARD}"
               - name: VERTEX_TB_PROJECT
                 value: "tpu-for-training"
               - name: VERTEX_TB_REGION

@@ -66,6 +66,9 @@ export PROFILER_STEPS="${PROFILER_STEPS:-}"
 # Extra XLA flags (empty = use script defaults only)
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-}"
 
+# Vertex AI Tensorboard (default off; set to "true" to enable)
+export USE_VERTEX_TENSORBOARD="${USE_VERTEX_TENSORBOARD:-false}"
+
 export JOB_NAME BRANCH BRANCH_LABEL USER
 
 # ============================================================================
@@ -89,6 +92,7 @@ SUBST_VARS+=' $PER_DEVICE_BATCH_SIZE $GRADIENT_ACCUMULATION_STEPS $REMAT_POLICY'
 SUBST_VARS+=' $LAZY_LOADER_SCATTER'
 SUBST_VARS+=' $PROFILER $SKIP_FIRST_N_STEPS_FOR_PROFILER $PROFILER_STEPS'
 SUBST_VARS+=' $LIBTPU_INIT_ARGS'
+SUBST_VARS+=' $USE_VERTEX_TENSORBOARD'
 
 echo "=== Submitting Ling3 Job ==="
 echo "  JobSet:     $JOB_NAME"
@@ -100,6 +104,7 @@ echo "  Batch:      $PER_DEVICE_BATCH_SIZE per device × $GRADIENT_ACCUMULATION_
 echo "  Parallelism: EP=$ICI_EXPERT_PARALLELISM DP=$ICI_DATA_PARALLELISM FSDP=$ICI_FSDP_PARALLELISM TP=$ICI_TENSOR_PARALLELISM CP=$ICI_CONTEXT_PARALLELISM"
 echo "  Remat:      $REMAT_POLICY"
 echo "  Scatter:    $LAZY_LOADER_SCATTER"
+echo "  VertexTB:   $USE_VERTEX_TENSORBOARD"
 echo "=============================="
 
 envsubst "$SUBST_VARS" < "$TEMPLATE" | kubectl apply -f -
