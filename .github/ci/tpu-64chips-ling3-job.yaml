@@ -112,7 +112,7 @@ spec:
               - name: EVAL_INTERVAL
                 value: "${EVAL_INTERVAL}"
               - name: ENABLE_CHECKPOINTING
-                value: "false"
+                value: "${ENABLE_CHECKPOINTING}"
               # CHECKPOINT_PERIOD set high to avoid saving new checkpoints during repro
               - name: CHECKPOINT_PERIOD
                 value: "10000"
@@ -162,7 +162,7 @@ spec:
                 value: "us-central1"
               # --- Disable Goodput in dev runs ---
               - name: ENABLE_GOODPUT
-                value: "false"
+                value: "${ENABLE_GOODPUT}"
               # --- GitHub token for cloning private repo ---
               - name: GITHUB_TOKEN
                 valueFrom:

@@ -76,6 +76,10 @@ export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:-}"
 # Vertex AI Tensorboard (default off; set to "true" to enable)
 export USE_VERTEX_TENSORBOARD="${USE_VERTEX_TENSORBOARD:-false}"
 
+# Checkpointing & Goodput (default off; set to "true" to enable)
+export ENABLE_CHECKPOINTING="${ENABLE_CHECKPOINTING:-false}"
+export ENABLE_GOODPUT="${ENABLE_GOODPUT:-false}"
+
 export JOB_NAME BRANCH BRANCH_LABEL USER
 
 # ============================================================================
@@ -101,6 +105,7 @@ SUBST_VARS+=' $LAZY_LOADER_SCATTER'
 SUBST_VARS+=' $PROFILER $SKIP_FIRST_N_STEPS_FOR_PROFILER $PROFILER_STEPS'
 SUBST_VARS+=' $LIBTPU_INIT_ARGS'
 SUBST_VARS+=' $USE_VERTEX_TENSORBOARD'
+SUBST_VARS+=' $ENABLE_CHECKPOINTING $ENABLE_GOODPUT'
 
 echo "=== Submitting Ling3 64-chips Job ==="
 echo "  JobSet:     $JOB_NAME"
@@ -116,6 +121,8 @@ echo "  ShardExpFSDP: $SHARD_EXP_ON_FSDP"
 echo "  Remat:      $REMAT_POLICY"
 echo "  Scatter:    $LAZY_LOADER_SCATTER"
 echo "  VertexTB:   $USE_VERTEX_TENSORBOARD"
+echo "  Checkpoint: $ENABLE_CHECKPOINTING"
+echo "  Goodput:    $ENABLE_GOODPUT"
 echo "====================================="
 
 envsubst "$SUBST_VARS" < "$TEMPLATE" | kubectl apply -f -

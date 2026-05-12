@@ -96,6 +96,8 @@ spec:
                 value: "1000"
               - name: EVAL_INTERVAL
                 value: "2000"
+              - name: ENABLE_CHECKPOINTING
+                value: "${ENABLE_CHECKPOINTING}"
               - name: GCS_BUCKET
                 value: "gs://data_ant/pretrain/ling3"
               - name: RUN_NAME
@@ -122,7 +124,7 @@ spec:
                 value: "us-central1"
               # --- Disable Goodput in dev runs ---
               - name: ENABLE_GOODPUT
-                value: "false"
+                value: "${ENABLE_GOODPUT}"
               # --- GitHub token for cloning private repo ---
               - name: GITHUB_TOKEN
                 valueFrom:
